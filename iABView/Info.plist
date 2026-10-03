@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon.icns</string>
+	<key>CFBundleIconFiles</key>
+	<array>
+		<string>AppIcon-60@2x.png</string>
+		<string>AppIcon-60@3x.png</string>
+		<string>AppIcon-76@2x.png</string>
+		<string>AppIcon-83.5@2x.png</string>
+		<string>AppIcon-1024.png</string>
+	</array>
+	<key>CFBundleIconName</key>
+	<string>AppIcon</string>
+</dict>
+</plist>
