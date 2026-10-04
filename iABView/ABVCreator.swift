@@ -452,14 +452,29 @@ private enum ABVCreatorPipeline {
             advance(stageWeight, message: "Fichiers copiés.")
 
             try cancellation.checkCancelled()
-            announce("Conversion vidéo en cours…")
+            let totalBytes: Int64 = stagedCameras.reduce(0) { total, url in
+                let attributes = try? fileManager.attributesOfItem(atPath: url.path)
+                let size = (attributes?[.size] as? NSNumber)?.int64Value ?? 0
+                return total + size
+            }
+            let totalGB = Double(totalBytes) / 1_000_000_000
+            // Calibré sur un retour empirique de cette machine : ~40–50 min pour 20–30 Go, soit ~1.8 min/Go.
+            let estimatedSeconds = totalGB * 108
+            let estimateText = totalGB > 0.05
+                ? " (~\(formattedMinutes(estimatedSeconds)) estimées pour \(String(format: "%.1f", totalGB)) Go)"
+                : ""
+            announce("Conversion vidéo en cours…" + estimateText)
             let front = output.appendingPathComponent("front.mp4")
             let back = output.appendingPathComponent("back.mp4")
             let videoStepFraction = fraction
+            let videoStart = Date()
             try convertVideo(
                 cameras: stagedCameras, front: front, back: back, work: work, cancellation: cancellation
             ) { cpu in
-                progress(ABVCreatorProgress(fraction: videoStepFraction, message: nil, ffmpegCPUUsage: cpu))
+                let elapsed = Date().timeIntervalSince(videoStart)
+                let estimatedProgress = estimatedSeconds > 0 ? min(elapsed / estimatedSeconds, 0.96) : 0
+                let liveFraction = min(1, videoStepFraction + videoWeight * estimatedProgress)
+                progress(ABVCreatorProgress(fraction: liveFraction, message: nil, ffmpegCPUUsage: cpu))
             }
             advance(videoWeight, message: "Conversion vidéo terminée.")
 
@@ -520,6 +535,14 @@ private enum ABVCreatorPipeline {
                 setxattr(path, "com.apple.FinderInfo", buffer.baseAddress, 32, 0, 0)
             }
         }
+    }
+
+    nonisolated static func formattedMinutes(_ seconds: Double) -> String {
+        guard seconds >= 60 else { return "moins d'une minute" }
+        let formatter = DateComponentsFormatter()
+        formatter.allowedUnits = [.hour, .minute]
+        formatter.unitsStyle = .abbreviated
+        return formatter.string(from: seconds) ?? "\(Int(seconds / 60)) min"
     }
 
     nonisolated static func executable(_ name: String, candidates: [String]) throws -> URL {
