@@ -14,5 +14,7 @@
 	</array>
 	<key>CFBundleIconName</key>
 	<string>AppIcon</string>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>iABView enregistre sa fenêtre afin d’exporter une vidéo du vol.</string>
 </dict>
 </plist>

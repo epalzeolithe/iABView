@@ -30,6 +30,8 @@ final class ScreenRecorder: NSObject {
 
     private func startRecording(destinationDirectory: URL?) async {
         do {
+            try ensureScreenCapturePermission()
+
             guard let appWindow = NSApp.keyWindow ?? NSApp.mainWindow else {
                 throw RecorderError.windowUnavailable
             }
@@ -80,6 +82,15 @@ final class ScreenRecorder: NSObject {
             errorMessage = error.localizedDescription
             isRecording = false
         }
+    }
+
+    private func ensureScreenCapturePermission() throws {
+        guard !CGPreflightScreenCaptureAccess() else { return }
+
+        if CGRequestScreenCaptureAccess() {
+            throw RecorderError.permissionRequiresRelaunch
+        }
+        throw RecorderError.permissionDenied
     }
 
     private func stopRecording() async {
@@ -143,10 +154,19 @@ extension ScreenRecorder: SCStreamDelegate {
 }
 
 enum RecorderError: LocalizedError {
+    case permissionDenied
+    case permissionRequiresRelaunch
     case windowUnavailable
 
     var errorDescription: String? {
-        "La fenêtre ABView n’est pas disponible pour l’enregistrement."
+        switch self {
+        case .permissionDenied:
+            "Autorisez iABView dans Réglages Système > Confidentialité et sécurité > Enregistrement de l’écran et de l’audio système."
+        case .permissionRequiresRelaunch:
+            "L’autorisation est accordée. Quittez complètement iABView, puis relancez l’app pour commencer l’enregistrement."
+        case .windowUnavailable:
+            "La fenêtre ABView n’est pas disponible pour l’enregistrement."
+        }
     }
 }
 #else

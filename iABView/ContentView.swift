@@ -42,7 +42,9 @@ struct ContentView: View {
                 onDetachFlightPath: { detachedWindows.showGPS(model: model) }
             )
         }
+        #if os(macOS)
         .frame(minWidth: 1_100, minHeight: 720)
+        #endif
         .onAppear {
             guard !didAskToRestoreLastBundle else { return }
             didAskToRestoreLastBundle = true
@@ -128,6 +130,17 @@ struct ContentView: View {
         } message: {
             Text(model.errorMessage ?? "")
         }
+        .alert(
+            "Mise à jour METAR",
+            isPresented: Binding(
+                get: { model.metarUpdateMessage != nil },
+                set: { if !$0 { model.dismissMETARUpdateMessage() } }
+            )
+        ) {
+            Button("OK") { model.dismissMETARUpdateMessage() }
+        } message: {
+            Text(model.metarUpdateMessage ?? "")
+        }
         .toolbar {
             ToolbarItemGroup {
                 Button {
@@ -143,6 +156,18 @@ struct ContentView: View {
                 .disabled(model.samples.isEmpty)
 
                 #if os(macOS)
+                Button(action: updateHistoricalMETAR) {
+                    if model.isUpdatingMETAR {
+                        ProgressView()
+                            .controlSize(.small)
+                            .accessibilityLabel("Mise à jour METAR en cours")
+                    } else {
+                        Label("Mettre à jour les METAR", systemImage: "cloud.sun.rain")
+                    }
+                }
+                .disabled(model.samples.isEmpty || model.isUpdatingMETAR)
+                .help("Télécharger les METAR historiques LFMT et mettre à jour metar.csv")
+
                 Menu {
                     Button("Caméra avant") {
                         detachedWindows.showFrontVideo(model: model)
@@ -259,6 +284,30 @@ struct ContentView: View {
         }
     }
 
+    #if os(macOS)
+    private func updateHistoricalMETAR() {
+        guard !model.hasBundleWriteAuthorization else {
+            model.updateHistoricalMETAR()
+            return
+        }
+        guard let bundleURL = model.bundleURL else { return }
+
+        let panel = NSOpenPanel()
+        panel.title = "Autoriser la mise à jour du vol"
+        panel.message = "Sélectionnez à nouveau \(bundleURL.lastPathComponent) pour autoriser l’écriture de metar.csv."
+        panel.prompt = "Autoriser"
+        panel.directoryURL = bundleURL.deletingLastPathComponent()
+        panel.nameFieldStringValue = bundleURL.lastPathComponent
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = true
+        panel.treatsFilePackagesAsDirectories = false
+        panel.allowsMultipleSelection = false
+
+        guard panel.runModal() == .OK, let authorizedURL = panel.url else { return }
+        model.authorizeBundleForWritingAndUpdateMETAR(authorizedURL)
+    }
+    #endif
+
     private func openBundlePanel() {
         #if os(macOS)
         let panel = NSOpenPanel()
@@ -350,47 +399,18 @@ struct FlightWorkspace: View {
             }
         } else {
             GeometryReader { proxy in
-                VStack(spacing: 6) {
-                    videoRow
-                        .frame(height: max(250, proxy.size.height * 0.36))
-
-                    instrumentRow
-                        .frame(maxHeight: .infinity)
-                        .layoutPriority(1)
-
-                    CompactTelemetryStrips(
-                        samples: model.chartSamples,
-                        currentTime: model.currentTime,
-                        duration: model.duration,
-                        isZoomed: model.isTimelineZoomed,
-                        mountingPitch: model.mountingPitch,
-                        maximumAltitude: model.maximumAltitude,
-                        bookmarks: model.bookmarks,
-                        videoFrameRate: model.frontVideoFrameRate
+                #if os(iOS)
+                if UIDevice.current.userInterfaceIdiom == .phone && proxy.size.height > proxy.size.width {
+                    IPhonePortraitFlightView(
+                        model: model,
+                        onAddBookmark: onAddBookmark
                     )
-                    .frame(height: 54)
-
-                    ZStack(alignment: .leading) {
-                        BookmarkTimelineSlider(
-                            value: Binding(
-                                get: { model.currentTime },
-                                set: model.seek
-                            ),
-                            duration: model.duration,
-                            bookmarks: model.bookmarks,
-                            videoFrameRate: model.frontVideoFrameRate
-                        )
-
-                        Text(model.currentTime.clockString)
-                            .font(.caption.monospacedDigit())
-                            .frame(width: 48, alignment: .trailing)
-                    }
-
-                    #if os(macOS)
-                    playbackControls
-                    #endif
+                } else {
+                    regularWorkspace(in: proxy.size)
                 }
-                .padding(6)
+                #else
+                regularWorkspace(in: proxy.size)
+                #endif
             }
             #if os(iOS)
             .toolbar {
@@ -407,6 +427,50 @@ struct FlightWorkspace: View {
             }
             #endif
         }
+    }
+
+    private func regularWorkspace(in size: CGSize) -> some View {
+        VStack(spacing: 6) {
+            videoRow
+                .frame(height: max(250, size.height * 0.36))
+
+            instrumentRow
+                .frame(maxHeight: .infinity)
+                .layoutPriority(1)
+
+            CompactTelemetryStrips(
+                samples: model.chartSamples,
+                currentTime: model.currentTime,
+                duration: model.duration,
+                isZoomed: model.isTimelineZoomed,
+                mountingPitch: model.mountingPitch,
+                maximumAltitude: model.maximumAltitude,
+                bookmarks: model.bookmarks,
+                videoFrameRate: model.frontVideoFrameRate
+            )
+            .frame(height: 54)
+
+            ZStack(alignment: .leading) {
+                BookmarkTimelineSlider(
+                    value: Binding(
+                        get: { model.currentTime },
+                        set: model.seek
+                    ),
+                    duration: model.duration,
+                    bookmarks: model.bookmarks,
+                    videoFrameRate: model.frontVideoFrameRate
+                )
+
+                Text(model.currentTime.clockString)
+                    .font(.caption.monospacedDigit())
+                    .frame(width: 48, alignment: .trailing)
+            }
+
+            #if os(macOS)
+            playbackControls
+            #endif
+        }
+        .padding(6)
     }
 
     private var videoRow: some View {
@@ -575,7 +639,7 @@ struct FlightWorkspace: View {
     }
 }
 
-private enum FlightVideoSelection: String, Identifiable {
+enum FlightVideoSelection: String, Identifiable {
     case front
     case back
 

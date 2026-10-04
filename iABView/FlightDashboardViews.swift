@@ -399,7 +399,10 @@ struct FlightMapView: View {
                     Spacer()
 
                     if let sample {
-                        WindOverlayView(sample: sample)
+                        WindOverlayView(
+                            sample: sample,
+                            metarWind: METARWind(report: metar)
+                        )
                     }
                 }
 
@@ -483,32 +486,57 @@ struct FlightMapView: View {
 
 struct WindOverlayView: View {
     let sample: FlightSample
+    let metarWind: METARWind?
+
+    private var direction: Double? {
+        if let metarWind { return metarWind.direction }
+        return sample.windDirection
+    }
+
+    private var speed: Double {
+        metarWind?.speed ?? sample.windSpeed / 1.852
+    }
+
+    private var headwind: Double? {
+        if let metarWind { return metarWind.headwind(for: sample.heading) }
+        return sample.headwind
+    }
+
+    private var crosswind: Double? {
+        if let metarWind { return metarWind.crosswind(for: sample.heading) }
+        return sample.crosswind
+    }
 
     var body: some View {
         VStack(alignment: .trailing, spacing: 5) {
             HStack(spacing: 8) {
                 Image(systemName: "location.north.fill")
-                    .rotationEffect(.degrees(sample.windDirection))
+                    .rotationEffect(.degrees(direction ?? 0))
                     .foregroundStyle(.cyan)
+                    .opacity(direction == nil ? 0.45 : 1)
+
                 VStack(alignment: .trailing, spacing: 1) {
-                    Text(
-                        "\(sample.windSpeed / 1.852, format: .number.precision(.fractionLength(0))) kt"
-                    )
-                    Text(
-                        "\(sample.windDirection, format: .number.precision(.fractionLength(0)))°"
-                    )
+                    HStack(spacing: 3) {
+                        Text(speed, format: .number.precision(.fractionLength(0)))
+                        if let gust = metarWind?.gust {
+                            Text("G\(gust, format: .number.precision(.fractionLength(0)))")
+                        }
+                        Text("kt")
+                    }
+                    Text(direction.map {
+                        "\($0, format: .number.precision(.fractionLength(0)))°"
+                    } ?? "VRB")
                 }
                 .monospacedDigit()
             }
             .font(.headline)
 
-            Text(
-                "Face \(sample.headwind, format: .number.precision(.fractionLength(0))) kt"
-            )
-            Text(
-                "Travers \(sample.crosswind, format: .number.precision(.fractionLength(0))) kt"
-            )
-
+            if let headwind {
+                Text("Face \(headwind, format: .number.precision(.fractionLength(0))) kt")
+            }
+            if let crosswind {
+                Text("Travers \(crosswind, format: .number.precision(.fractionLength(0))) kt")
+            }
         }
         .font(.caption)
         .foregroundStyle(.white)
@@ -598,11 +626,6 @@ private struct ArtificialHorizonPitchLadder: View {
                     path.addLine(to: CGPoint(x: centerX - 8, y: y))
                     path.move(to: CGPoint(x: centerX + 8, y: y))
                     path.addLine(to: CGPoint(x: centerX + halfWidth, y: y))
-
-                    path.move(to: CGPoint(x: centerX - halfWidth, y: y))
-                    path.addLine(to: CGPoint(x: centerX - halfWidth, y: y + 5))
-                    path.move(to: CGPoint(x: centerX + halfWidth, y: y))
-                    path.addLine(to: CGPoint(x: centerX + halfWidth, y: y + 5))
                 }
                 .stroke(
                     .white.opacity(0.58),

@@ -29,7 +29,7 @@ struct FlightSample: Identifiable, Sendable {
 
     var headwind: Double {
         let relativeAngle = (heading - windDirection) * .pi / 180
-        return -(windSpeed / 1.852) * cos(relativeAngle)
+        return (windSpeed / 1.852) * cos(relativeAngle)
     }
 
     var crosswind: Double {
@@ -154,6 +154,63 @@ struct FlightBookmark: Identifiable, Sendable {
         self.name = name
         self.frame = frame
         self.displayTime = displayTime
+    }
+}
+
+struct METARWind: Sendable {
+    let direction: Double?
+    let speed: Double
+    let gust: Double?
+
+    nonisolated init?(report: String) {
+        let pattern = #"^(\d{3}|VRB)(\d{2,3})(?:G(\d{2,3}))?(KT|MPS)$"#
+        guard let expression = try? NSRegularExpression(pattern: pattern) else { return nil }
+
+        let tokens = report.uppercased().split(whereSeparator: { $0.isWhitespace })
+        guard let token = tokens.first(where: {
+            let text = String($0)
+            let range = NSRange(text.startIndex..., in: text)
+            return expression.firstMatch(in: text, range: range)?.range == range
+        }) else {
+            return nil
+        }
+
+        let text = String(token)
+        let fullRange = NSRange(text.startIndex..., in: text)
+        guard let match = expression.firstMatch(in: text, range: fullRange),
+              let speedRange = Range(match.range(at: 2), in: text),
+              let parsedSpeed = Double(text[speedRange]),
+              let unitRange = Range(match.range(at: 4), in: text) else {
+            return nil
+        }
+
+        let multiplier = text[unitRange] == "MPS" ? 1.943_844 : 1
+        if let directionRange = Range(match.range(at: 1), in: text) {
+            let directionText = text[directionRange]
+            direction = directionText == "VRB" ? nil : Double(directionText)
+        } else {
+            direction = nil
+        }
+        speed = parsedSpeed * multiplier
+
+        if let gustRange = Range(match.range(at: 3), in: text),
+           let parsedGust = Double(text[gustRange]) {
+            gust = parsedGust * multiplier
+        } else {
+            gust = nil
+        }
+    }
+
+    nonisolated func headwind(for heading: Double) -> Double? {
+        guard let direction else { return nil }
+        let relativeAngle = (heading - direction) * .pi / 180
+        return speed * cos(relativeAngle)
+    }
+
+    nonisolated func crosswind(for heading: Double) -> Double? {
+        guard let direction else { return nil }
+        let relativeAngle = (heading - direction) * .pi / 180
+        return speed * sin(relativeAngle)
     }
 }
 

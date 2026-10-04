@@ -21,6 +21,9 @@ final class FlightViewModel {
     private(set) var metar: [METARReading] = []
     private(set) var currentIndex = 0
     private(set) var isLoading = false
+    private(set) var isUpdatingMETAR = false
+    private(set) var hasBundleWriteAuthorization = false
+    private(set) var metarUpdateMessage: String?
     private(set) var errorMessage: String?
     private(set) var isPlaying = false
     private(set) var aircraftModelURL = Bundle.main.url(
@@ -121,10 +124,10 @@ final class FlightViewModel {
 
     func openLastBundle() {
         guard let url = resolvedLastBundleURL() else { return }
-        openBundle(url)
+        openBundle(url, grantsWriteAccess: false)
     }
 
-    func openBundle(_ url: URL) {
+    func openBundle(_ url: URL, grantsWriteAccess: Bool = true) {
         isLoading = true
         errorMessage = nil
         let accessGranted = url.startAccessingSecurityScopedResource()
@@ -138,6 +141,7 @@ final class FlightViewModel {
                     previousURL.stopAccessingSecurityScopedResource()
                 }
                 securityScopedURL = accessGranted ? url : nil
+                hasBundleWriteAuthorization = grantsWriteAccess
                 apply(loaded)
                 saveLastBundleBookmark(url)
             } catch {
@@ -152,13 +156,71 @@ final class FlightViewModel {
         errorMessage = nil
     }
 
+    func authorizeBundleForWritingAndUpdateMETAR(_ authorizedURL: URL) {
+        guard let bundleURL,
+              authorizedURL.standardizedFileURL == bundleURL.standardizedFileURL else {
+            metarUpdateMessage = "Sélectionnez le fichier .abv actuellement ouvert."
+            return
+        }
+
+        let accessGranted = authorizedURL.startAccessingSecurityScopedResource()
+        guard accessGranted else {
+            metarUpdateMessage = "L’autorisation d’écriture sur ce fichier .abv n’a pas été accordée."
+            return
+        }
+
+        if let previousURL = securityScopedURL {
+            previousURL.stopAccessingSecurityScopedResource()
+        }
+        securityScopedURL = authorizedURL
+        self.bundleURL = authorizedURL
+        hasBundleWriteAuthorization = true
+        saveLastBundleBookmark(authorizedURL)
+        updateHistoricalMETAR()
+    }
+
+    func updateHistoricalMETAR() {
+        guard let bundleURL, let flightDate = samples.first?.timestamp else { return }
+
+        isUpdatingMETAR = true
+        metarUpdateMessage = nil
+        Task {
+            do {
+                let playbackPosition = currentVideoTime
+                let updatedReadings = try await METARHistoryService.update(
+                    bundleURL: bundleURL,
+                    flightDate: flightDate
+                )
+                let refreshedBundle = try await Task.detached(priority: .userInitiated) {
+                    try FlightBundleLoader.load(from: bundleURL)
+                }.value
+
+                samples = refreshedBundle.samples
+                metar = updatedReadings
+                let strideValue = max(1, samples.count / 2_500)
+                chartSamples = samples.enumerated().compactMap { index, sample in
+                    index.isMultiple(of: strideValue) ? sample : nil
+                }
+                maximumAltitude = samples.map(\.altitude).max() ?? 0
+                maximumSpeed = samples.map(\.speed).max() ?? 0
+                updateLoadFactorExtrema()
+                currentIndex = sampleIndex(at: playbackPosition)
+                metarUpdateMessage = "\(updatedReadings.count) relevés METAR enregistrés et gps_ias recalculé dans merged_data.csv."
+            } catch {
+                metarUpdateMessage = "Échec de la mise à jour METAR : \(error.localizedDescription)"
+            }
+            isUpdatingMETAR = false
+        }
+    }
+
+    func dismissMETARUpdateMessage() {
+        metarUpdateMessage = nil
+    }
+
     private func saveLastBundleBookmark(_ url: URL) {
         do {
             #if os(macOS)
-            let options: URL.BookmarkCreationOptions = [
-                .withSecurityScope,
-                .securityScopeAllowOnlyReadAccess
-            ]
+            let options: URL.BookmarkCreationOptions = .withSecurityScope
             #else
             let options: URL.BookmarkCreationOptions = []
             #endif
