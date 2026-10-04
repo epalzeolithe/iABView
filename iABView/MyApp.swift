@@ -68,8 +68,8 @@ struct MyApp: App {
 
     var body: some Scene {
         #if os(macOS)
-        WindowGroup("ABView") {
-            ContentView()
+        WindowGroup("ABView", id: "abview", for: URL.self) { $bundleURL in
+            ContentView(initialBundleURL: bundleURL)
         }
         .commands {
             ABVCreatorCommands()

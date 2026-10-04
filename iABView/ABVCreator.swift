@@ -308,9 +308,7 @@ final class ABVCreatorModel {
                 if let message = update.message {
                     log.append(message)
                 }
-                if let cpu = update.ffmpegCPUUsage {
-                    ffmpegCPUUsage = cpu
-                }
+                ffmpegCPUUsage = update.ffmpegCPUUsage
             }
         }
 
@@ -458,8 +456,8 @@ private enum ABVCreatorPipeline {
                 return total + size
             }
             let totalGB = Double(totalBytes) / 1_000_000_000
-            // Calibré sur un retour empirique de cette machine : ~40–50 min pour 20–30 Go, soit ~1.8 min/Go.
-            let estimatedSeconds = totalGB * 108
+            // Calibré sur un retour empirique de cette machine : 46 min pour 22 Go, soit ~2.1 min/Go.
+            let estimatedSeconds = totalGB * 125.5
             let estimateText = totalGB > 0.05
                 ? " (~\(formattedMinutes(estimatedSeconds)) estimées pour \(String(format: "%.1f", totalGB)) Go)"
                 : ""

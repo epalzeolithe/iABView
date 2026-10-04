@@ -4,6 +4,7 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 struct ABVCreatorView: View {
+    @Environment(\.openWindow) private var openWindow
     @State private var model = ABVCreatorModel()
     @State private var isImporterPresented = false
     @State private var isDropTargeted = false
@@ -252,6 +253,9 @@ struct ABVCreatorView: View {
                 if let outputURL = model.outputURL {
                     Button("Afficher dans le Finder", systemImage: "folder") {
                         NSWorkspace.shared.activateFileViewerSelecting([outputURL])
+                    }
+                    Button("Ouvrir dans ABView", systemImage: "play.rectangle") {
+                        openWindow(id: "abview", value: outputURL)
                     }
                 } else {
                     Text(model.suggestedName)

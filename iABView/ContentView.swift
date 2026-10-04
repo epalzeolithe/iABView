@@ -18,6 +18,7 @@ struct ContentView: View {
     #if os(macOS)
     @Environment(\.openWindow) private var openWindow
     #endif
+    var initialBundleURL: URL? = nil
     @State private var model = FlightViewModel()
     @State private var recorder = ScreenRecorder()
     @State private var detachedWindows = DetachedWindowManager()
@@ -74,7 +75,12 @@ struct ContentView: View {
         .onAppear {
             guard !didAskToRestoreLastBundle else { return }
             didAskToRestoreLastBundle = true
-            isLastBundleDialogPresented = model.lastBundleName != nil
+            if let initialBundleURL {
+                model.openBundle(initialBundleURL)
+                preferredCompactColumn = .detail
+            } else {
+                isLastBundleDialogPresented = model.lastBundleName != nil
+            }
         }
         .task(id: isLastBundleDialogPresented) {
             guard isLastBundleDialogPresented else { return }
