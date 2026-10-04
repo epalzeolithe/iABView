@@ -4,6 +4,7 @@ import SwiftUI
 struct IPhonePortraitFlightView: View {
     let model: FlightViewModel
     let onAddBookmark: () -> Void
+    let onOpenFullScreen: (FlightVideoSelection) -> Void
 
     @State private var selectedVideo = FlightVideoSelection.front
 
@@ -17,9 +18,6 @@ struct IPhonePortraitFlightView: View {
                     .frame(height: 210)
 
                 loadFactorBar
-
-                horizons
-                    .frame(height: 78)
 
                 timeline
 
@@ -60,8 +58,13 @@ struct IPhonePortraitFlightView: View {
             showsFlightData: isFront,
             timestampAlignment: isFront ? .topTrailing : .bottomTrailing,
             mountingPitch: model.mountingPitch,
-            isCameraInverted: model.isCameraInverted
+            isCameraInverted: model.isCameraInverted,
+            overlayStyle: .headingOnly
         )
+        .contentShape(Rectangle())
+        .onTapGesture {
+            onOpenFullScreen(selection)
+        }
     }
 
     private var aircraftSection: some View {
@@ -153,28 +156,6 @@ struct IPhonePortraitFlightView: View {
         .accessibilityValue("\(model.currentSignedLoadFactor, format: .number.precision(.fractionLength(1))) G")
     }
 
-    private var horizons: some View {
-        let attitude = model.currentSample?.attitude(
-            mountingPitch: model.mountingPitch,
-            isInverted: model.isCameraInverted
-        ) ?? Attitude(roll: 0, pitch: 0)
-        let wingtipAttitude = model.currentSample?.wingtipAttitude(
-            mountingPitch: model.mountingPitch,
-            isInverted: model.isCameraInverted
-        ) ?? Attitude(roll: 0, pitch: 0)
-
-        return HStack(spacing: 12) {
-            ArtificialHorizonView(pitch: attitude.pitch, roll: attitude.roll, marker: .wings)
-                .accessibilityLabel("Horizon fuselage")
-            ArtificialHorizonView(
-                pitch: wingtipAttitude.pitch,
-                roll: wingtipAttitude.roll,
-                marker: .triangle
-            )
-            .accessibilityLabel("Horizon saumon")
-        }
-    }
-
     private var timeline: some View {
         HStack(spacing: 6) {
             Text(model.currentTime.clockString)
@@ -212,7 +193,6 @@ struct IPhonePortraitFlightView: View {
                 control("Bookmark précédent", symbol: "backward.end.fill", action: model.previousBookmark)
                 control("Bookmark suivant", symbol: "forward.end.fill", action: model.nextBookmark)
                 control("Ajouter un bookmark", symbol: "bookmark.fill", action: onAddBookmark)
-                control("Prochain palier", symbol: "arrow.right.to.line.compact", action: model.seekNextLevelFlight)
                 control("Mise en ligne", symbol: "airplane.departure", action: model.goToTakeoff)
             }
         }

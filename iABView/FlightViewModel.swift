@@ -8,12 +8,26 @@ import CoreLocation
 import Foundation
 import Observation
 
+struct RecentBundle: Identifiable, Hashable, Sendable {
+    var id: String { url.path }
+    let name: String
+    let url: URL
+}
+
+private struct RecentBundleRecord: Codable {
+    let path: String
+    let name: String
+    let bookmarkData: Data?
+}
+
 @MainActor
 @Observable
 final class FlightViewModel {
     private static let bundleBookmarkKey = "ABView.lastBundleBookmark"
+    private static let recentBundlesKey = "ABView.recentBundles"
 
     private(set) var bundleURL: URL?
+    private(set) var recentBundles: [RecentBundle] = []
     private(set) var samples: [FlightSample] = []
     private(set) var chartSamples: [FlightSample] = []
     private(set) var routeCoordinates: [CLLocationCoordinate2D] = []
@@ -50,6 +64,10 @@ final class FlightViewModel {
     private var timeObserver: Any?
     private var securityScopedURL: URL?
     private var isCorrectingVideoDrift = false
+
+    init() {
+        self.recentBundles = loadRecentBundles()
+    }
 
     var currentSample: FlightSample? {
         guard samples.indices.contains(currentIndex) else { return nil }
@@ -119,12 +137,15 @@ final class FlightViewModel {
     }
 
     var lastBundleName: String? {
-        resolvedLastBundleURL()?.lastPathComponent
+        recentBundles.first?.name ?? resolvedLastBundleURL()?.lastPathComponent
     }
 
     func openLastBundle() {
-        guard let url = resolvedLastBundleURL() else { return }
-        openBundle(url, grantsWriteAccess: false)
+        if let firstRecent = recentBundles.first {
+            openBundle(firstRecent.url, grantsWriteAccess: false)
+        } else if let url = resolvedLastBundleURL() {
+            openBundle(url, grantsWriteAccess: false)
+        }
     }
 
     func openBundle(_ url: URL, grantsWriteAccess: Bool = true) {
@@ -143,7 +164,7 @@ final class FlightViewModel {
                 securityScopedURL = accessGranted ? url : nil
                 hasBundleWriteAuthorization = grantsWriteAccess
                 apply(loaded)
-                saveLastBundleBookmark(url)
+                saveRecentBundle(url)
             } catch {
                 if accessGranted { url.stopAccessingSecurityScopedResource() }
                 errorMessage = error.localizedDescription
@@ -175,7 +196,7 @@ final class FlightViewModel {
         securityScopedURL = authorizedURL
         self.bundleURL = authorizedURL
         hasBundleWriteAuthorization = true
-        saveLastBundleBookmark(authorizedURL)
+        saveRecentBundle(authorizedURL)
         updateHistoricalMETAR()
     }
 
@@ -215,6 +236,96 @@ final class FlightViewModel {
 
     func dismissMETARUpdateMessage() {
         metarUpdateMessage = nil
+    }
+
+    private func saveRecentBundle(_ url: URL) {
+        #if os(macOS)
+        let options: URL.BookmarkCreationOptions = .withSecurityScope
+        #else
+        let options: URL.BookmarkCreationOptions = []
+        #endif
+        let bookmarkData = try? url.bookmarkData(
+            options: options,
+            includingResourceValuesForKeys: nil,
+            relativeTo: nil
+        )
+
+        saveLastBundleBookmark(url)
+
+        var records: [RecentBundleRecord] = []
+        if let data = UserDefaults.standard.data(forKey: Self.recentBundlesKey),
+           let existingRecords = try? JSONDecoder().decode([RecentBundleRecord].self, from: data) {
+            records = existingRecords
+        }
+
+        let canonicalPath = url.standardizedFileURL.path
+        records.removeAll { record in
+            URL(fileURLWithPath: record.path).standardizedFileURL.path == canonicalPath
+        }
+
+        let newRecord = RecentBundleRecord(
+            path: url.path,
+            name: url.lastPathComponent,
+            bookmarkData: bookmarkData
+        )
+        records.insert(newRecord, at: 0)
+
+        if records.count > 5 {
+            records = Array(records.prefix(5))
+        }
+
+        if let data = try? JSONEncoder().encode(records) {
+            UserDefaults.standard.set(data, forKey: Self.recentBundlesKey)
+        }
+
+        recentBundles = loadRecentBundles()
+    }
+
+    private func loadRecentBundles() -> [RecentBundle] {
+        #if os(macOS)
+        let resOptions: URL.BookmarkResolutionOptions = .withSecurityScope
+        #else
+        let resOptions: URL.BookmarkResolutionOptions = []
+        #endif
+
+        if let data = UserDefaults.standard.data(forKey: Self.recentBundlesKey),
+           let records = try? JSONDecoder().decode([RecentBundleRecord].self, from: data) {
+            var items: [RecentBundle] = []
+            for record in records {
+                var resolvedURL: URL? = nil
+                if let bookmarkData = record.bookmarkData {
+                    var isStale = false
+                    if let url = try? URL(
+                        resolvingBookmarkData: bookmarkData,
+                        options: resOptions,
+                        relativeTo: nil,
+                        bookmarkDataIsStale: &isStale
+                    ) {
+                        resolvedURL = url
+                    }
+                }
+                if resolvedURL == nil {
+                    let fileURL = URL(fileURLWithPath: record.path)
+                    if FileManager.default.fileExists(atPath: fileURL.path) {
+                        resolvedURL = fileURL
+                    }
+                }
+                if let url = resolvedURL, FileManager.default.fileExists(atPath: url.path) {
+                    if !items.contains(where: { $0.url.standardizedFileURL == url.standardizedFileURL }) {
+                        items.append(RecentBundle(name: record.name, url: url))
+                    }
+                }
+            }
+            if !items.isEmpty {
+                return Array(items.prefix(5))
+            }
+        }
+
+        if let legacyURL = resolvedLastBundleURL() {
+            return [RecentBundle(name: legacyURL.lastPathComponent, url: legacyURL)]
+        }
+
+        return []
     }
 
     private func saveLastBundleBookmark(_ url: URL) {

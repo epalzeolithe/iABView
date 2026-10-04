@@ -1,0 +1,25 @@
+#------------------------------------------------------------------------------
+# File:         gpx.fmt
+#
+# Description:  Example ExifTool print format file to generate a GPX track log
+#
+# Usage:        exiftool -p gpx.fmt -d %Y-%m-%dT%H:%M:%SZ FILE [...] > out.gpx
+#
+# Requires:     ExifTool version 8.10 or later
+#
+# Revisions:    2010/02/05 - P. Harvey created
+#
+# Notes:     1) All input files must contain GPSLatitude and GPSLongitude.
+#            2) The -fileOrder option may be used to control the order of the
+#               generated track points.
+#------------------------------------------------------------------------------
+#[HEAD]<gpx version="1.1" creator="ExifTool">
+#[HEAD]<trk><name>Insta360</name><trkseg>
+
+#[IF] $gpslatitude $gpslongitude
+#[BODY]<trkpt lat="$gpslatitude#" lon="$gpslongitude#">
+#[BODY]  <ele>$gpsaltitude#</ele>
+#[BODY]  <time>${gpsdatetime#;DateFmt("%Y-%m-%dT%H:%M:%SZ")}</time>
+#[BODY]</trkpt>
+
+#[TAIL]</trkseg></trk></gpx>

@@ -8,6 +8,11 @@ import Charts
 import MapKit
 import SwiftUI
 
+enum VideoOverlayStyle {
+    case standard
+    case headingOnly
+}
+
 struct VideoPane: View {
     let title: LocalizedStringKey
     let player: AVPlayer
@@ -20,31 +25,58 @@ struct VideoPane: View {
     var timestampAlignment: Alignment = .topTrailing
     var mountingPitch = 15.0
     var isCameraInverted = false
+    var overlayStyle: VideoOverlayStyle = .standard
 
     var body: some View {
         ZStack {
             PlayerSurface(player: player)
                 .background(.black)
 
-            VideoInformationOverlay(
-                timestamp: timestamp,
-                elapsedTime: elapsedTime,
-                previousBookmark: previousBookmark,
-                upcomingBookmark: upcomingBookmark,
-                showsPlaybackStatus: showsFlightData,
-                timestampAlignment: timestampAlignment
-            )
-
-            if showsFlightData, let flightSample {
-                FlightVideoDataOverlay(
-                    sample: flightSample,
-                    mountingPitch: mountingPitch,
-                    isCameraInverted: isCameraInverted
+            if overlayStyle == .headingOnly {
+                if let flightSample {
+                    VideoHeadingOverlay(heading: flightSample.heading)
+                }
+            } else {
+                VideoInformationOverlay(
+                    timestamp: timestamp,
+                    elapsedTime: elapsedTime,
+                    previousBookmark: previousBookmark,
+                    upcomingBookmark: upcomingBookmark,
+                    showsPlaybackStatus: showsFlightData,
+                    timestampAlignment: timestampAlignment
                 )
+
+                if showsFlightData, let flightSample {
+                    FlightVideoDataOverlay(
+                        sample: flightSample,
+                        mountingPitch: mountingPitch,
+                        isCameraInverted: isCameraInverted
+                    )
+                }
             }
         }
         .clipShape(RoundedRectangle(cornerRadius: 3))
         .accessibilityLabel(title)
+    }
+}
+
+private struct VideoHeadingOverlay: View {
+    let heading: Double
+
+    var body: some View {
+        VStack {
+            Spacer()
+            Text("Cap \(heading, format: .number.precision(.fractionLength(0)))°")
+                .font(.headline.monospacedDigit())
+                .foregroundStyle(.white)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(.black.opacity(0.6), in: Capsule())
+                .padding(.bottom, 8)
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Cap")
+        .accessibilityValue("\(heading, format: .number.precision(.fractionLength(0))) degrés")
     }
 }
 

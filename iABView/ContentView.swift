@@ -2,15 +2,29 @@ import SwiftUI
 import UniformTypeIdentifiers
 #if os(macOS)
 import AppKit
+#elseif os(iOS)
+import UIKit
 #endif
 
+private var isRunningOnIPhone: Bool {
+    #if os(iOS)
+    UIDevice.current.userInterfaceIdiom == .phone
+    #else
+    false
+    #endif
+}
+
 struct ContentView: View {
+    #if os(macOS)
+    @Environment(\.openWindow) private var openWindow
+    #endif
     @State private var model = FlightViewModel()
     @State private var recorder = ScreenRecorder()
     @State private var detachedWindows = DetachedWindowManager()
     @State private var isChaseCamPresented = false
     @State private var isKeyboardHelpPresented = false
     @State private var columnVisibility: NavigationSplitViewVisibility = .detailOnly
+    @State private var preferredCompactColumn: NavigationSplitViewColumn = .detail
     @State private var bookmarkName = ""
     @State private var isBookmarkDialogPresented = false
     @State private var isLastBundleDialogPresented = false
@@ -18,12 +32,24 @@ struct ContentView: View {
     @State private var isBundleImporterPresented = false
 
     var body: some View {
-        NavigationSplitView(columnVisibility: $columnVisibility) {
+        NavigationSplitView(
+            columnVisibility: $columnVisibility,
+            preferredCompactColumn: $preferredCompactColumn
+        ) {
             FlightSidebar(
                 bundleName: model.bundleURL?.lastPathComponent,
+                recentBundles: model.recentBundles,
                 bookmarks: model.bookmarks,
                 onOpen: openBundlePanel,
-                onSelectBookmark: model.goToBookmark
+                onSelectRecent: { recent in
+                    model.openBundle(recent.url)
+                    preferredCompactColumn = .detail
+                },
+                onShowFlight: { preferredCompactColumn = .detail },
+                onSelectBookmark: { bookmark in
+                    model.goToBookmark(bookmark)
+                    preferredCompactColumn = .detail
+                }
             )
             .navigationSplitViewColumnWidth(min: 190, ideal: 240)
         } detail: {
@@ -107,6 +133,7 @@ struct ContentView: View {
             guard case .success(let urls) = result, let url = urls.first else { return }
             _ = url.startAccessingSecurityScopedResource()
             model.openBundle(url)
+            preferredCompactColumn = .detail
         }
         .alert(
             "Erreur d’enregistrement",
@@ -148,14 +175,23 @@ struct ContentView: View {
                 } label: {
                     Label("Ouvrir un vol", systemImage: "folder")
                 }
-                Button {
-                    isChaseCamPresented = true
-                } label: {
-                    Label("Cam", systemImage: "map")
-                }
-                .disabled(model.samples.isEmpty)
+
+                if !isRunningOnIPhone {
+                    Button {
+                        isChaseCamPresented = true
+                    } label: {
+                        Label("Cam", systemImage: "map")
+                    }
+                    .disabled(model.samples.isEmpty)
 
                 #if os(macOS)
+                Button {
+                    openWindow(id: "abv-creator")
+                } label: {
+                    Label("Créer un fichier ABV…", systemImage: "shippingbox.and.arrow.backward")
+                }
+                .help("Assembler les sources d’un vol (caméra, GPS, iPhone) en un fichier ABV")
+
                 Button(action: updateHistoricalMETAR) {
                     if model.isUpdatingMETAR {
                         ProgressView()
@@ -275,10 +311,11 @@ struct ContentView: View {
                 }
                 .disabled(model.samples.isEmpty)
 
-                Button {
-                    isKeyboardHelpPresented = true
-                } label: {
-                    Label("Raccourcis clavier", systemImage: "keyboard")
+                    Button {
+                        isKeyboardHelpPresented = true
+                    } label: {
+                        Label("Raccourcis clavier", systemImage: "keyboard")
+                    }
                 }
             }
         }
@@ -322,6 +359,7 @@ struct ContentView: View {
 
         guard panel.runModal() == .OK, let url = panel.url else { return }
         model.openBundle(url)
+        preferredCompactColumn = .detail
         #else
         isBundleImporterPresented = true
         #endif
@@ -330,8 +368,11 @@ struct ContentView: View {
 
 struct FlightSidebar: View {
     let bundleName: String?
+    let recentBundles: [RecentBundle]
     let bookmarks: [FlightBookmark]
     let onOpen: () -> Void
+    let onSelectRecent: (RecentBundle) -> Void
+    let onShowFlight: () -> Void
     let onSelectBookmark: (FlightBookmark) -> Void
 
     var body: some View {
@@ -342,6 +383,29 @@ struct FlightSidebar: View {
                 } else {
                     Button(action: onOpen) {
                         Label("Ouvrir un bundle .abv", systemImage: "folder.badge.plus")
+                    }
+                }
+            }
+
+            if !recentBundles.isEmpty {
+                Section("Derniers vols") {
+                    ForEach(recentBundles) { recent in
+                        Button {
+                            onSelectRecent(recent)
+                        } label: {
+                            HStack {
+                                Label(recent.name, systemImage: "clock.arrow.circlepath")
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                Spacer()
+                                if recent.name == bundleName {
+                                    Image(systemName: "checkmark")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                        .buttonStyle(.plain)
                     }
                 }
             }
@@ -366,9 +430,19 @@ struct FlightSidebar: View {
                     }
                 }
             }
-
         }
         .navigationTitle("ABView")
+        #if os(iOS)
+        .toolbar {
+            if isRunningOnIPhone, bundleName != nil {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(action: onShowFlight) {
+                        Label("Retour au vol", systemImage: "airplane")
+                    }
+                }
+            }
+        }
+        #endif
     }
 }
 
@@ -403,7 +477,8 @@ struct FlightWorkspace: View {
                 if UIDevice.current.userInterfaceIdiom == .phone && proxy.size.height > proxy.size.width {
                     IPhonePortraitFlightView(
                         model: model,
-                        onAddBookmark: onAddBookmark
+                        onAddBookmark: onAddBookmark,
+                        onOpenFullScreen: { fullScreenVideo = $0 }
                     )
                 } else {
                     regularWorkspace(in: proxy.size)
@@ -414,8 +489,10 @@ struct FlightWorkspace: View {
             }
             #if os(iOS)
             .toolbar {
-                ToolbarItem(placement: .navigation) {
-                    playbackControls
+                if !isRunningOnIPhone {
+                    ToolbarItem(placement: .navigation) {
+                        playbackControls
+                    }
                 }
             }
             .fullScreenCover(item: $fullScreenVideo) { selection in
@@ -487,7 +564,8 @@ struct FlightWorkspace: View {
                     showsFlightData: true,
                     timestampAlignment: .topTrailing,
                     mountingPitch: model.mountingPitch,
-                    isCameraInverted: model.isCameraInverted
+                    isCameraInverted: model.isCameraInverted,
+                    overlayStyle: isRunningOnIPhone ? .headingOnly : .standard
                 )
                 #if os(macOS)
                 detachButton(action: onDetachFront)
@@ -511,7 +589,8 @@ struct FlightWorkspace: View {
                     previousBookmark: model.previousBookmarkName,
                     upcomingBookmark: model.upcomingBookmarkName,
                     flightSample: model.currentSample,
-                    timestampAlignment: .bottomTrailing
+                    timestampAlignment: .bottomTrailing,
+                    overlayStyle: isRunningOnIPhone ? .headingOnly : .standard
                 )
                 #if os(macOS)
                 detachButton(action: onDetachBack)
@@ -671,7 +750,8 @@ private struct FullScreenFlightVideo: View {
                 showsFlightData: isFrontVideo,
                 timestampAlignment: isFrontVideo ? .topTrailing : .topLeading,
                 mountingPitch: model.mountingPitch,
-                isCameraInverted: model.isCameraInverted
+                isCameraInverted: model.isCameraInverted,
+                overlayStyle: isRunningOnIPhone ? .headingOnly : .standard
             )
             .ignoresSafeArea()
 
@@ -684,6 +764,20 @@ private struct FullScreenFlightVideo: View {
             .foregroundStyle(.white)
             .padding(20)
         }
+        .contentShape(Rectangle())
+        .onTapGesture(perform: onDismiss)
+        #if os(iOS)
+        .task {
+            guard isRunningOnIPhone else { return }
+            await Task.yield()
+            try? await Task.sleep(for: .milliseconds(100))
+            AppOrientationController.request(.landscape)
+        }
+        .onDisappear {
+            guard isRunningOnIPhone else { return }
+            AppOrientationController.request(.portrait)
+        }
+        #endif
     }
 }
 
