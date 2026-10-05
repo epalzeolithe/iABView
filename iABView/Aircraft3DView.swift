@@ -27,9 +27,6 @@ struct Aircraft3DView: PlatformViewRepresentable {
     let speed: Double
     let samples: [FlightSample]
     let player: AVPlayer
-    var finalRotationX = 90.0
-    var finalRotationY = 0.0
-    var finalRotationZ = 90.0
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
@@ -78,10 +75,7 @@ struct Aircraft3DView: PlatformViewRepresentable {
             samples: samples,
             player: player,
             mountingPitch: mountingPitch,
-            isInverted: isInverted,
-            finalRotationX: finalRotationX,
-            finalRotationY: finalRotationY,
-            finalRotationZ: finalRotationZ
+            isInverted: isInverted
         )
         context.coordinator.loadModelIfNeeded(from: modelURL)
         context.coordinator.axes.isHidden = !showsAxes
@@ -117,9 +111,6 @@ struct Aircraft3DView: PlatformViewRepresentable {
         private weak var player: AVPlayer?
         private var realtimeMountingPitch = 15.0
         private var realtimeIsInverted = false
-        private var realtimeFinalRotationX = 90.0
-        private var realtimeFinalRotationY = 0.0
-        private var realtimeFinalRotationZ = 90.0
         private let realtimeLock = NSLock()
 
         override init() {
@@ -131,18 +122,12 @@ struct Aircraft3DView: PlatformViewRepresentable {
             samples: [FlightSample],
             player: AVPlayer,
             mountingPitch: Double,
-            isInverted: Bool,
-            finalRotationX: Double,
-            finalRotationY: Double,
-            finalRotationZ: Double
+            isInverted: Bool
         ) {
             realtimeLock.lock()
             defer { realtimeLock.unlock() }
             realtimeMountingPitch = mountingPitch
             realtimeIsInverted = isInverted
-            realtimeFinalRotationX = finalRotationX
-            realtimeFinalRotationY = finalRotationY
-            realtimeFinalRotationZ = finalRotationZ
 
             let needsRestart = self.player !== player
                 || realtimeSamples.count != samples.count
@@ -191,26 +176,17 @@ struct Aircraft3DView: PlatformViewRepresentable {
                 * inversionCorrection
                 * sensorToAircraftAxes
                 * pitchCorrection
-            let finalXRotation = simd_quatf(
-                angle: Float(realtimeFinalRotationX * .pi / 180),
+            let zUpToYUp = simd_quatf(
+                angle: -.pi / 2,
                 axis: SIMD3<Float>(1, 0, 0)
             )
-            let finalYRotation = simd_quatf(
-                angle: Float(realtimeFinalRotationY * .pi / 180),
-                axis: SIMD3<Float>(0, 1, 0)
-            )
-            let finalZRotation = simd_quatf(
-                angle: Float(realtimeFinalRotationZ * .pi / 180),
-                axis: SIMD3<Float>(0, 0, 1)
-            )
-            let displayedOrientation = orientation * finalXRotation * finalYRotation * finalZRotation
-
+            let sceneOrientation = zUpToYUp * orientation * zUpToYUp.inverse
             SCNTransaction.begin()
             SCNTransaction.disableActions = true
             if updatesFlightVector {
-                updateFlightVector(orientation: orientation, speed: speed)
+                updateFlightVector(orientation: sceneOrientation, speed: speed)
             }
-            aircraft.simdOrientation = displayedOrientation
+            aircraft.simdOrientation = sceneOrientation
             SCNTransaction.commit()
         }
 
@@ -297,11 +273,15 @@ struct Aircraft3DView: PlatformViewRepresentable {
 
             aircraft.simdPosition = SIMD3<Float>(0, 0.8, 0)
             modelRoot.simdPosition = SIMD3<Float>(0, 0, 0)
+            modelRoot.simdOrientation = simd_quatf(
+                angle: -.pi / 2,
+                axis: SIMD3<Float>(1, 0, 0)
+            )
             scene.rootNode.addChildNode(aircraft)
             aircraft.addChildNode(modelRoot)
             let fallbackModel = SCNNode()
             fallbackModel.simdOrientation = simd_quatf(
-                angle: .pi / 2,
+                angle: .pi,
                 axis: SIMD3<Float>(1, 0, 0)
             )
             fallbackModel.addChildNode(makeFuselage())

@@ -605,48 +605,55 @@ struct ArtificialHorizonView: View {
 
     var body: some View {
         GeometryReader { proxy in
-            let fillSize = max(proxy.size.width, proxy.size.height) * 4
+            let referenceSize: CGFloat = 140
+            let contentScale = min(proxy.size.width, proxy.size.height) / referenceSize
+            let fillSize = referenceSize * 4
 
             ZStack {
-                VStack(spacing: 0) {
-                    Rectangle().fill(.blue.gradient)
-                    Rectangle().fill(.brown.gradient)
-                }
-
-                Rectangle()
-                    .fill(.white.opacity(0.9))
-                    .frame(height: 2)
-
-                ArtificialHorizonPitchLadder()
-            }
-            .frame(width: fillSize, height: fillSize)
-            .rotationEffect(.degrees(-roll))
-            .offset(y: pitch * 2)
-            .frame(width: proxy.size.width, height: proxy.size.height)
-            .clipped()
-            .overlay {
-                Path { path in
-                    let center = CGPoint(x: proxy.size.width / 2, y: proxy.size.height / 2)
-                    switch marker {
-                    case .wings:
-                        path.move(to: CGPoint(x: center.x - 45, y: center.y))
-                        path.addLine(to: CGPoint(x: center.x - 10, y: center.y))
-                        path.addLine(to: CGPoint(x: center.x, y: center.y + 8))
-                        path.addLine(to: CGPoint(x: center.x + 10, y: center.y))
-                        path.addLine(to: CGPoint(x: center.x + 45, y: center.y))
-                    case .triangle:
-                        let size: CGFloat = 27
-                        path.move(to: CGPoint(x: center.x, y: center.y - size))
-                        path.addLine(to: CGPoint(x: center.x - size, y: center.y))
-                        path.addLine(to: CGPoint(x: center.x + size, y: center.y))
-                        path.closeSubpath()
+                ZStack {
+                    VStack(spacing: 0) {
+                        Rectangle().fill(.blue.gradient)
+                        Rectangle().fill(.brown.gradient)
                     }
+
+                    Rectangle()
+                        .fill(.white.opacity(0.9))
+                        .frame(height: 2)
+
+                    ArtificialHorizonPitchLadder()
                 }
-                .stroke(
-                    .yellow,
-                    style: StrokeStyle(lineWidth: 3, lineCap: .round, lineJoin: .round)
-                )
+                .frame(width: fillSize, height: fillSize)
+                .rotationEffect(.degrees(-roll))
+                .offset(y: pitch * 2)
+                .frame(width: referenceSize, height: referenceSize)
+                .clipped()
+                .overlay {
+                    Path { path in
+                        let center = CGPoint(x: referenceSize / 2, y: referenceSize / 2)
+                        switch marker {
+                        case .wings:
+                            path.move(to: CGPoint(x: center.x - 45, y: center.y))
+                            path.addLine(to: CGPoint(x: center.x - 10, y: center.y))
+                            path.addLine(to: CGPoint(x: center.x, y: center.y + 8))
+                            path.addLine(to: CGPoint(x: center.x + 10, y: center.y))
+                            path.addLine(to: CGPoint(x: center.x + 45, y: center.y))
+                        case .triangle:
+                            let size: CGFloat = 27
+                            path.move(to: CGPoint(x: center.x, y: center.y - size))
+                            path.addLine(to: CGPoint(x: center.x - size, y: center.y))
+                            path.addLine(to: CGPoint(x: center.x + size, y: center.y))
+                            path.closeSubpath()
+                        }
+                    }
+                    .stroke(
+                        .yellow,
+                        style: StrokeStyle(lineWidth: 3, lineCap: .round, lineJoin: .round)
+                    )
+                }
+                .frame(width: referenceSize, height: referenceSize)
+                .scaleEffect(contentScale)
             }
+            .frame(width: proxy.size.width, height: proxy.size.height)
         }
         .clipShape(RoundedRectangle(cornerRadius: 5))
         .accessibilityLabel("Horizon artificiel")
