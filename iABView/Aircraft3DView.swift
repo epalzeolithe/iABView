@@ -54,9 +54,9 @@ struct Aircraft3DView: PlatformViewRepresentable {
         let view = SCNView()
         view.scene = context.coordinator.scene
         view.backgroundColor = PlatformColor(
-            red: 0.12,
-            green: 0.20,
-            blue: 0.31,
+            red: 0.35,
+            green: 0.48,
+            blue: 0.60,
             alpha: 1
         )
         view.antialiasingMode = .multisampling4X
@@ -256,9 +256,9 @@ struct Aircraft3DView: PlatformViewRepresentable {
 
         private func configureScene() {
             scene.background.contents = PlatformColor(
-                red: 0.12,
-                green: 0.20,
-                blue: 0.31,
+                red: 0.35,
+                green: 0.48,
+                blue: 0.60,
                 alpha: 1
             )
             scene.fogColor = PlatformColor(

@@ -186,7 +186,7 @@ struct ContentView: View {
                     Button {
                         isChaseCamPresented = true
                     } label: {
-                        Label("Cam", systemImage: "map")
+                        Label("Cam", systemImage: "binoculars.fill")
                     }
                     .disabled(model.samples.isEmpty)
 
@@ -688,13 +688,23 @@ struct FlightWorkspace: View {
             .padding(.top, max(12, workspaceSize.height * 0.015))
             .allowsHitTesting(false)
             #else
+            let horizonSize = min(
+                105,
+                max(72, min(workspaceSize.width / 10, workspaceSize.height / 6))
+            )
+
             TelemetryPanel(
                 sample: model.currentSample,
                 signedLoadFactor: model.currentSignedLoadFactor,
                 mountingPitch: model.mountingPitch,
-                isCameraInverted: model.isCameraInverted
+                isCameraInverted: model.isCameraInverted,
+                horizonSize: horizonSize
             )
-            .frame(width: 145, height: 288, alignment: .leading)
+            .frame(
+                width: horizonSize,
+                height: horizonSize * 2 + 8,
+                alignment: .leading
+            )
             .padding(.leading, 6)
             .frame(maxHeight: .infinity, alignment: .bottom)
             .padding(.bottom, 6)
@@ -838,9 +848,7 @@ private struct AircraftReadoutOverlay: View {
     var body: some View {
         VStack {
             HStack(alignment: .top) {
-                Spacer()
-
-                VStack(alignment: .trailing, spacing: 2) {
+                VStack(alignment: .leading, spacing: 2) {
                     readout("GS", value: sample?.speed ?? 0, unit: "km/h", color: .green, prominent: true)
                     readout("Alt", value: sample?.altitude ?? 0, unit: "ft", color: .blue, prominent: true)
                     Text("\(sample?.verticalSpeed ?? 0, format: .number.precision(.fractionLength(0))) ft/min")
@@ -848,7 +856,7 @@ private struct AircraftReadoutOverlay: View {
                         .foregroundStyle(.secondary)
                 }
 
-                Spacer(minLength: 12)
+                Spacer()
 
                 VStack(alignment: .trailing, spacing: 1) {
                     Text("G: \(loadFactor, format: .number.precision(.fractionLength(1)))")
@@ -882,7 +890,7 @@ private struct AircraftReadoutOverlay: View {
                 readout("Bank", value: attitude.roll, unit: "°", color: .blue)
             }
             .padding(.trailing, 8)
-            .padding(.bottom, 42)
+            .padding(.bottom, 8)
         }
         .allowsHitTesting(false)
     }

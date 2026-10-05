@@ -195,21 +195,16 @@ struct FlightVideoDataOverlay: View {
 
                 HStack(alignment: .bottom, spacing: 10) {
                     VStack(alignment: .leading, spacing: 4) {
+                        metric(icon: "location.north.line.fill", value: sample.heading, unit: "°")
+                            .accessibilityLabel("Cap")
+                        metric("△", value: aerobaticAxisDeviation, unit: "°")
+                            .accessibilityLabel("Écart d’axe")
                         metric("IAS", value: sample.indicatedAirspeed, unit: "km/h")
                         metric("GS", value: sample.speed, unit: "km/h")
                     }
                         .frame(maxWidth: .infinity, alignment: .leading)
 
                     VStack(spacing: 4) {
-                        ZStack {
-                            metric("Cap", value: sample.heading, unit: "°")
-
-                            metric("△", value: aerobaticAxisDeviation, unit: "°")
-                                .accessibilityLabel("Écart d’axe")
-                                .offset(x: 72)
-                        }
-                        .frame(width: 270)
-
                         AnalogInstrumentsView(
                             speed: sample.indicatedAirspeed,
                             altitude: sample.altitude,
@@ -258,6 +253,22 @@ struct FlightVideoDataOverlay: View {
 
         return VStack(spacing: 0) {
             Text(label)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Text(verbatim: "\(formattedValue) \(unit)")
+                .font(.caption.monospacedDigit().bold())
+        }
+        .padding(.horizontal, 7)
+        .padding(.vertical, 4)
+        .background(.black.opacity(0.68), in: RoundedRectangle(cornerRadius: 6))
+        .foregroundStyle(.white)
+    }
+
+    private func metric(icon: String, value: Double, unit: String) -> some View {
+        let formattedValue = value.formatted(.number.precision(.fractionLength(0)))
+
+        return VStack(spacing: 0) {
+            Image(systemName: icon)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
             Text(verbatim: "\(formattedValue) \(unit)")
@@ -336,23 +347,22 @@ struct VideoInformationOverlay: View {
     var body: some View {
         ZStack {
             if showsPlaybackStatus {
-                VStack(spacing: 6) {
-                    HStack(spacing: 6) {
-                        Text(elapsedTime.clockString)
-                            .font(.body.monospacedDigit().bold())
-                            .padding(.horizontal, 9)
-                            .padding(.vertical, 3)
-                            .background(.regularMaterial, in: Rectangle())
+                Text(elapsedTime.clockString)
+                    .font(.body.monospacedDigit().bold())
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 3)
+                    .background(.regularMaterial, in: Rectangle())
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
 
-                        if let previousBookmark {
-                            Label(previousBookmark, systemImage: "bookmark.fill")
-                                .lineLimit(1)
-                                .font(.caption)
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 5)
-                                .background(.black.opacity(0.65), in: Capsule())
-                                .foregroundStyle(.white)
-                        }
+                VStack(spacing: 6) {
+                    if let previousBookmark {
+                        Label(previousBookmark, systemImage: "bookmark.fill")
+                            .lineLimit(1)
+                            .font(.caption)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 5)
+                            .background(.black.opacity(0.65), in: Capsule())
+                            .foregroundStyle(.white)
                     }
 
                     if let upcomingBookmark {
@@ -364,9 +374,8 @@ struct VideoInformationOverlay: View {
                             .background(.regularMaterial, in: Rectangle())
                             .transition(.scale.combined(with: .opacity))
                     }
-
-                    Spacer()
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             }
 
             if let timestamp {
@@ -602,6 +611,7 @@ struct ArtificialHorizonView: View {
     let pitch: Double
     let roll: Double
     var marker: ArtificialHorizonMarker = .wings
+    var displaySize: CGFloat = 140
 
     var body: some View {
         GeometryReader { proxy in
@@ -620,7 +630,10 @@ struct ArtificialHorizonView: View {
                         .fill(.white.opacity(0.9))
                         .frame(height: 2)
 
-                    ArtificialHorizonPitchLadder()
+                    ArtificialHorizonPitchLadder(
+                        marker: marker,
+                        displaySize: displaySize
+                    )
                 }
                 .frame(width: fillSize, height: fillSize)
                 .rotationEffect(.degrees(-roll))
@@ -649,6 +662,7 @@ struct ArtificialHorizonView: View {
                         .yellow,
                         style: StrokeStyle(lineWidth: 3, lineCap: .round, lineJoin: .round)
                     )
+                    .shadow(color: .black.opacity(0.8), radius: 1, y: 1)
                 }
                 .frame(width: referenceSize, height: referenceSize)
                 .scaleEffect(contentScale)
@@ -662,15 +676,26 @@ struct ArtificialHorizonView: View {
 }
 
 private struct ArtificialHorizonPitchLadder: View {
-    private static let marks = [-90, -60, -30, -20, -10, 10, 20, 30, 60, 90]
+    let marker: ArtificialHorizonMarker
+    let displaySize: CGFloat
     private let pointsPerDegree: CGFloat = 2
+
+    private var marks: [Int] {
+        if marker == .triangle || displaySize < 90 {
+            return [-10, 10]
+        }
+        if displaySize < 120 {
+            return [-20, -10, 10, 20]
+        }
+        return [-30, -20, -10, 10, 20, 30]
+    }
 
     var body: some View {
         GeometryReader { proxy in
             let centerX = proxy.size.width / 2
             let centerY = proxy.size.height / 2
 
-            ForEach(Self.marks, id: \.self) { degree in
+            ForEach(marks, id: \.self) { degree in
                 let y = centerY - CGFloat(degree) * pointsPerDegree
                 let halfWidth = barHalfWidth(for: abs(degree))
 
@@ -681,22 +706,42 @@ private struct ArtificialHorizonPitchLadder: View {
                     path.addLine(to: CGPoint(x: centerX + halfWidth, y: y))
                 }
                 .stroke(
-                    .white.opacity(0.58),
-                    style: StrokeStyle(lineWidth: 1, lineCap: .round)
+                    .white.opacity(lineOpacity(for: degree)),
+                    style: StrokeStyle(
+                        lineWidth: abs(degree) == 10 ? 1.4 : 1,
+                        lineCap: .round
+                    )
                 )
 
-                Text(verbatim: "\(degree)°")
-                    .font(.system(size: 8, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(.white)
-                    .position(x: centerX - halfWidth - 22, y: y)
+                if showsLabel(for: degree) {
+                    Text(verbatim: "\(abs(degree))")
+                        .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(.white.opacity(0.82))
+                        .position(x: centerX - halfWidth - 17, y: y)
 
-                Text(verbatim: "\(degree)°")
-                    .font(.system(size: 8, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(.white)
-                    .position(x: centerX + halfWidth + 22, y: y)
+                    if displaySize >= 120 {
+                        Text(verbatim: "\(abs(degree))")
+                            .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(.white.opacity(0.82))
+                            .position(x: centerX + halfWidth + 17, y: y)
+                    }
+                }
             }
         }
         .accessibilityHidden(true)
+    }
+
+    private func showsLabel(for degree: Int) -> Bool {
+        guard marker == .wings, displaySize >= 90 else { return false }
+        return displaySize >= 120 || abs(degree) == 10
+    }
+
+    private func lineOpacity(for degree: Int) -> Double {
+        switch abs(degree) {
+        case 10: 0.78
+        case 20: 0.58
+        default: 0.42
+        }
     }
 
     private func barHalfWidth(for degree: Int) -> CGFloat {
@@ -769,7 +814,8 @@ struct TelemetryPanel: View {
         ArtificialHorizonView(
             pitch: attitude.pitch,
             roll: attitude.roll,
-            marker: marker
+            marker: marker,
+            displaySize: horizonSize
         )
         .aspectRatio(1, contentMode: .fit)
         .frame(width: horizonSize, height: horizonSize)
@@ -870,7 +916,7 @@ struct PlaybackControls: View {
             #endif
 
             Button(action: onOpenChaseCam) {
-                Label("Cam", systemImage: "map")
+                Label("Cam", systemImage: "binoculars.fill")
             }
             .labelStyle(.titleAndIcon)
 
