@@ -84,6 +84,7 @@ struct IPhonePortraitFlightView: View {
                 isInverted: model.isCameraInverted,
                 showsAxes: model.shows3DAxes,
                 showsVerticalGrid: model.showsVerticalGrid,
+                showsTrajectoryTrail: model.showsTrajectoryTrail,
                 accelerationX: model.renderingSample?.accelerationX ?? 0,
                 accelerationY: model.renderingSample?.accelerationY ?? 0,
                 accelerationZ: model.renderingSample?.accelerationZ ?? 0,

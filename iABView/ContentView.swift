@@ -259,6 +259,13 @@ struct ContentView: View {
                             set: { _ in model.toggleVerticalGrid() }
                         )
                     )
+                    Toggle(
+                        "Afficher la traînée 3D",
+                        isOn: Binding(
+                            get: { model.showsTrajectoryTrail },
+                            set: { _ in model.toggleTrajectoryTrail() }
+                        )
+                    )
 
                     Toggle(
                         "Montage caméra inversé",
@@ -566,7 +573,7 @@ struct FlightWorkspace: View {
 
     private var videoRow: some View {
         HStack(spacing: 6) {
-            ZStack(alignment: .topLeading) {
+            ZStack(alignment: .topTrailing) {
                 VideoPane(
                     title: "Caméra avant",
                     player: model.displayedFrontPlayer,
@@ -723,6 +730,7 @@ struct FlightWorkspace: View {
             isInverted: model.isCameraInverted,
             showsAxes: model.shows3DAxes,
             showsVerticalGrid: model.showsVerticalGrid,
+            showsTrajectoryTrail: model.showsTrajectoryTrail,
             accelerationX: sample?.accelerationX ?? 0,
             accelerationY: sample?.accelerationY ?? 0,
             accelerationZ: sample?.accelerationZ ?? 0,

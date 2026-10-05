@@ -687,7 +687,7 @@ private struct ArtificialHorizonPitchLadder: View {
         if displaySize < 120 {
             return [-20, -10, 10, 20]
         }
-        return [-30, -20, -10, 10, 20, 30]
+        return [-90, -60, -30, -20, -10, 10, 20, 30, 60, 90]
     }
 
     var body: some View {
@@ -740,6 +740,7 @@ private struct ArtificialHorizonPitchLadder: View {
         switch abs(degree) {
         case 10: 0.78
         case 20: 0.58
+        case 90: 0.5
         default: 0.42
         }
     }
@@ -748,7 +749,7 @@ private struct ArtificialHorizonPitchLadder: View {
         switch degree {
         case 10:
             return 42
-        case 20, 30:
+        case 20, 30, 60, 90:
             return 34
         default:
             return 28

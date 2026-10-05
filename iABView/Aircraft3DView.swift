@@ -21,6 +21,7 @@ struct Aircraft3DView: PlatformViewRepresentable {
     let isInverted: Bool
     let showsAxes: Bool
     let showsVerticalGrid: Bool
+    let showsTrajectoryTrail: Bool
     let accelerationX: Double
     let accelerationY: Double
     let accelerationZ: Double
@@ -80,6 +81,9 @@ struct Aircraft3DView: PlatformViewRepresentable {
         context.coordinator.loadModelIfNeeded(from: modelURL)
         context.coordinator.axes.isHidden = !showsAxes
         context.coordinator.verticalGrid.isHidden = !showsVerticalGrid
+        context.coordinator.trajectoryTrail.isHidden = !showsTrajectoryTrail
+        context.coordinator.leftWingtipTrail.isHidden = !showsTrajectoryTrail
+        context.coordinator.rightWingtipTrail.isHidden = !showsTrajectoryTrail
         if samples.isEmpty {
             context.coordinator.updateAircraft(
                 quaternionW: quaternionW,
@@ -100,12 +104,19 @@ struct Aircraft3DView: PlatformViewRepresentable {
         private let modelRoot = SCNNode()
         let axes = SCNNode()
         let verticalGrid = SCNNode()
+        let trajectoryTrail = SCNNode()
+        let leftWingtipTrail = SCNNode()
+        let rightWingtipTrail = SCNNode()
         private let accelerationVector = SCNNode()
         private let accelerationTrail = SCNNode()
         private let velocityVector = SCNNode()
         private let noseTrail = SCNNode()
         private var trailPoints: [SCNVector3] = []
         private var noseTrailPoints: [SCNVector3] = []
+        private var lastTrajectoryTrailIndex = -1
+        private let trajectoryWindowSeconds: TimeInterval = 12
+        private let trajectoryMetersPerUnit: Double = 55
+        private let wingHalfSpan: Float = 2.1
         private var currentModelURL: URL?
         private var realtimeSamples: [FlightSample] = []
         private weak var player: AVPlayer?
@@ -137,10 +148,118 @@ struct Aircraft3DView: PlatformViewRepresentable {
 
             self.player = player
             realtimeSamples = samples
+            lastTrajectoryTrailIndex = -1
+            trajectoryTrail.geometry = nil
+            leftWingtipTrail.geometry = nil
+            rightWingtipTrail.geometry = nil
         }
 
         func renderer(_ renderer: any SCNSceneRenderer, updateAtTime time: TimeInterval) {
             updateFromPlaybackClock()
+        }
+
+        // Rotation about the X axis, shared by every helper below. It re-expresses the
+        // Z-up attitude math (same convention as FlightSample.attitude) in SceneKit's Y-up
+        // scene space. Being a change of basis, it must be applied around a full body-frame
+        // vector transform (bodyOrientation.act(v)) rather than folded into the orientation
+        // quaternion first — conjugating sceneOrientation and then feeding it a raw body axis
+        // silently remaps which axis comes out (that bug sent the trail out along the
+        // aircraft's vertical axis instead of its nose).
+        private let zUpToYUp = simd_quatf(angle: -.pi / 2, axis: SIMD3<Float>(1, 0, 0))
+
+        private func bodyOrientation(
+            quaternionW: Double,
+            quaternionX: Double,
+            quaternionY: Double,
+            quaternionZ: Double,
+            mountingPitch: Double,
+            isInverted: Bool
+        ) -> simd_quatf {
+            let rawSensorQuaternion = simd_quatf(
+                ix: Float(quaternionX),
+                iy: Float(quaternionY),
+                iz: Float(quaternionZ),
+                r: Float(quaternionW)
+            )
+            let sensorQuaternion = rawSensorQuaternion.normalizedSafely
+            let pitchCorrection = simd_quatf(
+                angle: Float(-mountingPitch * .pi / 180),
+                axis: SIMD3<Float>(1, 0, 0)
+            )
+            let sensorToAircraftAxes = simd_quatf(
+                angle: -.pi / 2,
+                axis: SIMD3<Float>(1, 0, 0)
+            )
+            let inversionCorrection = simd_quatf(
+                angle: isInverted ? .pi : 0,
+                axis: SIMD3<Float>(0, 1, 0)
+            )
+            return sensorQuaternion
+                * inversionCorrection
+                * sensorToAircraftAxes
+                * pitchCorrection
+        }
+
+        private func sceneOrientation(
+            quaternionW: Double,
+            quaternionX: Double,
+            quaternionY: Double,
+            quaternionZ: Double,
+            mountingPitch: Double,
+            isInverted: Bool
+        ) -> simd_quatf {
+            let orientation = bodyOrientation(
+                quaternionW: quaternionW,
+                quaternionX: quaternionX,
+                quaternionY: quaternionY,
+                quaternionZ: quaternionZ,
+                mountingPitch: mountingPitch,
+                isInverted: isInverted
+            )
+            return zUpToYUp * orientation * zUpToYUp.inverse
+        }
+
+        // The aircraft's nose-forward direction (body axis (0, 1, 0)), transformed into
+        // SceneKit's Y-up scene space for use in world-space vector math (e.g. the trail).
+        private func sceneForward(
+            quaternionW: Double,
+            quaternionX: Double,
+            quaternionY: Double,
+            quaternionZ: Double,
+            mountingPitch: Double,
+            isInverted: Bool
+        ) -> SIMD3<Float> {
+            let orientation = bodyOrientation(
+                quaternionW: quaternionW,
+                quaternionX: quaternionX,
+                quaternionY: quaternionY,
+                quaternionZ: quaternionZ,
+                mountingPitch: mountingPitch,
+                isInverted: isInverted
+            )
+            return zUpToYUp.act(orientation.act(SIMD3<Float>(0, 1, 0)))
+        }
+
+        // The aircraft's right-wing direction (body axis (1, 0, 0)), transformed into
+        // SceneKit's Y-up scene space. Offsetting the dead-reckoned path by this vector at
+        // each sample's own roll angle is what makes the wingtip trails twist with roll.
+        private func sceneRight(
+            quaternionW: Double,
+            quaternionX: Double,
+            quaternionY: Double,
+            quaternionZ: Double,
+            mountingPitch: Double,
+            isInverted: Bool
+        ) -> SIMD3<Float> {
+            let orientation = bodyOrientation(
+                quaternionW: quaternionW,
+                quaternionX: quaternionX,
+                quaternionY: quaternionY,
+                quaternionZ: quaternionZ,
+                mountingPitch: mountingPitch,
+                isInverted: isInverted
+            )
+            return zUpToYUp.act(orientation.act(SIMD3<Float>(1, 0, 0)))
         }
 
         func updateAircraft(
@@ -153,34 +272,14 @@ struct Aircraft3DView: PlatformViewRepresentable {
             isInverted: Bool? = nil,
             updatesFlightVector: Bool = true
         ) {
-            let rawSensorQuaternion = simd_quatf(
-                ix: Float(quaternionX),
-                iy: Float(quaternionY),
-                iz: Float(quaternionZ),
-                r: Float(quaternionW)
+            let sceneOrientation = sceneOrientation(
+                quaternionW: quaternionW,
+                quaternionX: quaternionX,
+                quaternionY: quaternionY,
+                quaternionZ: quaternionZ,
+                mountingPitch: mountingPitch ?? realtimeMountingPitch,
+                isInverted: isInverted ?? realtimeIsInverted
             )
-            let sensorQuaternion = rawSensorQuaternion.normalizedSafely
-            let pitchCorrection = simd_quatf(
-                angle: Float(-(mountingPitch ?? realtimeMountingPitch) * .pi / 180),
-                axis: SIMD3<Float>(1, 0, 0)
-            )
-            let sensorToAircraftAxes = simd_quatf(
-                angle: -.pi / 2,
-                axis: SIMD3<Float>(1, 0, 0)
-            )
-            let inversionCorrection = simd_quatf(
-                angle: (isInverted ?? realtimeIsInverted) ? .pi : 0,
-                axis: SIMD3<Float>(0, 1, 0)
-            )
-            let orientation = sensorQuaternion
-                * inversionCorrection
-                * sensorToAircraftAxes
-                * pitchCorrection
-            let zUpToYUp = simd_quatf(
-                angle: -.pi / 2,
-                axis: SIMD3<Float>(1, 0, 0)
-            )
-            let sceneOrientation = zUpToYUp * orientation * zUpToYUp.inverse
             SCNTransaction.begin()
             SCNTransaction.disableActions = true
             if updatesFlightVector {
@@ -198,10 +297,16 @@ struct Aircraft3DView: PlatformViewRepresentable {
             let isInverted = realtimeIsInverted
             realtimeLock.unlock()
 
-            guard let player, !samples.isEmpty else { return }
+            guard let player, !samples.isEmpty else {
+                trajectoryTrail.geometry = nil
+                leftWingtipTrail.geometry = nil
+                rightWingtipTrail.geometry = nil
+                return
+            }
             let seconds = player.currentTime().seconds
             guard seconds.isFinite else { return }
-            let sample = samples[sampleIndex(at: seconds, in: samples)]
+            let index = sampleIndex(at: seconds, in: samples)
+            let sample = samples[index]
             updateAircraft(
                 quaternionW: sample.quaternionW,
                 quaternionX: sample.quaternionX,
@@ -212,6 +317,188 @@ struct Aircraft3DView: PlatformViewRepresentable {
                 isInverted: isInverted,
                 updatesFlightVector: false
             )
+            updateTrajectoryTrail(samples: samples, currentIndex: index)
+        }
+
+        private func updateTrajectoryTrail(samples: [FlightSample], currentIndex: Int) {
+            guard samples.indices.contains(currentIndex) else { return }
+            guard currentIndex != lastTrajectoryTrailIndex else { return }
+            lastTrajectoryTrailIndex = currentIndex
+
+            let current = samples[currentIndex]
+            let windowStart = max(0, current.elapsed - trajectoryWindowSeconds)
+            var startIndex = currentIndex
+            while startIndex > 0 && samples[startIndex - 1].elapsed >= windowStart {
+                startIndex -= 1
+            }
+            guard currentIndex - startIndex > 1 else {
+                trajectoryTrail.geometry = nil
+                leftWingtipTrail.geometry = nil
+                rightWingtipTrail.geometry = nil
+                return
+            }
+
+            // Dead-reckons the recent path from attitude (gyro-derived quaternion) and speed,
+            // walking backward from "now". This keeps the trail perfectly in sync with the
+            // model's own rotation and avoids the jitter of raw GPS fixes.
+            let sampleCount = currentIndex - startIndex + 1
+            var relativePositions = [SIMD3<Float>](repeating: .zero, count: sampleCount)
+            var rightVectors = [SIMD3<Float>](repeating: .zero, count: sampleCount)
+            var accumulated = SIMD3<Float>.zero
+            for offset in stride(from: sampleCount - 1, through: 1, by: -1) {
+                let index = startIndex + offset
+                let sample = samples[index]
+                let previous = samples[index - 1]
+                let forward = sceneForward(
+                    quaternionW: sample.quaternionW,
+                    quaternionX: sample.quaternionX,
+                    quaternionY: sample.quaternionY,
+                    quaternionZ: sample.quaternionZ,
+                    mountingPitch: realtimeMountingPitch,
+                    isInverted: realtimeIsInverted
+                )
+                let dt = Float(max(0, sample.elapsed - previous.elapsed))
+                accumulated -= forward * Float(sample.speed / 3.6) * dt
+                relativePositions[offset - 1] = accumulated
+            }
+            for offset in 0..<sampleCount {
+                let sample = samples[startIndex + offset]
+                rightVectors[offset] = sceneRight(
+                    quaternionW: sample.quaternionW,
+                    quaternionX: sample.quaternionX,
+                    quaternionY: sample.quaternionY,
+                    quaternionZ: sample.quaternionZ,
+                    mountingPitch: realtimeMountingPitch,
+                    isInverted: realtimeIsInverted
+                )
+            }
+
+            let scale = Float(1.0 / trajectoryMetersPerUnit)
+            let pivot = SIMD3<Float>(0, 0.8, 0)
+            let scenePositions = relativePositions.map { $0 * scale + pivot }
+
+            var centerVertices: [SCNVector3] = []
+            var centerColors: [Float] = []
+            var rightVertices: [SCNVector3] = []
+            var rightColors: [Float] = []
+            var leftVertices: [SCNVector3] = []
+            var leftColors: [Float] = []
+            let segmentCount = sampleCount - 1
+            centerVertices.reserveCapacity(segmentCount * 2)
+            centerColors.reserveCapacity(segmentCount * 8)
+            rightVertices.reserveCapacity(segmentCount * 2)
+            rightColors.reserveCapacity(segmentCount * 8)
+            leftVertices.reserveCapacity(segmentCount * 2)
+            leftColors.reserveCapacity(segmentCount * 8)
+
+            // Navigation-light convention: red on the left (port) wingtip, green on the
+            // right (starboard), so the two trails read distinctly from the speed-colored
+            // fuselage trail and from each other as they twist with roll.
+            let leftRGBA = fixedColorComponents(.systemRed)
+            let rightRGBA = fixedColorComponents(
+                PlatformColor(red: 0, green: 0.4, blue: 0, alpha: 1)
+            )
+
+            for offset in 1..<sampleCount {
+                let sample = samples[startIndex + offset]
+                let previousCenter = scenePositions[offset - 1]
+                let currentCenter = scenePositions[offset]
+                centerVertices.append(SCNVector3(previousCenter))
+                centerVertices.append(SCNVector3(currentCenter))
+
+                let previousWingOffset = rightVectors[offset - 1] * wingHalfSpan
+                let currentWingOffset = rightVectors[offset] * wingHalfSpan
+                rightVertices.append(SCNVector3(previousCenter + previousWingOffset))
+                rightVertices.append(SCNVector3(currentCenter + currentWingOffset))
+                leftVertices.append(SCNVector3(previousCenter - previousWingOffset))
+                leftVertices.append(SCNVector3(currentCenter - currentWingOffset))
+
+                let age = current.elapsed - sample.elapsed
+                let fade = Float(max(0, min(1, 1 - age / trajectoryWindowSeconds)))
+
+                let centerRGBA = trailColorComponents(forSpeed: sample.speed)
+                let centerPair = [centerRGBA.0, centerRGBA.1, centerRGBA.2, centerRGBA.3 * fade]
+                centerColors.append(contentsOf: centerPair)
+                centerColors.append(contentsOf: centerPair)
+
+                let rightPair = [rightRGBA.0, rightRGBA.1, rightRGBA.2, rightRGBA.3 * fade]
+                rightColors.append(contentsOf: rightPair)
+                rightColors.append(contentsOf: rightPair)
+                let leftPair = [leftRGBA.0, leftRGBA.1, leftRGBA.2, leftRGBA.3 * fade]
+                leftColors.append(contentsOf: leftPair)
+                leftColors.append(contentsOf: leftPair)
+            }
+
+            trajectoryTrail.geometry = coloredLineGeometry(
+                vertices: centerVertices,
+                colorComponents: centerColors
+            )
+            rightWingtipTrail.geometry = coloredLineGeometry(
+                vertices: rightVertices,
+                colorComponents: rightColors
+            )
+            leftWingtipTrail.geometry = coloredLineGeometry(
+                vertices: leftVertices,
+                colorComponents: leftColors
+            )
+        }
+
+        private func trailColorComponents(forSpeed speed: Double) -> (Float, Float, Float, Float) {
+            switch speed {
+            case ..<113:
+                return fixedColorComponents(.systemBlue)
+            case ..<236:
+                return fixedColorComponents(.systemGreen)
+            case ..<300:
+                return fixedColorComponents(.systemYellow)
+            default:
+                return fixedColorComponents(.systemRed)
+            }
+        }
+
+        private func fixedColorComponents(_ color: PlatformColor) -> (Float, Float, Float, Float) {
+            #if os(macOS)
+            let converted = color.usingColorSpace(.deviceRGB) ?? color
+            return (
+                Float(converted.redComponent),
+                Float(converted.greenComponent),
+                Float(converted.blueComponent),
+                Float(converted.alphaComponent)
+            )
+            #else
+            var red: CGFloat = 0
+            var green: CGFloat = 0
+            var blue: CGFloat = 0
+            var alpha: CGFloat = 0
+            color.getRed(&red, green: &green, blue: &blue, alpha: &alpha)
+            return (Float(red), Float(green), Float(blue), Float(alpha))
+            #endif
+        }
+
+        private func coloredLineGeometry(
+            vertices: [SCNVector3],
+            colorComponents: [Float]
+        ) -> SCNGeometry? {
+            guard vertices.count > 1 else { return nil }
+            let vertexSource = SCNGeometrySource(vertices: vertices)
+            let colorData = colorComponents.withUnsafeBytes { Data($0) }
+            let colorSource = SCNGeometrySource(
+                data: colorData,
+                semantic: .color,
+                vectorCount: vertices.count,
+                usesFloatComponents: true,
+                componentsPerVector: 4,
+                bytesPerComponent: MemoryLayout<Float>.size,
+                dataOffset: 0,
+                dataStride: MemoryLayout<Float>.size * 4
+            )
+            let indices = vertices.indices.map(Int32.init)
+            let element = SCNGeometryElement(indices: indices, primitiveType: .line)
+            let geometry = SCNGeometry(sources: [vertexSource, colorSource], elements: [element])
+            geometry.firstMaterial?.lightingModel = .constant
+            geometry.firstMaterial?.isDoubleSided = true
+            geometry.firstMaterial?.writesToDepthBuffer = false
+            return geometry
         }
 
         private func sampleIndex(at time: TimeInterval, in samples: [FlightSample]) -> Int {
@@ -293,6 +580,9 @@ struct Aircraft3DView: PlatformViewRepresentable {
             configureVerticalGrid()
             scene.rootNode.addChildNode(axes)
             scene.rootNode.addChildNode(verticalGrid)
+            scene.rootNode.addChildNode(trajectoryTrail)
+            scene.rootNode.addChildNode(leftWingtipTrail)
+            scene.rootNode.addChildNode(rightWingtipTrail)
             scene.rootNode.addChildNode(makeGround())
             scene.rootNode.addChildNode(makeGroundGrid())
             scene.rootNode.addChildNode(makeCamera())
