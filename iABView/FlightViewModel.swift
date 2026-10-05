@@ -54,7 +54,7 @@ final class FlightViewModel {
     private(set) var maximumLoadFactor = 0.0
     private(set) var maximumAltitude = 0.0
     private(set) var maximumSpeed = 0.0
-    private(set) var shows3DAxes = false
+    private(set) var shows3DAxes = true
     private(set) var showsVerticalGrid = false
     private(set) var isAudioMuted = false
     private(set) var playbackCorrectionCount = 0

@@ -27,6 +27,9 @@ struct Aircraft3DView: PlatformViewRepresentable {
     let speed: Double
     let samples: [FlightSample]
     let player: AVPlayer
+    var finalRotationX = 90.0
+    var finalRotationY = 0.0
+    var finalRotationZ = 90.0
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
@@ -53,7 +56,12 @@ struct Aircraft3DView: PlatformViewRepresentable {
     private func makeView(context: Context) -> SCNView {
         let view = SCNView()
         view.scene = context.coordinator.scene
-        view.backgroundColor = .white
+        view.backgroundColor = PlatformColor(
+            red: 0.12,
+            green: 0.20,
+            blue: 0.31,
+            alpha: 1
+        )
         view.antialiasingMode = .multisampling4X
         view.allowsCameraControl = true
         view.autoenablesDefaultLighting = false
@@ -70,9 +78,14 @@ struct Aircraft3DView: PlatformViewRepresentable {
             samples: samples,
             player: player,
             mountingPitch: mountingPitch,
-            isInverted: isInverted
+            isInverted: isInverted,
+            finalRotationX: finalRotationX,
+            finalRotationY: finalRotationY,
+            finalRotationZ: finalRotationZ
         )
         context.coordinator.loadModelIfNeeded(from: modelURL)
+        context.coordinator.axes.isHidden = !showsAxes
+        context.coordinator.verticalGrid.isHidden = !showsVerticalGrid
         if samples.isEmpty {
             context.coordinator.updateAircraft(
                 quaternionW: quaternionW,
@@ -104,6 +117,9 @@ struct Aircraft3DView: PlatformViewRepresentable {
         private weak var player: AVPlayer?
         private var realtimeMountingPitch = 15.0
         private var realtimeIsInverted = false
+        private var realtimeFinalRotationX = 90.0
+        private var realtimeFinalRotationY = 0.0
+        private var realtimeFinalRotationZ = 90.0
         private let realtimeLock = NSLock()
 
         override init() {
@@ -115,12 +131,18 @@ struct Aircraft3DView: PlatformViewRepresentable {
             samples: [FlightSample],
             player: AVPlayer,
             mountingPitch: Double,
-            isInverted: Bool
+            isInverted: Bool,
+            finalRotationX: Double,
+            finalRotationY: Double,
+            finalRotationZ: Double
         ) {
             realtimeLock.lock()
             defer { realtimeLock.unlock() }
             realtimeMountingPitch = mountingPitch
             realtimeIsInverted = isInverted
+            realtimeFinalRotationX = finalRotationX
+            realtimeFinalRotationY = finalRotationY
+            realtimeFinalRotationZ = finalRotationZ
 
             let needsRestart = self.player !== player
                 || realtimeSamples.count != samples.count
@@ -169,13 +191,26 @@ struct Aircraft3DView: PlatformViewRepresentable {
                 * inversionCorrection
                 * sensorToAircraftAxes
                 * pitchCorrection
+            let finalXRotation = simd_quatf(
+                angle: Float(realtimeFinalRotationX * .pi / 180),
+                axis: SIMD3<Float>(1, 0, 0)
+            )
+            let finalYRotation = simd_quatf(
+                angle: Float(realtimeFinalRotationY * .pi / 180),
+                axis: SIMD3<Float>(0, 1, 0)
+            )
+            let finalZRotation = simd_quatf(
+                angle: Float(realtimeFinalRotationZ * .pi / 180),
+                axis: SIMD3<Float>(0, 0, 1)
+            )
+            let displayedOrientation = orientation * finalXRotation * finalYRotation * finalZRotation
 
             SCNTransaction.begin()
             SCNTransaction.disableActions = true
             if updatesFlightVector {
                 updateFlightVector(orientation: orientation, speed: speed)
             }
-            aircraft.simdOrientation = orientation
+            aircraft.simdOrientation = displayedOrientation
             SCNTransaction.commit()
         }
 
@@ -244,6 +279,22 @@ struct Aircraft3DView: PlatformViewRepresentable {
         }
 
         private func configureScene() {
+            scene.background.contents = PlatformColor(
+                red: 0.12,
+                green: 0.20,
+                blue: 0.31,
+                alpha: 1
+            )
+            scene.fogColor = PlatformColor(
+                red: 0.35,
+                green: 0.48,
+                blue: 0.60,
+                alpha: 1
+            )
+            scene.fogStartDistance = 14
+            scene.fogEndDistance = 34
+            scene.fogDensityExponent = 1.2
+
             aircraft.simdPosition = SIMD3<Float>(0, 0.8, 0)
             modelRoot.simdPosition = SIMD3<Float>(0, 0, 0)
             scene.rootNode.addChildNode(aircraft)
@@ -258,6 +309,12 @@ struct Aircraft3DView: PlatformViewRepresentable {
             fallbackModel.addChildNode(makeTail())
             fallbackModel.addChildNode(makeNose())
             modelRoot.addChildNode(fallbackModel)
+            configureAxes()
+            configureVerticalGrid()
+            scene.rootNode.addChildNode(axes)
+            scene.rootNode.addChildNode(verticalGrid)
+            scene.rootNode.addChildNode(makeGround())
+            scene.rootNode.addChildNode(makeGroundGrid())
             scene.rootNode.addChildNode(makeCamera())
             scene.rootNode.addChildNode(makeLight())
             scene.rootNode.addChildNode(makeFillLight())
@@ -438,7 +495,24 @@ struct Aircraft3DView: PlatformViewRepresentable {
                     color: .systemBlue
                 )
             )
+            axes.addChildNode(axisLabel("X", color: .systemRed, position: SCNVector3(3.15, 0, 0)))
+            axes.addChildNode(axisLabel("Y", color: .systemGreen, position: SCNVector3(0, 3.15, 0)))
+            axes.addChildNode(axisLabel("Z", color: .systemBlue, position: SCNVector3(0, 0, 3.15)))
             axes.isHidden = true
+        }
+
+        private func axisLabel(_ text: String, color: PlatformColor, position: SCNVector3) -> SCNNode {
+            let geometry = SCNText(string: text, extrusionDepth: 0.04)
+            geometry.font = .boldSystemFont(ofSize: 12)
+            geometry.flatness = 0.2
+            geometry.firstMaterial?.diffuse.contents = color
+            geometry.firstMaterial?.lightingModel = .constant
+
+            let node = SCNNode(geometry: geometry)
+            node.position = position
+            node.scale = SCNVector3(0.035, 0.035, 0.035)
+            node.constraints = [SCNBillboardConstraint()]
+            return node
         }
 
         private func configureVerticalGrid() {
@@ -473,12 +547,12 @@ struct Aircraft3DView: PlatformViewRepresentable {
             let node = SCNNode()
             for value in stride(from: -10, through: 10, by: 1) {
                 let horizontal = line(
-                    from: SCNVector3(-10, -2, Float(value)),
-                    to: SCNVector3(10, -2, Float(value))
+                    from: SCNVector3(-10, -1.98, Float(value)),
+                    to: SCNVector3(10, -1.98, Float(value))
                 )
                 let vertical = line(
-                    from: SCNVector3(Float(value), -2, -10),
-                    to: SCNVector3(Float(value), -2, 10)
+                    from: SCNVector3(Float(value), -1.98, -10),
+                    to: SCNVector3(Float(value), -1.98, 10)
                 )
                 node.addChildNode(horizontal)
                 node.addChildNode(vertical)
@@ -486,27 +560,46 @@ struct Aircraft3DView: PlatformViewRepresentable {
             return node
         }
 
+        private func makeGround() -> SCNNode {
+            let floor = SCNFloor()
+            floor.reflectivity = 0.06
+            floor.reflectionFalloffEnd = 7
+            floor.firstMaterial?.lightingModel = .physicallyBased
+            floor.firstMaterial?.diffuse.contents = PlatformColor(
+                red: 0.055,
+                green: 0.09,
+                blue: 0.14,
+                alpha: 1
+            )
+            floor.firstMaterial?.roughness.contents = 0.82
+
+            let node = SCNNode(geometry: floor)
+            node.position.y = -2
+            node.castsShadow = false
+            return node
+        }
+
         private func line(from start: SCNVector3, to end: SCNVector3) -> SCNNode {
             let source = SCNGeometrySource(vertices: [start, end])
             let element = SCNGeometryElement(indices: [Int32(0), Int32(1)], primitiveType: .line)
             let geometry = SCNGeometry(sources: [source], elements: [element])
-            geometry.firstMaterial?.diffuse.contents = PlatformColor.systemGreen.withAlphaComponent(0.35)
+            geometry.firstMaterial?.diffuse.contents = PlatformColor.systemTeal.withAlphaComponent(0.28)
+            geometry.firstMaterial?.lightingModel = .constant
             return SCNNode(geometry: geometry)
         }
 
         private func makeCamera() -> SCNNode {
             let camera = SCNCamera()
-            camera.fieldOfView = 48
+            camera.fieldOfView = 44
             camera.zNear = 0.1
-            camera.zFar = 100
+            camera.zFar = 80
+            camera.wantsHDR = true
+            camera.screenSpaceAmbientOcclusionIntensity = 0.65
+            camera.screenSpaceAmbientOcclusionRadius = 4
             let node = SCNNode()
             node.camera = camera
-            node.simdPosition = SIMD3<Float>(8, 0, 0)
-            node.simdEulerAngles = SIMD3<Float>(
-                .pi / 2,
-                0,
-                .pi / 2
-            )
+            node.simdPosition = SIMD3<Float>(7.2, 4.2, 5.4)
+            node.look(at: SCNVector3(0, 0.4, 0))
             return node
         }
 

@@ -34,7 +34,20 @@ struct VideoPane: View {
 
             if overlayStyle == .headingOnly {
                 if let flightSample {
-                    VideoHeadingOverlay(heading: flightSample.heading)
+                    VideoHeadingOverlay(heading: flightSample.heading, speed: flightSample.speed)
+                }
+                if let timestamp {
+                    Text(
+                        timestamp,
+                        format: .dateTime.day().month(.twoDigits).year().hour().minute().second()
+                    )
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 4)
+                    .background(.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 5))
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: timestampAlignment)
+                    .padding(8)
                 }
             } else {
                 VideoInformationOverlay(
@@ -62,11 +75,12 @@ struct VideoPane: View {
 
 private struct VideoHeadingOverlay: View {
     let heading: Double
+    let speed: Double
 
     var body: some View {
         VStack {
             Spacer()
-            Text("Cap \(heading, format: .number.precision(.fractionLength(0)))°")
+            Text("Cap \(heading, format: .number.precision(.fractionLength(0)))° · \(speed, format: .number.precision(.fractionLength(0))) km/h")
                 .font(.headline.monospacedDigit())
                 .foregroundStyle(.white)
                 .padding(.horizontal, 10)
@@ -75,8 +89,8 @@ private struct VideoHeadingOverlay: View {
                 .padding(.bottom, 8)
         }
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Cap")
-        .accessibilityValue("\(heading, format: .number.precision(.fractionLength(0))) degrés")
+        .accessibilityLabel("Cap et vitesse")
+        .accessibilityValue("\(heading, format: .number.precision(.fractionLength(0))) degrés, \(speed, format: .number.precision(.fractionLength(0))) kilomètres heure")
     }
 }
 
@@ -720,6 +734,7 @@ struct TelemetryPanel: View {
     let signedLoadFactor: Double
     let mountingPitch: Double
     let isCameraInverted: Bool
+    var horizonSize: CGFloat = 140
 
     private var attitude: Attitude {
         sample?.attitude(mountingPitch: mountingPitch, isInverted: isCameraInverted)
@@ -750,7 +765,7 @@ struct TelemetryPanel: View {
             marker: marker
         )
         .aspectRatio(1, contentMode: .fit)
-        .frame(maxWidth: 140, maxHeight: 140)
+        .frame(width: horizonSize, height: horizonSize)
     }
 }
 

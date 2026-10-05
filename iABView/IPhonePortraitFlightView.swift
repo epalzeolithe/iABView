@@ -50,13 +50,13 @@ struct IPhonePortraitFlightView: View {
         VideoPane(
             title: isFront ? "Caméra avant" : "Caméra arrière",
             player: isFront ? model.displayedFrontPlayer : model.displayedBackPlayer,
-            timestamp: isFront ? nil : model.currentSample?.timestamp,
+            timestamp: model.currentSample?.timestamp,
             elapsedTime: model.currentTime,
             previousBookmark: model.previousBookmarkName,
             upcomingBookmark: model.upcomingBookmarkName,
             flightSample: model.currentSample,
             showsFlightData: isFront,
-            timestampAlignment: isFront ? .topTrailing : .bottomTrailing,
+            timestampAlignment: .bottomTrailing,
             mountingPitch: model.mountingPitch,
             isCameraInverted: model.isCameraInverted,
             overlayStyle: .headingOnly
@@ -68,7 +68,12 @@ struct IPhonePortraitFlightView: View {
     }
 
     private var aircraftSection: some View {
-        ZStack(alignment: .topTrailing) {
+        let attitude = model.currentSample?.attitude(
+            mountingPitch: model.mountingPitch,
+            isInverted: model.isCameraInverted
+        )
+
+        return ZStack(alignment: .topTrailing) {
             Aircraft3DView(
                 quaternionW: model.renderingSample?.quaternionW ?? 1,
                 quaternionX: model.renderingSample?.quaternionX ?? 0,
@@ -91,10 +96,13 @@ struct IPhonePortraitFlightView: View {
                 metric("Vitesse", value: model.currentSample?.speed ?? 0, unit: "km/h")
                 metric("Altitude", value: model.currentSample?.altitude ?? 0, unit: "ft")
                 metric("Vario", value: model.currentSample?.verticalSpeed ?? 0, unit: "ft/min")
+                metric("Tangage", value: attitude?.pitch ?? 0, unit: "°")
+                metric("Roulis", value: attitude?.roll ?? 0, unit: "°")
             }
             .padding(7)
             .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 8))
             .padding(8)
+
         }
         .clipShape(RoundedRectangle(cornerRadius: 10))
         .accessibilityElement(children: .contain)
@@ -212,6 +220,104 @@ struct IPhonePortraitFlightView: View {
                 .frame(maxWidth: .infinity, minHeight: 28)
         }
         .buttonStyle(.bordered)
+        .tint(prominent ? .accentColor : nil)
+        .accessibilityLabel(label)
+    }
+}
+
+struct IPhoneLandscapeFlightView: View {
+    let model: FlightViewModel
+    let onAddBookmark: () -> Void
+    let onOpenFullScreen: (FlightVideoSelection) -> Void
+
+    var body: some View {
+        VStack(spacing: 6) {
+            HStack(spacing: 6) {
+                videoPane(for: .front)
+                videoPane(for: .back)
+            }
+            .frame(maxHeight: .infinity)
+
+            timeline
+            compactControls
+        }
+        .padding(6)
+        .background(Color(uiColor: .systemGroupedBackground))
+    }
+
+    private func videoPane(for selection: FlightVideoSelection) -> some View {
+        let isFront = selection == .front
+
+        return VideoPane(
+            title: isFront ? "Caméra avant" : "Caméra arrière",
+            player: isFront ? model.displayedFrontPlayer : model.displayedBackPlayer,
+            timestamp: nil,
+            elapsedTime: model.currentTime,
+            previousBookmark: model.previousBookmarkName,
+            upcomingBookmark: model.upcomingBookmarkName,
+            flightSample: model.currentSample,
+            showsFlightData: isFront,
+            timestampAlignment: .bottomTrailing,
+            mountingPitch: model.mountingPitch,
+            isCameraInverted: model.isCameraInverted,
+            overlayStyle: .headingOnly
+        )
+        .contentShape(Rectangle())
+        .onTapGesture {
+            onOpenFullScreen(selection)
+        }
+    }
+
+    private var timeline: some View {
+        HStack(spacing: 6) {
+            Text(model.currentTime.clockString)
+            BookmarkTimelineSlider(
+                value: Binding(
+                    get: { model.currentTime },
+                    set: model.seek
+                ),
+                duration: model.duration,
+                bookmarks: model.bookmarks,
+                videoFrameRate: model.frontVideoFrameRate
+            )
+            Text(model.duration.clockString)
+        }
+        .font(.caption2.monospacedDigit())
+        .frame(height: 24)
+    }
+
+    private var compactControls: some View {
+        HStack(spacing: 6) {
+            control("Reculer de 10 secondes", symbol: "gobackward.10") { model.jump(by: -10) }
+            control("Reculer de 2 secondes", symbol: "backward.fill") { model.jump(by: -2) }
+            control(
+                model.isPlaying ? "Pause" : "Lecture",
+                symbol: model.isPlaying ? "pause.fill" : "play.fill",
+                prominent: true,
+                action: model.togglePlayback
+            )
+            control("Avancer de 2 secondes", symbol: "forward.fill") { model.jump(by: 2) }
+            control("Avancer de 10 secondes", symbol: "goforward.10") { model.jump(by: 10) }
+            control("Bookmark précédent", symbol: "backward.end.fill", action: model.previousBookmark)
+            control("Bookmark suivant", symbol: "forward.end.fill", action: model.nextBookmark)
+            control("Ajouter un bookmark", symbol: "bookmark.fill", action: onAddBookmark)
+            control("Mise en ligne", symbol: "airplane.departure", action: model.goToTakeoff)
+        }
+    }
+
+    private func control(
+        _ label: LocalizedStringKey,
+        symbol: String,
+        prominent: Bool = false,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Label(label, systemImage: symbol)
+                .labelStyle(.iconOnly)
+                .frame(maxWidth: .infinity, minHeight: 24)
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.small)
         .tint(prominent ? .accentColor : nil)
         .accessibilityLabel(label)
     }
