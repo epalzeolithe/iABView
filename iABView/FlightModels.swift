@@ -253,9 +253,13 @@ enum FlightBundleLoader {
             throw FlightLoadError.missingFile("merged_data.csv")
         }
 
-        try ensureFileIsDownloaded(csvURL) { fraction in progress(fraction * 0.3) }
+        // Weighted so the bar doesn't look done the moment the (usually quick,
+        // already-local) byte read finishes: parsing hundreds of thousands of
+        // CSV rows into `FlightSample`s is the slowest step for a large flight
+        // log, so it gets the largest share of the range.
+        try ensureFileIsDownloaded(csvURL) { fraction in progress(fraction * 0.2) }
         try Task.checkCancellation()
-        let csv = try readFileTrackingProgress(csvURL) { fraction in progress(0.3 + fraction * 0.7) }
+        let csv = try readFileTrackingProgress(csvURL) { fraction in progress(0.2 + fraction * 0.2) }
         let timestampFormatters = [
             "yyyy-MM-dd HH:mm:ss.SSSSSS",
             "yyyy-MM-dd HH:mm:ss.SSS",
@@ -292,11 +296,19 @@ enum FlightBundleLoader {
         var offset = 0
 
         var isCancelled = false
+        var lineNumber = 0
+        var bytesConsumed = 0
+        let totalBytes = max(1, csv.utf8.count)
         csv.enumerateLines { line, stop in
-            if offset.isMultiple(of: 5_000), Task.isCancelled {
-                isCancelled = true
-                stop = true
-                return
+            bytesConsumed += line.utf8.count + 1
+            lineNumber += 1
+            if lineNumber.isMultiple(of: 2_000) {
+                if Task.isCancelled {
+                    isCancelled = true
+                    stop = true
+                    return
+                }
+                progress(0.4 + Double(bytesConsumed) / Double(totalBytes) * 0.6)
             }
             let row = CSVParser.fields(in: line)
             guard !row.isEmpty else { return }
@@ -373,6 +385,7 @@ enum FlightBundleLoader {
             offset += 1
         }
         if isCancelled { throw CancellationError() }
+        progress(1)
 
         guard !samples.isEmpty else { throw FlightLoadError.emptyData }
         if !isChronological {

@@ -708,7 +708,7 @@ struct FlightWorkspace: View {
                 .layoutPriority(1)
                 #if !os(macOS)
                 .contentShape(Rectangle())
-                .onTapGesture(count: 2) {
+                .onTapGesture {
                     fullScreenInstrument = .aircraft
                 }
                 #endif
@@ -740,7 +740,7 @@ struct FlightWorkspace: View {
                 .layoutPriority(1)
                 #if !os(macOS)
                 .contentShape(Rectangle())
-                .onTapGesture(count: 2) {
+                .onTapGesture {
                     fullScreenInstrument = .flightPath
                 }
                 #endif
