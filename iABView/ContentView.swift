@@ -82,6 +82,10 @@ struct ContentView: View {
                 isLastBundleDialogPresented = model.lastBundleName != nil
             }
         }
+        .onOpenURL { url in
+            model.openBundle(url)
+            preferredCompactColumn = .detail
+        }
         .task(id: isLastBundleDialogPresented) {
             guard isLastBundleDialogPresented else { return }
             do {
@@ -471,10 +475,25 @@ struct FlightWorkspace: View {
     let onDetachAircraft: () -> Void
     let onDetachFlightPath: () -> Void
     @State private var fullScreenVideo: FlightVideoSelection?
+    @State private var fullScreenInstrument: FlightInstrumentSelection?
 
     var body: some View {
         if model.isLoading {
-            ProgressView("Chargement du vol…")
+            VStack(spacing: 14) {
+                ProgressView(value: model.loadingProgress) {
+                    Text("Chargement du vol…")
+                } currentValueLabel: {
+                    Text(model.loadingProgress, format: .percent.precision(.fractionLength(0)))
+                }
+                .progressViewStyle(.linear)
+                .frame(maxWidth: 320)
+
+                Button("Annuler", role: .cancel) {
+                    model.cancelLoading()
+                }
+                .buttonStyle(.bordered)
+            }
+            .padding()
         } else if model.samples.isEmpty {
             ContentUnavailableView {
                 Label("Aucun vol ouvert", systemImage: "airplane.circle")
@@ -523,7 +542,28 @@ struct FlightWorkspace: View {
                     onDismiss: { fullScreenVideo = nil }
                 )
             }
+            .fullScreenCover(item: $fullScreenInstrument) { selection in
+                FullScreenFlightInstrument(onDismiss: { fullScreenInstrument = nil }) {
+                    instrumentContent(for: selection)
+                }
+            }
             #endif
+        }
+    }
+
+    @ViewBuilder
+    private func instrumentContent(for selection: FlightInstrumentSelection) -> some View {
+        switch selection {
+        case .aircraft:
+            aircraftView(sample: model.renderingSample)
+        case .flightPath:
+            FlightPath3DView(model: model)
+        case .map:
+            FlightMapView(
+                coordinates: model.routeCoordinates,
+                sample: model.currentSample,
+                metar: model.currentMETAR
+            )
         }
     }
 
@@ -666,6 +706,12 @@ struct FlightWorkspace: View {
                 .clipShape(RoundedRectangle(cornerRadius: 7))
                 .frame(minWidth: 280)
                 .layoutPriority(1)
+                #if !os(macOS)
+                .contentShape(Rectangle())
+                .onTapGesture(count: 2) {
+                    fullScreenInstrument = .aircraft
+                }
+                #endif
 
                 ZStack(alignment: .bottom) {
                     FlightPath3DView(model: model)
@@ -692,6 +738,12 @@ struct FlightWorkspace: View {
                 .clipShape(RoundedRectangle(cornerRadius: 7))
                 .frame(minWidth: 280)
                 .layoutPriority(1)
+                #if !os(macOS)
+                .contentShape(Rectangle())
+                .onTapGesture(count: 2) {
+                    fullScreenInstrument = .flightPath
+                }
+                #endif
 
                 FlightMapView(
                     coordinates: model.routeCoordinates,
@@ -699,6 +751,12 @@ struct FlightWorkspace: View {
                     metar: model.currentMETAR
                 )
                 .frame(minWidth: 260)
+                #if !os(macOS)
+                .contentShape(Rectangle())
+                .onTapGesture(count: 2) {
+                    fullScreenInstrument = .map
+                }
+                #endif
             }
 
             #if !os(macOS)
@@ -849,6 +907,52 @@ private struct FullScreenFlightVideo: View {
         }
         .contentShape(Rectangle())
         .onTapGesture(perform: onDismiss)
+        #if os(iOS)
+        .task {
+            guard isRunningOnIPhone else { return }
+            await Task.yield()
+            try? await Task.sleep(for: .milliseconds(100))
+            AppOrientationController.request(.landscape)
+        }
+        .onDisappear {
+            guard isRunningOnIPhone else { return }
+            AppOrientationController.request(.portrait)
+        }
+        #endif
+    }
+}
+
+enum FlightInstrumentSelection: String, Identifiable {
+    case aircraft
+    case flightPath
+    case map
+
+    var id: String { rawValue }
+}
+
+private struct FullScreenFlightInstrument<Content: View>: View {
+    let onDismiss: () -> Void
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        ZStack(alignment: .topTrailing) {
+            Color.black
+                .ignoresSafeArea()
+
+            content
+                .ignoresSafeArea()
+                .contentShape(Rectangle())
+                .onTapGesture(count: 2, perform: onDismiss)
+
+            Button(action: onDismiss) {
+                Label("Fermer le plein écran", systemImage: "xmark.circle.fill")
+                    .font(.title)
+            }
+            .labelStyle(.iconOnly)
+            .buttonStyle(.plain)
+            .foregroundStyle(.white)
+            .padding(20)
+        }
         #if os(iOS)
         .task {
             guard isRunningOnIPhone else { return }

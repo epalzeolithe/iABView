@@ -35,6 +35,7 @@ final class FlightViewModel {
     private(set) var metar: [METARReading] = []
     private(set) var currentIndex = 0
     private(set) var isLoading = false
+    private(set) var loadingProgress: Double = 0
     private(set) var isUpdatingMETAR = false
     private(set) var hasBundleWriteAuthorization = false
     private(set) var metarUpdateMessage: String?
@@ -65,6 +66,14 @@ final class FlightViewModel {
     private var timeObserver: Any?
     private var securityScopedURL: URL?
     private var isCorrectingVideoDrift = false
+    private var loadTask: Task<FlightBundle, Error>?
+    private var loadGeneration = 0
+    private var lastDriftSeekTime: TimeInterval = 0
+    private let videoDriftDeadband: TimeInterval = 0.05
+    private let videoDriftHardSeekThreshold: TimeInterval = 0.4
+    private let videoDriftSeekCooldown: TimeInterval = 1.0
+    private let videoDriftMaxNudgeRate: Double = 0.08
+    private let videoDriftNudgeGain: Double = 0.3
 
     init() {
         self.recentBundles = loadRecentBundles()
@@ -150,15 +159,34 @@ final class FlightViewModel {
     }
 
     func openBundle(_ url: URL, grantsWriteAccess: Bool = true) {
+        // `loadTask` is the detached task doing the actual work, not a thin
+        // wrapper, so cancelling it is what makes the `Task.checkCancellation()`
+        // calls inside `FlightBundleLoader` observe cancellation — a wrapper
+        // `Task { try await Task.detached { … }.value }` would only mark itself
+        // cancelled while the unrelated detached task kept running to completion.
+        loadTask?.cancel()
+        loadGeneration += 1
+        let generation = loadGeneration
         isLoading = true
+        loadingProgress = 0
         errorMessage = nil
         let accessGranted = url.startAccessingSecurityScopedResource()
+        let model = WeakFlightViewModel(self)
+
+        let task = Task.detached(priority: .userInitiated) {
+            try FlightBundleLoader.load(from: url) { fraction in
+                Task { @MainActor in
+                    guard model.value?.loadGeneration == generation else { return }
+                    model.value?.loadingProgress = fraction
+                }
+            }
+        }
+        loadTask = task
 
         Task {
             do {
-                let loaded = try await Task.detached(priority: .userInitiated) {
-                    try FlightBundleLoader.load(from: url)
-                }.value
+                let loaded = try await task.value
+                guard generation == loadGeneration else { return }
                 if let previousURL = securityScopedURL {
                     previousURL.stopAccessingSecurityScopedResource()
                 }
@@ -166,12 +194,20 @@ final class FlightViewModel {
                 hasBundleWriteAuthorization = grantsWriteAccess
                 apply(loaded)
                 saveRecentBundle(url)
+            } catch is CancellationError {
+                if accessGranted { url.stopAccessingSecurityScopedResource() }
             } catch {
                 if accessGranted { url.stopAccessingSecurityScopedResource() }
+                guard generation == loadGeneration else { return }
                 errorMessage = error.localizedDescription
             }
+            guard generation == loadGeneration else { return }
             isLoading = false
         }
+    }
+
+    func cancelLoading() {
+        loadTask?.cancel()
     }
 
     func dismissError() {
@@ -724,29 +760,53 @@ final class FlightViewModel {
         }
     }
 
+    // Two-tier correction: small/moderate drift is absorbed by nudging the back
+    // player's rate a few percent so it silently re-converges, with no seek at
+    // all. Only drift beyond `videoDriftHardSeekThreshold` (e.g. after a
+    // buffering stall) triggers a seek, and that seek is throttled and given a
+    // loose tolerance. The previous version seeked frame-accurately (±20ms) on
+    // every drift past 100ms; on footage that needs several frames decoded to
+    // satisfy that tolerance, the seek itself could take longer than the drift
+    // took to appear, so by the time it completed the players had already
+    // drifted past the threshold again — a feedback loop of back-to-back seeks
+    // ("pumping") that each froze the back video for a beat.
     private func correctVideoDrift(frontTime: TimeInterval) {
-        guard !isCorrectingVideoDrift, backPlayer.currentItem != nil else { return }
+        guard isPlaying, backPlayer.currentItem != nil, !isCorrectingVideoDrift else { return }
         let expectedBackTime = max(0, frontTime + backVideoOffset)
         let actualBackTime = backPlayer.currentTime().seconds
-        guard actualBackTime.isFinite,
-              abs(actualBackTime - expectedBackTime) > 0.10 else {
+        guard actualBackTime.isFinite else { return }
+        let drift = actualBackTime - expectedBackTime
+
+        if abs(drift) > videoDriftHardSeekThreshold {
+            let now = ProcessInfo.processInfo.systemUptime
+            guard now - lastDriftSeekTime > videoDriftSeekCooldown else { return }
+            lastDriftSeekTime = now
+
+            backPlayer.rate = 1
+            let target = CMTime(seconds: expectedBackTime, preferredTimescale: 600)
+            let tolerance = CMTime(seconds: 0.15, preferredTimescale: 600)
+            playbackCorrectionCount += 1
+            isCorrectingVideoDrift = true
+            let model = WeakFlightViewModel(self)
+            backPlayer.seek(
+                to: target,
+                toleranceBefore: tolerance,
+                toleranceAfter: tolerance
+            ) { _ in
+                Task { @MainActor in
+                    model.value?.isCorrectingVideoDrift = false
+                }
+            }
             return
         }
 
-        let target = CMTime(seconds: expectedBackTime, preferredTimescale: 600)
-        let tolerance = CMTime(seconds: 0.02, preferredTimescale: 600)
-        playbackCorrectionCount += 1
-        isCorrectingVideoDrift = true
-        let model = WeakFlightViewModel(self)
-        backPlayer.seek(
-            to: target,
-            toleranceBefore: tolerance,
-            toleranceAfter: tolerance
-        ) { _ in
-            Task { @MainActor in
-                model.value?.isCorrectingVideoDrift = false
-            }
+        guard abs(drift) > videoDriftDeadband else {
+            if backPlayer.rate != 1 { backPlayer.rate = 1 }
+            return
         }
+
+        let nudge = max(-videoDriftMaxNudgeRate, min(videoDriftMaxNudgeRate, drift * videoDriftNudgeGain))
+        backPlayer.rate = Float(1 - nudge)
     }
 
     private func saveBookmarks() {

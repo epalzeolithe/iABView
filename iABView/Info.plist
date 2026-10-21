@@ -16,5 +16,44 @@
 	<string>AppIcon</string>
 	<key>NSScreenCaptureUsageDescription</key>
 	<string>iABView enregistre sa fenêtre afin d’exporter une vidéo du vol.</string>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
+	<key>UTExportedTypeDeclarations</key>
+	<array>
+		<dict>
+			<key>UTTypeIdentifier</key>
+			<string>com.epalzeolithe.iabview.flightbundle</string>
+			<key>UTTypeDescription</key>
+			<string>Vol ABView</string>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>com.apple.package</string>
+			</array>
+			<key>UTTypeTagSpecification</key>
+			<dict>
+				<key>public.filename-extension</key>
+				<array>
+					<string>abv</string>
+				</array>
+			</dict>
+		</dict>
+	</array>
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Vol ABView</string>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>LSHandlerRank</key>
+			<string>Owner</string>
+			<key>LSTypeIsPackage</key>
+			<true/>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>com.epalzeolithe.iabview.flightbundle</string>
+			</array>
+		</dict>
+	</array>
 </dict>
 </plist>
