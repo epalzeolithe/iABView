@@ -543,7 +543,7 @@ struct FlightWorkspace: View {
                 )
             }
             .fullScreenCover(item: $fullScreenInstrument) { selection in
-                FullScreenFlightInstrument(onDismiss: { fullScreenInstrument = nil }) {
+                FullScreenFlightInstrument(model: model, onDismiss: { fullScreenInstrument = nil }) {
                     instrumentContent(for: selection)
                 }
             }
@@ -637,7 +637,7 @@ struct FlightWorkspace: View {
             .onTapGesture(count: 2, perform: onDetachFront)
             #else
             .contentShape(Rectangle())
-            .onTapGesture(count: 2) {
+            .onTapGesture {
                 fullScreenVideo = .front
             }
             #endif
@@ -671,7 +671,7 @@ struct FlightWorkspace: View {
             .onTapGesture(count: 2, perform: onDetachBack)
             #else
             .contentShape(Rectangle())
-            .onTapGesture(count: 2) {
+            .onTapGesture {
                 fullScreenVideo = .back
             }
             #endif
@@ -904,9 +904,12 @@ private struct FullScreenFlightVideo: View {
             .buttonStyle(.plain)
             .foregroundStyle(.white)
             .padding(20)
+
+            FullScreenPlaybackScrubber(model: model)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
         }
         .contentShape(Rectangle())
-        .onTapGesture(perform: onDismiss)
+        .onTapGesture(count: 2, perform: onDismiss)
         #if os(iOS)
         .task {
             guard isRunningOnIPhone else { return }
@@ -931,6 +934,7 @@ enum FlightInstrumentSelection: String, Identifiable {
 }
 
 private struct FullScreenFlightInstrument<Content: View>: View {
+    let model: FlightViewModel
     let onDismiss: () -> Void
     @ViewBuilder let content: Content
 
@@ -952,6 +956,9 @@ private struct FullScreenFlightInstrument<Content: View>: View {
             .buttonStyle(.plain)
             .foregroundStyle(.white)
             .padding(20)
+
+            FullScreenPlaybackScrubber(model: model)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
         }
         #if os(iOS)
         .task {
@@ -965,6 +972,31 @@ private struct FullScreenFlightInstrument<Content: View>: View {
             AppOrientationController.request(.portrait)
         }
         #endif
+    }
+}
+
+private struct FullScreenPlaybackScrubber: View {
+    let model: FlightViewModel
+
+    var body: some View {
+        ZStack(alignment: .leading) {
+            BookmarkTimelineSlider(
+                value: Binding(
+                    get: { model.currentTime },
+                    set: model.seek
+                ),
+                duration: model.duration,
+                bookmarks: model.bookmarks,
+                videoFrameRate: model.frontVideoFrameRate
+            )
+
+            Text(model.currentTime.clockString)
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.white)
+                .frame(width: 48, alignment: .trailing)
+        }
+        .padding(.horizontal, 16)
+        .padding(.bottom, 20)
     }
 }
 
