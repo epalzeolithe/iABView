@@ -216,18 +216,12 @@ struct FlightVideoDataOverlay: View {
                     }
 
                     VStack(alignment: .trailing, spacing: 4) {
+                        metric("Assiette", value: attitude.pitch, unit: "°")
+                        metric("Roulis", value: attitude.roll, unit: "°")
                         unlabeledMetric("Altitude", value: sample.altitude, unit: "ft")
                         unlabeledMetric("Vario", value: sample.verticalSpeed, unit: "ft/min")
                     }
                         .frame(maxWidth: .infinity, alignment: .trailing)
-                }
-            }
-
-            HStack {
-                Spacer()
-                VStack(spacing: 4) {
-                    metric("Assiette", value: attitude.pitch, unit: "°")
-                    metric("Roulis", value: attitude.roll, unit: "°")
                 }
             }
         }
@@ -681,10 +675,10 @@ private struct ArtificialHorizonPitchLadder: View {
     private let pointsPerDegree: CGFloat = 2
 
     private var marks: [Int] {
-        if marker == .triangle || displaySize < 90 {
+        if marker == .triangle || displaySize < 70 {
             return [-10, 10]
         }
-        if displaySize < 120 {
+        if displaySize < 100 {
             return [-20, -10, 10, 20]
         }
         return [-90, -60, -30, -20, -10, 10, 20, 30, 60, 90]
@@ -719,7 +713,7 @@ private struct ArtificialHorizonPitchLadder: View {
                         .foregroundStyle(.white.opacity(0.82))
                         .position(x: centerX - halfWidth - 17, y: y)
 
-                    if displaySize >= 120 {
+                    if displaySize >= 100 {
                         Text(verbatim: "\(abs(degree))")
                             .font(.system(size: 8, weight: .semibold, design: .monospaced))
                             .foregroundStyle(.white.opacity(0.82))
@@ -732,8 +726,8 @@ private struct ArtificialHorizonPitchLadder: View {
     }
 
     private func showsLabel(for degree: Int) -> Bool {
-        guard marker == .wings, displaySize >= 90 else { return false }
-        return displaySize >= 120 || abs(degree) == 10
+        guard marker == .wings, displaySize >= 70 else { return false }
+        return displaySize >= 100 || abs(degree) == 10
     }
 
     private func lineOpacity(for degree: Int) -> Double {

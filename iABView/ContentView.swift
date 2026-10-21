@@ -530,9 +530,9 @@ struct FlightWorkspace: View {
     private func regularWorkspace(in size: CGSize) -> some View {
         VStack(spacing: 6) {
             videoRow
-                .frame(height: max(250, size.height * 0.36))
+                .frame(height: max(320, size.height * 0.48))
 
-            instrumentRow(in: size)
+            instrumentRow
                 .frame(maxHeight: .infinity)
                 .layoutPriority(1)
 
@@ -613,9 +613,18 @@ struct FlightWorkspace: View {
                     timestampAlignment: .bottomTrailing,
                     overlayStyle: isRunningOnIPhone ? .headingOnly : .standard
                 )
-                #if os(macOS)
-                detachButton(action: onDetachBack)
-                #endif
+                VStack(alignment: .trailing, spacing: 4) {
+                    #if os(macOS)
+                    detachButton(action: onDetachBack)
+                    #endif
+                    PlaybackDiagnosticsOverlay(
+                        currentFrame: model.currentVideoFrame,
+                        playbackCorrectionCount: model.playbackCorrectionCount,
+                        videoFrameRate: model.frontVideoFrameRate,
+                        synchronizationError: model.videoSynchronizationError
+                    )
+                }
+                .padding(8)
             }
             #if os(macOS)
             .contentShape(Rectangle())
@@ -629,7 +638,13 @@ struct FlightWorkspace: View {
         }
     }
 
-    private func instrumentRow(in workspaceSize: CGSize) -> some View {
+    private var instrumentRow: some View {
+        GeometryReader { proxy in
+            instrumentRowContent(in: proxy.size)
+        }
+    }
+
+    private func instrumentRowContent(in workspaceSize: CGSize) -> some View {
         ZStack(alignment: .topLeading) {
             HStack(spacing: 6) {
                 ZStack(alignment: .topTrailing) {
@@ -639,11 +654,6 @@ struct FlightWorkspace: View {
                         loadFactor: model.currentSignedLoadFactor,
                         minimumLoadFactor: model.minimumLoadFactor,
                         maximumLoadFactor: model.maximumLoadFactor,
-                        currentFrame: model.currentVideoFrame,
-                        playbackCorrectionCount: model.playbackCorrectionCount,
-                        videoFrameRate: model.frontVideoFrameRate,
-                        videoOffset: model.frontVideoOffset,
-                        synchronizationError: model.videoSynchronizationError,
                         mountingPitch: model.mountingPitch,
                         isCameraInverted: model.isCameraInverted
                     )
@@ -661,6 +671,22 @@ struct FlightWorkspace: View {
                     FlightPath3DView(model: model)
                     #if os(macOS)
                     detachButton(action: onDetachFlightPath)
+
+                    let windowScale = min(workspaceSize.width / 1_440, workspaceSize.height / 900)
+                    let horizonSize = min(260, max(140, 220 * windowScale))
+
+                    TelemetryPanel(
+                        sample: model.currentSample,
+                        signedLoadFactor: model.currentSignedLoadFactor,
+                        mountingPitch: model.mountingPitch,
+                        isCameraInverted: model.isCameraInverted,
+                        horizonSize: horizonSize
+                    )
+                    .frame(width: horizonSize, height: horizonSize * 2 + 8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.leading, 8)
+                    .padding(.bottom, 8)
+                    .allowsHitTesting(false)
                     #endif
                 }
                 .clipShape(RoundedRectangle(cornerRadius: 7))
@@ -675,29 +701,10 @@ struct FlightWorkspace: View {
                 .frame(minWidth: 260)
             }
 
-            #if os(macOS)
-            let windowScale = min(workspaceSize.width / 1_440, workspaceSize.height / 900)
-            let horizonSize = min(140, max(56, 140 * windowScale))
-
-            TelemetryPanel(
-                sample: model.currentSample,
-                signedLoadFactor: model.currentSignedLoadFactor,
-                mountingPitch: model.mountingPitch,
-                isCameraInverted: model.isCameraInverted,
-                horizonSize: horizonSize
-            )
-            .frame(
-                width: horizonSize,
-                height: horizonSize * 2 + 8,
-                alignment: .leading
-            )
-            .padding(.leading, 8)
-            .padding(.top, max(12, workspaceSize.height * 0.015))
-            .allowsHitTesting(false)
-            #else
+            #if !os(macOS)
             let horizonSize = min(
-                105,
-                max(72, min(workspaceSize.width / 10, workspaceSize.height / 6))
+                140,
+                max(100, min(workspaceSize.width / 8, workspaceSize.height / 3))
             )
 
             TelemetryPanel(
@@ -772,6 +779,28 @@ struct FlightWorkspace: View {
     }
 }
 
+private struct PlaybackDiagnosticsOverlay: View {
+    let currentFrame: Int
+    let playbackCorrectionCount: Int
+    let videoFrameRate: Double
+    let synchronizationError: TimeInterval
+
+    var body: some View {
+        VStack(alignment: .trailing, spacing: 1) {
+            Text("Frame : \(currentFrame)")
+            Text("Corrections : \(playbackCorrectionCount)")
+            Text("FPS : \(videoFrameRate, format: .number.precision(.fractionLength(2)))")
+            Text("Dérive : \(synchronizationError * 1_000, format: .number.precision(.fractionLength(0))) ms")
+        }
+        .font(.caption2.monospacedDigit())
+        .foregroundStyle(.black.opacity(0.7))
+        .padding(.horizontal, 6)
+        .padding(.vertical, 3)
+        .background(.white.opacity(0.78), in: RoundedRectangle(cornerRadius: 4))
+        .allowsHitTesting(false)
+    }
+}
+
 enum FlightVideoSelection: String, Identifiable {
     case front
     case back
@@ -840,11 +869,6 @@ private struct AircraftReadoutOverlay: View {
     let loadFactor: Double
     let minimumLoadFactor: Double
     let maximumLoadFactor: Double
-    let currentFrame: Int
-    let playbackCorrectionCount: Int
-    let videoFrameRate: Double
-    let videoOffset: TimeInterval
-    let synchronizationError: TimeInterval
     let mountingPitch: Double
     let isCameraInverted: Bool
 
@@ -876,21 +900,8 @@ private struct AircraftReadoutOverlay: View {
                 .font(.caption2.monospacedDigit())
                 .foregroundStyle(.secondary)
             }
-
-            Spacer()
-
-            VStack(spacing: 1) {
-                Text("Frame : \(currentFrame)")
-                Text("Corrections : \(playbackCorrectionCount)")
-                Text("FPS : \(videoFrameRate, format: .number.precision(.fractionLength(2)))")
-                Text("Dérive : \(synchronizationError * 1_000, format: .number.precision(.fractionLength(0))) ms")
-            }
-            .font(.caption2.monospacedDigit())
-            .foregroundStyle(.secondary)
-            .padding(.horizontal, 6)
-            .padding(.vertical, 3)
-            .background(.white.opacity(0.78), in: RoundedRectangle(cornerRadius: 4))
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .padding(8)
         .overlay(alignment: .bottomTrailing) {
             VStack(alignment: .trailing, spacing: 4) {

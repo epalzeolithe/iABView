@@ -104,6 +104,10 @@ struct Aircraft3DView: PlatformViewRepresentable {
         private let modelRoot = SCNNode()
         let axes = SCNNode()
         let verticalGrid = SCNNode()
+        private let groundGrid = SCNNode()
+        private var groundGridOffsetX: Float = 0
+        private var groundGridOffsetZ: Float = 0
+        private var lastGridClockSeconds: TimeInterval?
         let trajectoryTrail = SCNNode()
         let leftWingtipTrail = SCNNode()
         let rightWingtipTrail = SCNNode()
@@ -114,7 +118,7 @@ struct Aircraft3DView: PlatformViewRepresentable {
         private var trailPoints: [SCNVector3] = []
         private var noseTrailPoints: [SCNVector3] = []
         private var lastTrajectoryTrailIndex = -1
-        private let trajectoryWindowSeconds: TimeInterval = 12
+        private let trajectoryWindowSeconds: TimeInterval = 24
         private let trajectoryMetersPerUnit: Double = 55
         private let wingHalfSpan: Float = 2.1
         private var currentModelURL: URL?
@@ -317,6 +321,7 @@ struct Aircraft3DView: PlatformViewRepresentable {
                 isInverted: isInverted,
                 updatesFlightVector: false
             )
+            updateGroundGridScroll(sample: sample, seconds: seconds)
             updateTrajectoryTrail(samples: samples, currentIndex: index)
         }
 
@@ -584,7 +589,8 @@ struct Aircraft3DView: PlatformViewRepresentable {
             scene.rootNode.addChildNode(leftWingtipTrail)
             scene.rootNode.addChildNode(rightWingtipTrail)
             scene.rootNode.addChildNode(makeGround())
-            scene.rootNode.addChildNode(makeGroundGrid())
+            configureGroundGrid()
+            scene.rootNode.addChildNode(groundGrid)
             scene.rootNode.addChildNode(makeCamera())
             scene.rootNode.addChildNode(makeLight())
             scene.rootNode.addChildNode(makeFillLight())
@@ -813,8 +819,7 @@ struct Aircraft3DView: PlatformViewRepresentable {
             return node
         }
 
-        private func makeGroundGrid() -> SCNNode {
-            let node = SCNNode()
+        private func configureGroundGrid() {
             for value in stride(from: -10, through: 10, by: 1) {
                 let horizontal = line(
                     from: SCNVector3(-10, -1.98, Float(value)),
@@ -824,10 +829,42 @@ struct Aircraft3DView: PlatformViewRepresentable {
                     from: SCNVector3(Float(value), -1.98, -10),
                     to: SCNVector3(Float(value), -1.98, 10)
                 )
-                node.addChildNode(horizontal)
-                node.addChildNode(vertical)
+                groundGrid.addChildNode(horizontal)
+                groundGrid.addChildNode(vertical)
             }
-            return node
+        }
+
+        // Scrolls the ground grid opposite the aircraft's nose-forward axis, scaled by
+        // speed, so the stationary aircraft reads as moving over the ground. The grid
+        // repeats every 1 unit, so only the sub-unit remainder of the accumulated offset
+        // is applied — the shift is visually indistinguishable from true unbounded travel.
+        private func updateGroundGridScroll(sample: FlightSample, seconds: TimeInterval) {
+            defer { lastGridClockSeconds = seconds }
+            guard let lastSeconds = lastGridClockSeconds else { return }
+            let dt = Float(seconds - lastSeconds)
+            guard dt.isFinite, dt != 0 else { return }
+
+            let forward = sceneForward(
+                quaternionW: sample.quaternionW,
+                quaternionX: sample.quaternionX,
+                quaternionY: sample.quaternionY,
+                quaternionZ: sample.quaternionZ,
+                mountingPitch: realtimeMountingPitch,
+                isInverted: realtimeIsInverted
+            )
+            // forward.x/z are the horizontal (ground-plane) components of the unit
+            // nose vector, i.e. speed already projected onto the ground by cos(pitch
+            // from horizontal) — a vertical attitude (forward ≈ (0, ±1, 0)) yields
+            // zero here, so the grid correctly stops advancing.
+            let metersTraveled = Float(sample.speed / 3.6) * dt
+            let sceneDistance = metersTraveled / Float(trajectoryMetersPerUnit)
+            groundGridOffsetX -= forward.x * sceneDistance
+            groundGridOffsetZ -= forward.z * sceneDistance
+            groundGrid.position = SCNVector3(
+                groundGridOffsetX.truncatingRemainder(dividingBy: 1),
+                0,
+                groundGridOffsetZ.truncatingRemainder(dividingBy: 1)
+            )
         }
 
         private func makeGround() -> SCNNode {
