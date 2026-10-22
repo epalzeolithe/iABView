@@ -743,9 +743,16 @@ final class FlightViewModel {
         if let timeObserver {
             frontPlayer.removeTimeObserver(timeObserver)
         }
+        // This drives `currentIndex`, which every readout, gauge, map annotation
+        // and overlay in the UI observes — at 30 Hz that's the whole surrounding
+        // interface (not the video itself, which AVPlayer renders independently)
+        // re-diffing and redrawing 30 times a second, continuously, for as long
+        // as a flight plays. None of these are frame-accurate instruments; 15 Hz
+        // is still visually smooth for numeric readouts and gauges and halves
+        // that cost.
         let model = WeakFlightViewModel(self)
         timeObserver = frontPlayer.addPeriodicTimeObserver(
-            forInterval: CMTime(seconds: 1.0 / 30.0, preferredTimescale: 600),
+            forInterval: CMTime(seconds: 1.0 / 15.0, preferredTimescale: 600),
             queue: .main
         ) { time in
             let seconds = time.seconds
