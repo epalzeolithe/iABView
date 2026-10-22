@@ -14,9 +14,30 @@ private var isRunningOnIPhone: Bool {
     #endif
 }
 
+#if os(macOS)
+// `.navigationTitle` on a NavigationSplitView column doesn't reliably drive
+// the actual NSWindow title bar text, so the CPU readout never showed up
+// there. Reaching the window directly through its hosting NSView is the
+// dependable way to set it from SwiftUI.
+private struct WindowTitleSetter: NSViewRepresentable {
+    let title: String
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        DispatchQueue.main.async { view.window?.title = title }
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        nsView.window?.title = title
+    }
+}
+#endif
+
 struct ContentView: View {
     #if os(macOS)
     @Environment(\.openWindow) private var openWindow
+    @State private var cpuMonitor = CPUMonitor()
     #endif
     var initialBundleURL: URL? = nil
     @State private var model = FlightViewModel()
@@ -31,6 +52,14 @@ struct ContentView: View {
     @State private var isLastBundleDialogPresented = false
     @State private var didAskToRestoreLastBundle = false
     @State private var isBundleImporterPresented = false
+
+    private var cpuUsageText: String {
+        #if os(macOS)
+        cpuMonitor.usageText
+        #else
+        ""
+        #endif
+    }
 
     var body: some View {
         NavigationSplitView(
@@ -71,6 +100,14 @@ struct ContentView: View {
         }
         #if os(macOS)
         .frame(minWidth: 1_100, minHeight: 720)
+        .background(
+            WindowTitleSetter(
+                title: cpuUsageText.isEmpty ? "ABView" : "ABView — \(cpuUsageText)"
+            )
+        )
+        .task {
+            cpuMonitor.start()
+        }
         #endif
         .onAppear {
             guard !didAskToRestoreLastBundle else { return }
@@ -397,10 +434,12 @@ struct FlightSidebar: View {
             Section("Vol") {
                 if let bundleName {
                     Label(bundleName, systemImage: "airplane")
-                } else {
-                    Button(action: onOpen) {
-                        Label("Ouvrir un bundle .abv", systemImage: "folder.badge.plus")
-                    }
+                }
+                Button(action: onOpen) {
+                    Label(
+                        bundleName == nil ? "Ouvrir un bundle .abv" : "Ouvrir un autre fichier…",
+                        systemImage: "folder.badge.plus"
+                    )
                 }
             }
 
@@ -685,8 +724,7 @@ struct FlightWorkspace: View {
     }
 
     private func instrumentRowContent(in workspaceSize: CGSize) -> some View {
-        ZStack(alignment: .topLeading) {
-            HStack(spacing: 6) {
+        HStack(spacing: 6) {
                 ZStack(alignment: .topTrailing) {
                     aircraftView(sample: model.renderingSample)
                     AircraftReadoutOverlay(
@@ -717,9 +755,23 @@ struct FlightWorkspace: View {
                     FlightPath3DView(model: model)
                     #if os(macOS)
                     detachButton(action: onDetachFlightPath)
+                    #endif
 
+                    #if os(macOS)
                     let windowScale = min(workspaceSize.width / 1_440, workspaceSize.height / 900)
                     let horizonSize = min(260, max(140, 220 * windowScale))
+                    #else
+                    // The G-factor bar and load history chart already occupy the
+                    // top-leading corner of this same pane (via FlightPath3DView's
+                    // own overlay, ~120pt tall with padding); the horizon stack
+                    // below must leave that height alone or it grows up over it.
+                    let reservedTopHeight: CGFloat = 120
+                    let availableHeight = max(0, workspaceSize.height - reservedTopHeight)
+                    let horizonSize = min(
+                        140,
+                        max(70, min(workspaceSize.width / 8, (availableHeight - 16) / 2))
+                    )
+                    #endif
 
                     TelemetryPanel(
                         sample: model.currentSample,
@@ -733,7 +785,6 @@ struct FlightWorkspace: View {
                     .padding(.leading, 8)
                     .padding(.bottom, 8)
                     .allowsHitTesting(false)
-                    #endif
                 }
                 .clipShape(RoundedRectangle(cornerRadius: 7))
                 .frame(minWidth: 280)
@@ -757,30 +808,6 @@ struct FlightWorkspace: View {
                     fullScreenInstrument = .map
                 }
                 #endif
-            }
-
-            #if !os(macOS)
-            let horizonSize = min(
-                140,
-                max(100, min(workspaceSize.width / 8, workspaceSize.height / 3))
-            )
-
-            TelemetryPanel(
-                sample: model.currentSample,
-                signedLoadFactor: model.currentSignedLoadFactor,
-                mountingPitch: model.mountingPitch,
-                isCameraInverted: model.isCameraInverted,
-                horizonSize: horizonSize
-            )
-            .frame(
-                width: horizonSize,
-                height: horizonSize * 2 + 8,
-                alignment: .leading
-            )
-            .padding(.leading, 6)
-            .frame(maxHeight: .infinity, alignment: .bottom)
-            .padding(.bottom, 6)
-            #endif
         }
     }
 

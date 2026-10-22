@@ -66,7 +66,13 @@ struct Aircraft3DView: PlatformViewRepresentable {
         view.delegate = context.coordinator
         view.preferredFramesPerSecond = 60
         view.isPlaying = true
-        view.rendersContinuously = true
+        // `rendersContinuously` would force a full GPU draw every frame even
+        // while playback is paused and nothing on screen is actually moving —
+        // left on, that's a permanent 60 fps render load competing with the
+        // rest of the app (and, on macOS, with the window server) for no
+        // visual benefit. `isPlaying` alone keeps `updateAtTime` firing every
+        // frame, which is all the realtime attitude sync needs.
+        view.rendersContinuously = false
         view.defaultCameraController.target = SCNVector3Zero
         return view
     }
@@ -127,6 +133,8 @@ struct Aircraft3DView: PlatformViewRepresentable {
         private var realtimeMountingPitch = 15.0
         private var realtimeIsInverted = false
         private let realtimeLock = NSLock()
+        private var lastUpdateSeconds: TimeInterval?
+        private var lastTrailRebuildSeconds: TimeInterval = -.infinity
 
         override init() {
             super.init()
@@ -153,6 +161,7 @@ struct Aircraft3DView: PlatformViewRepresentable {
             self.player = player
             realtimeSamples = samples
             lastTrajectoryTrailIndex = -1
+            lastTrailRebuildSeconds = -.infinity
             trajectoryTrail.geometry = nil
             leftWingtipTrail.geometry = nil
             rightWingtipTrail.geometry = nil
@@ -309,6 +318,8 @@ struct Aircraft3DView: PlatformViewRepresentable {
             }
             let seconds = player.currentTime().seconds
             guard seconds.isFinite else { return }
+            guard lastUpdateSeconds != seconds else { return }
+            lastUpdateSeconds = seconds
             let index = sampleIndex(at: seconds, in: samples)
             let sample = samples[index]
             updateAircraft(
@@ -322,7 +333,18 @@ struct Aircraft3DView: PlatformViewRepresentable {
                 updatesFlightVector: false
             )
             updateGroundGridScroll(sample: sample, seconds: seconds)
-            updateTrajectoryTrail(samples: samples, currentIndex: index)
+            // Rebuilding the trail walks up to `trajectoryWindowSeconds` worth of
+            // samples (hundreds to thousands at IMU sample rates), rotating a
+            // vector by each one's attitude quaternion to dead-reckon the path,
+            // then hands SceneKit all-new vertex buffers. The sample index this
+            // keys off usually advances on nearly every 60 fps tick during
+            // playback, which made this the dominant cost behind ~200% sustained
+            // CPU — throttling the rebuild to 10 Hz is visually indistinguishable
+            // for a trail covering tens of seconds, but cuts that work 5-10x.
+            if seconds - lastTrailRebuildSeconds >= 0.1 {
+                lastTrailRebuildSeconds = seconds
+                updateTrajectoryTrail(samples: samples, currentIndex: index)
+            }
         }
 
         private func updateTrajectoryTrail(samples: [FlightSample], currentIndex: Int) {

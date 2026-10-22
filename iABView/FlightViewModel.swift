@@ -69,11 +69,8 @@ final class FlightViewModel {
     private var loadTask: Task<FlightBundle, Error>?
     private var loadGeneration = 0
     private var lastDriftSeekTime: TimeInterval = 0
-    private let videoDriftDeadband: TimeInterval = 0.05
-    private let videoDriftHardSeekThreshold: TimeInterval = 0.4
+    private let videoDriftSeekThreshold: TimeInterval = 0.15
     private let videoDriftSeekCooldown: TimeInterval = 1.0
-    private let videoDriftMaxNudgeRate: Double = 0.08
-    private let videoDriftNudgeGain: Double = 0.3
 
     init() {
         self.recentBundles = loadRecentBundles()
@@ -760,53 +757,42 @@ final class FlightViewModel {
         }
     }
 
-    // Two-tier correction: small/moderate drift is absorbed by nudging the back
-    // player's rate a few percent so it silently re-converges, with no seek at
-    // all. Only drift beyond `videoDriftHardSeekThreshold` (e.g. after a
-    // buffering stall) triggers a seek, and that seek is throttled and given a
-    // loose tolerance. The previous version seeked frame-accurately (±20ms) on
-    // every drift past 100ms; on footage that needs several frames decoded to
-    // satisfy that tolerance, the seek itself could take longer than the drift
-    // took to appear, so by the time it completed the players had already
-    // drifted past the threshold again — a feedback loop of back-to-back seeks
-    // ("pumping") that each froze the back video for a beat.
+    // Seek-only correction, deliberately never touching `backPlayer.rate`.
+    // An earlier version nudged the rate a few percent for small drift to
+    // avoid visible seek hitches, but that meant the back player spent most
+    // of playback sitting at a non-1.0 rate — which keeps AVFoundation's
+    // audio time-pitch processing continuously engaged even on a muted
+    // player, and was heavy enough to make the whole app feel laggy. A seek
+    // only costs something at the moment it happens, so it's throttled
+    // (`videoDriftSeekCooldown`) and given a loose tolerance so it resolves
+    // in one step instead of requiring several frames to be decoded — the
+    // combination that used to make corrections "pump" back-to-back.
     private func correctVideoDrift(frontTime: TimeInterval) {
         guard isPlaying, backPlayer.currentItem != nil, !isCorrectingVideoDrift else { return }
         let expectedBackTime = max(0, frontTime + backVideoOffset)
         let actualBackTime = backPlayer.currentTime().seconds
-        guard actualBackTime.isFinite else { return }
-        let drift = actualBackTime - expectedBackTime
+        guard actualBackTime.isFinite, abs(actualBackTime - expectedBackTime) > videoDriftSeekThreshold else {
+            return
+        }
 
-        if abs(drift) > videoDriftHardSeekThreshold {
-            let now = ProcessInfo.processInfo.systemUptime
-            guard now - lastDriftSeekTime > videoDriftSeekCooldown else { return }
-            lastDriftSeekTime = now
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - lastDriftSeekTime > videoDriftSeekCooldown else { return }
+        lastDriftSeekTime = now
 
-            backPlayer.rate = 1
-            let target = CMTime(seconds: expectedBackTime, preferredTimescale: 600)
-            let tolerance = CMTime(seconds: 0.15, preferredTimescale: 600)
-            playbackCorrectionCount += 1
-            isCorrectingVideoDrift = true
-            let model = WeakFlightViewModel(self)
-            backPlayer.seek(
-                to: target,
-                toleranceBefore: tolerance,
-                toleranceAfter: tolerance
-            ) { _ in
-                Task { @MainActor in
-                    model.value?.isCorrectingVideoDrift = false
-                }
+        let target = CMTime(seconds: expectedBackTime, preferredTimescale: 600)
+        let tolerance = CMTime(seconds: 0.1, preferredTimescale: 600)
+        playbackCorrectionCount += 1
+        isCorrectingVideoDrift = true
+        let model = WeakFlightViewModel(self)
+        backPlayer.seek(
+            to: target,
+            toleranceBefore: tolerance,
+            toleranceAfter: tolerance
+        ) { _ in
+            Task { @MainActor in
+                model.value?.isCorrectingVideoDrift = false
             }
-            return
         }
-
-        guard abs(drift) > videoDriftDeadband else {
-            if backPlayer.rate != 1 { backPlayer.rate = 1 }
-            return
-        }
-
-        let nudge = max(-videoDriftMaxNudgeRate, min(videoDriftMaxNudgeRate, drift * videoDriftNudgeGain))
-        backPlayer.rate = Float(1 - nudge)
     }
 
     private func saveBookmarks() {
