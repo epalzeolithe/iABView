@@ -659,6 +659,15 @@ struct ArtificialHorizonView: View {
                 .scaleEffect(contentScale)
             }
             .frame(width: proxy.size.width, height: proxy.size.height)
+            // This stack is redrawn on every playback tick and is heavier than
+            // it looks: two gradient-filled rectangles oversized 4x to cover
+            // rotation, a dozen pitch-ladder strokes, up to ~20 text labels,
+            // and a drop shadow (one of the pricier SwiftUI effects). Two of
+            // these render per telemetry panel. `.drawingGroup()` flattens all
+            // of that into a single GPU-composited layer instead of many
+            // separately-animated Core Animation layers — same pixels, far
+            // less CPU-side compositing work per redraw.
+            .drawingGroup()
         }
         .clipShape(RoundedRectangle(cornerRadius: 5))
         .accessibilityLabel("Horizon artificiel")
