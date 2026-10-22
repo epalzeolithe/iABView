@@ -464,6 +464,9 @@ struct FlightWorkspace: View {
     let onDetachAircraft: () -> Void
     let onDetachFlightPath: () -> Void
     @State private var fullScreenVideo: FlightVideoSelection?
+    @State private var finalRotationX = 90.0
+    @State private var finalRotationY = 0.0
+    @State private var finalRotationZ = 90.0
 
     var body: some View {
         if model.isLoading {
@@ -525,7 +528,7 @@ struct FlightWorkspace: View {
             videoRow
                 .frame(height: max(250, size.height * 0.36))
 
-            instrumentRow(in: size)
+            instrumentRow
                 .frame(maxHeight: .infinity)
                 .layoutPriority(1)
 
@@ -622,7 +625,7 @@ struct FlightWorkspace: View {
         }
     }
 
-    private func instrumentRow(in workspaceSize: CGSize) -> some View {
+    private var instrumentRow: some View {
         ZStack(alignment: .topLeading) {
             HStack(spacing: 6) {
                 ZStack(alignment: .topTrailing) {
@@ -642,6 +645,11 @@ struct FlightWorkspace: View {
                     )
                     .padding(8)
                     #if os(macOS)
+                    rotationDebugPanel
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+                        .padding(8)
+                        .zIndex(100)
+
                     detachButton(action: onDetachAircraft)
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
                     #endif
@@ -669,23 +677,24 @@ struct FlightWorkspace: View {
             }
 
             #if os(macOS)
-            let windowScale = min(workspaceSize.width / 1_440, workspaceSize.height / 900)
-            let horizonSize = min(140, max(56, 140 * windowScale))
+            GeometryReader { proxy in
+                let horizonSize = min(140, max(58, (proxy.size.height - 36) / 2))
 
-            TelemetryPanel(
-                sample: model.currentSample,
-                signedLoadFactor: model.currentSignedLoadFactor,
-                mountingPitch: model.mountingPitch,
-                isCameraInverted: model.isCameraInverted,
-                horizonSize: horizonSize
-            )
-            .frame(
-                width: horizonSize,
-                height: horizonSize * 2 + 8,
-                alignment: .leading
-            )
-            .padding(.leading, 8)
-            .padding(.top, max(12, workspaceSize.height * 0.015))
+                TelemetryPanel(
+                    sample: model.currentSample,
+                    signedLoadFactor: model.currentSignedLoadFactor,
+                    mountingPitch: model.mountingPitch,
+                    isCameraInverted: model.isCameraInverted,
+                    horizonSize: horizonSize
+                )
+                .frame(
+                    width: horizonSize,
+                    height: horizonSize * 2 + 8,
+                    alignment: .leading
+                )
+                .padding(.leading, 8)
+                .padding(.top, max(12, proxy.size.height * 0.06))
+            }
             .allowsHitTesting(false)
             #else
             TelemetryPanel(
@@ -718,9 +727,61 @@ struct FlightWorkspace: View {
             accelerationZ: sample?.accelerationZ ?? 0,
             speed: sample?.speed ?? 0,
             samples: model.samples,
-            player: model.frontPlayer
+            player: model.frontPlayer,
+            finalRotationX: finalRotationX,
+            finalRotationY: finalRotationY,
+            finalRotationZ: finalRotationZ
         )
     }
+
+    #if os(macOS)
+    private var rotationDebugPanel: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text("Rotation finale")
+                .font(.caption.bold())
+
+            rotationControl("X", value: $finalRotationX, color: .red)
+            rotationControl("Y", value: $finalRotationY, color: .green)
+            rotationControl("Z", value: $finalRotationZ, color: .blue)
+        }
+        .padding(8)
+        .foregroundStyle(.white)
+        .background(.black.opacity(0.92), in: RoundedRectangle(cornerRadius: 8))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(.orange, lineWidth: 2)
+        }
+        .shadow(color: .black.opacity(0.8), radius: 5)
+    }
+
+    private func rotationControl(
+        _ axis: String,
+        value: Binding<Double>,
+        color: Color
+    ) -> some View {
+        HStack(spacing: 5) {
+            Text(axis)
+                .fontWeight(.bold)
+                .foregroundStyle(color)
+                .frame(width: 14)
+
+            Button("−90°") {
+                value.wrappedValue -= 90
+            }
+
+            Text("\(value.wrappedValue, format: .number.precision(.fractionLength(0)))°")
+                .monospacedDigit()
+                .frame(width: 48)
+
+            Button("+90°") {
+                value.wrappedValue += 90
+            }
+        }
+        .font(.caption)
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+    }
+    #endif
 
     private var playbackControls: some View {
         PlaybackControls(
