@@ -752,16 +752,11 @@ struct FlightWorkspace: View {
                 }
                 #endif
 
-                #if os(macOS)
-                let windowScale = min(workspaceSize.width / 1_440, workspaceSize.height / 900)
-                let horizonSize = min(260, max(140, 220 * windowScale))
-                #else
                 // The two horizon gauges stack vertically with 8pt between them;
                 // sizing from that so their combined height matches the STL pane
                 // next to them, instead of a width-driven proportion that could
                 // run taller than the row and get clipped.
                 let horizonSize = max(60, (workspaceSize.height - 8) / 2)
-                #endif
 
                 TelemetryPanel(
                     sample: model.currentSample,
