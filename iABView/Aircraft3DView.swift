@@ -60,7 +60,10 @@ struct Aircraft3DView: PlatformViewRepresentable {
             blue: 0.60,
             alpha: 1
         )
-        view.antialiasingMode = .multisampling4X
+        // Rendered continuously for as long as a flight is open; 2x MSAA is
+        // still smooth at this panel's on-screen size and roughly halves the
+        // GPU fragment work of 4x for every one of those frames.
+        view.antialiasingMode = .multisampling2X
         view.allowsCameraControl = true
         view.autoenablesDefaultLighting = false
         view.delegate = context.coordinator

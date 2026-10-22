@@ -151,7 +151,10 @@ private struct FlightPathScene: PlatformViewRepresentable {
     private func makeView(context: Context) -> SCNView {
         let view = SCNView()
         view.backgroundColor = platformBackgroundColor
-        view.antialiasingMode = .multisampling4X
+        // Same tradeoff as Aircraft3DView: this renders on demand but still
+        // frequently during playback, and 2x MSAA is plenty for this panel's
+        // on-screen size while costing roughly half the GPU fragment work of 4x.
+        view.antialiasingMode = .multisampling2X
         view.allowsCameraControl = true
         view.scene = context.coordinator.scene
         context.coordinator.configure(
