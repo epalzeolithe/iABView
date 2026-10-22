@@ -401,6 +401,7 @@ struct FlightMapView: View {
     let coordinates: [CLLocationCoordinate2D]
     let sample: FlightSample?
     let metar: String
+    let routeProgress: Double
     @State private var position: MapCameraPosition = .automatic
 
     var body: some View {
@@ -475,13 +476,17 @@ struct FlightMapView: View {
         .onChange(of: coordinates.count) { _, _ in frameEntireRoute() }
     }
 
+    // Used to scan every one of up to ~3 000 route points to find the
+    // geometrically nearest one to the aircraft's current position, redone on
+    // every ~15 Hz playback tick — expensive, and also semantically shaky
+    // whenever the route loops back near itself (a maneuver, not a GPS glitch,
+    // for the aerobatic flights this app is built around). `routeProgress`
+    // already tells us exactly how far along the flight we are chronologically,
+    // which is both O(1) and the actually-correct notion of "flown so far".
     private var flownCoordinates: [CLLocationCoordinate2D] {
-        guard let sample, !coordinates.isEmpty else { return [] }
-        let nearestIndex = coordinates.indices.min { lhs, rhs in
-            coordinateDistanceSquared(coordinates[lhs], sample.coordinate)
-                < coordinateDistanceSquared(coordinates[rhs], sample.coordinate)
-        } ?? 0
-        return Array(coordinates.prefix(through: nearestIndex))
+        guard !coordinates.isEmpty else { return [] }
+        let lastIndex = Int(routeProgress * Double(coordinates.count - 1))
+        return Array(coordinates.prefix(through: max(0, min(coordinates.count - 1, lastIndex))))
     }
 
     private func frameEntireRoute() {
@@ -523,14 +528,6 @@ struct FlightMapView: View {
         )
     }
 
-    private func coordinateDistanceSquared(
-        _ lhs: CLLocationCoordinate2D,
-        _ rhs: CLLocationCoordinate2D
-    ) -> Double {
-        let latitude = lhs.latitude - rhs.latitude
-        let longitude = lhs.longitude - rhs.longitude
-        return latitude * latitude + longitude * longitude
-    }
 }
 
 struct WindOverlayView: View {

@@ -601,7 +601,8 @@ struct FlightWorkspace: View {
             FlightMapView(
                 coordinates: model.routeCoordinates,
                 sample: model.currentSample,
-                metar: model.currentMETAR
+                metar: model.currentMETAR,
+                routeProgress: model.routeProgress
             )
         }
     }
@@ -799,7 +800,8 @@ struct FlightWorkspace: View {
                 FlightMapView(
                     coordinates: model.routeCoordinates,
                     sample: model.currentSample,
-                    metar: model.currentMETAR
+                    metar: model.currentMETAR,
+                    routeProgress: model.routeProgress
                 )
                 .frame(minWidth: 260)
                 #if !os(macOS)

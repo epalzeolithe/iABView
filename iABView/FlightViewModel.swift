@@ -90,6 +90,11 @@ final class FlightViewModel {
         currentSample?.signedLoadFactor(mountingPitch: mountingPitch) ?? 0
     }
 
+    var routeProgress: Double {
+        guard samples.count > 1 else { return 0 }
+        return Double(currentIndex) / Double(samples.count - 1)
+    }
+
     var displayedFrontPlayer: AVPlayer {
         isCameraInverted ? backPlayer : frontPlayer
     }
