@@ -244,13 +244,22 @@ enum FlightLoadError: LocalizedError {
 }
 
 enum FlightBundleLoader {
-    nonisolated static func load(from url: URL) throws -> FlightBundle {
+    nonisolated static func load(
+        from url: URL,
+        progress: @escaping @Sendable (Double) -> Void = { _ in }
+    ) throws -> FlightBundle {
         let csvURL = url.appendingPathComponent("merged_data.csv")
         guard FileManager.default.fileExists(atPath: csvURL.path) else {
             throw FlightLoadError.missingFile("merged_data.csv")
         }
 
-        let csv = try String(contentsOf: csvURL, encoding: .utf8)
+        // Weighted so the bar doesn't look done the moment the (usually quick,
+        // already-local) byte read finishes: parsing hundreds of thousands of
+        // CSV rows into `FlightSample`s is the slowest step for a large flight
+        // log, so it gets the largest share of the range.
+        try ensureFileIsDownloaded(csvURL) { fraction in progress(fraction * 0.2) }
+        try Task.checkCancellation()
+        let csv = try readFileTrackingProgress(csvURL) { fraction in progress(0.2 + fraction * 0.2) }
         let timestampFormatters = [
             "yyyy-MM-dd HH:mm:ss.SSSSSS",
             "yyyy-MM-dd HH:mm:ss.SSS",
@@ -286,7 +295,21 @@ enum FlightBundleLoader {
         var isChronological = true
         var offset = 0
 
-        csv.enumerateLines { line, _ in
+        var isCancelled = false
+        var lineNumber = 0
+        var bytesConsumed = 0
+        let totalBytes = max(1, csv.utf8.count)
+        csv.enumerateLines { line, stop in
+            bytesConsumed += line.utf8.count + 1
+            lineNumber += 1
+            if lineNumber.isMultiple(of: 2_000) {
+                if Task.isCancelled {
+                    isCancelled = true
+                    stop = true
+                    return
+                }
+                progress(0.4 + Double(bytesConsumed) / Double(totalBytes) * 0.6)
+            }
             let row = CSVParser.fields(in: line)
             guard !row.isEmpty else { return }
             if columns.isEmpty {
@@ -361,6 +384,8 @@ enum FlightBundleLoader {
             ))
             offset += 1
         }
+        if isCancelled { throw CancellationError() }
+        progress(1)
 
         guard !samples.isEmpty else { throw FlightLoadError.emptyData }
         if !isChronological {
@@ -372,6 +397,67 @@ enum FlightBundleLoader {
             bookmarks: loadBookmarks(from: url.appendingPathComponent("bookmark.csv")),
             metar: loadMETAR(from: url.appendingPathComponent("metar.csv"))
         )
+    }
+
+    // Forces materialization of a file that may still be a placeholder on a cloud
+    // drive (iCloud Drive, Google Drive, …) before attempting to read it, so the
+    // slow part of opening a bundle shows up as visible, cancellable progress
+    // instead of a silent block inside the first read call.
+    nonisolated private static func ensureFileIsDownloaded(
+        _ url: URL,
+        progress: @escaping @Sendable (Double) -> Void
+    ) throws {
+        guard (try? url.resourceValues(forKeys: [.isUbiquitousItemKey]))?.isUbiquitousItem == true else {
+            progress(1)
+            return
+        }
+        try? FileManager.default.startDownloadingUbiquitousItem(at: url)
+        while true {
+            try Task.checkCancellation()
+            let status = try? url.resourceValues(
+                forKeys: [.ubiquitousItemDownloadingStatusKey]
+            ).ubiquitousItemDownloadingStatus
+            if status == nil || status == .current {
+                progress(1)
+                return
+            }
+            progress(0.5)
+            Thread.sleep(forTimeInterval: 0.2)
+        }
+    }
+
+    // Reads the file in chunks instead of a single `String(contentsOf:)` call so
+    // callers get a real byte-based progress fraction and a chance to notice
+    // cancellation while the data is still being pulled off slow storage.
+    nonisolated private static func readFileTrackingProgress(
+        _ url: URL,
+        progress: @escaping @Sendable (Double) -> Void
+    ) throws -> String {
+        guard let handle = FileHandle(forReadingAtPath: url.path) else {
+            throw FlightLoadError.missingFile(url.lastPathComponent)
+        }
+        defer { try? handle.close() }
+
+        let totalSize = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
+        var data = Data()
+        data.reserveCapacity(totalSize > 0 ? totalSize : 1_000_000)
+        let chunkSize = 2 * 1_024 * 1_024
+
+        while true {
+            try Task.checkCancellation()
+            let chunk = handle.readData(ofLength: chunkSize)
+            if chunk.isEmpty { break }
+            data.append(chunk)
+            if totalSize > 0 {
+                progress(Double(data.count) / Double(totalSize))
+            }
+        }
+        progress(1)
+
+        guard let string = String(data: data, encoding: .utf8) else {
+            throw FlightLoadError.invalidCSV
+        }
+        return string
     }
 
     nonisolated static func loadBookmarks(from url: URL) -> [FlightBookmark] {

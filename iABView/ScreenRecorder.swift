@@ -84,13 +84,18 @@ final class ScreenRecorder: NSObject {
         }
     }
 
+    // `CGPreflightScreenCaptureAccess`/`CGRequestScreenCaptureAccess` only ever
+    // reflect the authorization this process was launched with: toggling the
+    // permission on in System Settings while iABView is already running does
+    // not make either call start returning true, even though macOS now shows
+    // it as granted. That made the two outcomes below unreliable — a user who
+    // had just granted access from here still landed on "go grant access",
+    // not "relaunch the app" — so both cases now point at the one fix that
+    // actually works: a full quit and relaunch.
     private func ensureScreenCapturePermission() throws {
         guard !CGPreflightScreenCaptureAccess() else { return }
-
-        if CGRequestScreenCaptureAccess() {
-            throw RecorderError.permissionRequiresRelaunch
-        }
-        throw RecorderError.permissionDenied
+        _ = CGRequestScreenCaptureAccess()
+        throw RecorderError.permissionNotYetEffective
     }
 
     private func stopRecording() async {
@@ -154,16 +159,13 @@ extension ScreenRecorder: SCStreamDelegate {
 }
 
 enum RecorderError: LocalizedError {
-    case permissionDenied
-    case permissionRequiresRelaunch
+    case permissionNotYetEffective
     case windowUnavailable
 
     var errorDescription: String? {
         switch self {
-        case .permissionDenied:
-            "Autorisez iABView dans Réglages Système > Confidentialité et sécurité > Enregistrement de l’écran et de l’audio système."
-        case .permissionRequiresRelaunch:
-            "L’autorisation est accordée. Quittez complètement iABView, puis relancez l’app pour commencer l’enregistrement."
+        case .permissionNotYetEffective:
+            "Vérifiez qu’iABView est autorisé dans Réglages Système > Confidentialité et sécurité > Enregistrement de l’écran et de l’audio système, puis quittez complètement iABView (⌘Q) et relancez l’app : macOS ne prend en compte cette autorisation qu’au prochain lancement."
         case .windowUnavailable:
             "La fenêtre ABView n’est pas disponible pour l’enregistrement."
         }

@@ -35,6 +35,7 @@ final class FlightViewModel {
     private(set) var metar: [METARReading] = []
     private(set) var currentIndex = 0
     private(set) var isLoading = false
+    private(set) var loadingProgress: Double = 0
     private(set) var isUpdatingMETAR = false
     private(set) var hasBundleWriteAuthorization = false
     private(set) var metarUpdateMessage: String?
@@ -56,6 +57,7 @@ final class FlightViewModel {
     private(set) var maximumSpeed = 0.0
     private(set) var shows3DAxes = true
     private(set) var showsVerticalGrid = false
+    private(set) var showsTrajectoryTrail = true
     private(set) var isAudioMuted = false
     private(set) var playbackCorrectionCount = 0
 
@@ -64,6 +66,11 @@ final class FlightViewModel {
     private var timeObserver: Any?
     private var securityScopedURL: URL?
     private var isCorrectingVideoDrift = false
+    private var loadTask: Task<FlightBundle, Error>?
+    private var loadGeneration = 0
+    private var lastDriftSeekTime: TimeInterval = 0
+    private let videoDriftSeekThreshold: TimeInterval = 0.15
+    private let videoDriftSeekCooldown: TimeInterval = 1.0
 
     init() {
         self.recentBundles = loadRecentBundles()
@@ -149,15 +156,34 @@ final class FlightViewModel {
     }
 
     func openBundle(_ url: URL, grantsWriteAccess: Bool = true) {
+        // `loadTask` is the detached task doing the actual work, not a thin
+        // wrapper, so cancelling it is what makes the `Task.checkCancellation()`
+        // calls inside `FlightBundleLoader` observe cancellation — a wrapper
+        // `Task { try await Task.detached { … }.value }` would only mark itself
+        // cancelled while the unrelated detached task kept running to completion.
+        loadTask?.cancel()
+        loadGeneration += 1
+        let generation = loadGeneration
         isLoading = true
+        loadingProgress = 0
         errorMessage = nil
         let accessGranted = url.startAccessingSecurityScopedResource()
+        let model = WeakFlightViewModel(self)
+
+        let task = Task.detached(priority: .userInitiated) {
+            try FlightBundleLoader.load(from: url) { fraction in
+                Task { @MainActor in
+                    guard model.value?.loadGeneration == generation else { return }
+                    model.value?.loadingProgress = fraction
+                }
+            }
+        }
+        loadTask = task
 
         Task {
             do {
-                let loaded = try await Task.detached(priority: .userInitiated) {
-                    try FlightBundleLoader.load(from: url)
-                }.value
+                let loaded = try await task.value
+                guard generation == loadGeneration else { return }
                 if let previousURL = securityScopedURL {
                     previousURL.stopAccessingSecurityScopedResource()
                 }
@@ -165,12 +191,20 @@ final class FlightViewModel {
                 hasBundleWriteAuthorization = grantsWriteAccess
                 apply(loaded)
                 saveRecentBundle(url)
+            } catch is CancellationError {
+                if accessGranted { url.stopAccessingSecurityScopedResource() }
             } catch {
                 if accessGranted { url.stopAccessingSecurityScopedResource() }
+                guard generation == loadGeneration else { return }
                 errorMessage = error.localizedDescription
             }
+            guard generation == loadGeneration else { return }
             isLoading = false
         }
+    }
+
+    func cancelLoading() {
+        loadTask?.cancel()
     }
 
     func dismissError() {
@@ -404,6 +438,10 @@ final class FlightViewModel {
 
     func toggleVerticalGrid() {
         showsVerticalGrid.toggle()
+    }
+
+    func toggleTrajectoryTrail() {
+        showsTrajectoryTrail.toggle()
     }
 
     func reloadBookmarks() {
@@ -719,17 +757,30 @@ final class FlightViewModel {
         }
     }
 
+    // Seek-only correction, deliberately never touching `backPlayer.rate`.
+    // An earlier version nudged the rate a few percent for small drift to
+    // avoid visible seek hitches, but that meant the back player spent most
+    // of playback sitting at a non-1.0 rate — which keeps AVFoundation's
+    // audio time-pitch processing continuously engaged even on a muted
+    // player, and was heavy enough to make the whole app feel laggy. A seek
+    // only costs something at the moment it happens, so it's throttled
+    // (`videoDriftSeekCooldown`) and given a loose tolerance so it resolves
+    // in one step instead of requiring several frames to be decoded — the
+    // combination that used to make corrections "pump" back-to-back.
     private func correctVideoDrift(frontTime: TimeInterval) {
-        guard !isCorrectingVideoDrift, backPlayer.currentItem != nil else { return }
+        guard isPlaying, backPlayer.currentItem != nil, !isCorrectingVideoDrift else { return }
         let expectedBackTime = max(0, frontTime + backVideoOffset)
         let actualBackTime = backPlayer.currentTime().seconds
-        guard actualBackTime.isFinite,
-              abs(actualBackTime - expectedBackTime) > 0.10 else {
+        guard actualBackTime.isFinite, abs(actualBackTime - expectedBackTime) > videoDriftSeekThreshold else {
             return
         }
 
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - lastDriftSeekTime > videoDriftSeekCooldown else { return }
+        lastDriftSeekTime = now
+
         let target = CMTime(seconds: expectedBackTime, preferredTimescale: 600)
-        let tolerance = CMTime(seconds: 0.02, preferredTimescale: 600)
+        let tolerance = CMTime(seconds: 0.1, preferredTimescale: 600)
         playbackCorrectionCount += 1
         isCorrectingVideoDrift = true
         let model = WeakFlightViewModel(self)

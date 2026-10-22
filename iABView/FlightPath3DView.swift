@@ -13,21 +13,54 @@ private typealias PlatformViewRepresentable = UIViewRepresentable
 
 struct FlightPath3DView: View {
     let model: FlightViewModel
+    @Environment(\.colorScheme) private var colorScheme
 
+    private var backgroundColor: Color {
+        colorScheme == .dark ? Color(white: 0.12) : .white
+    }
+
+    // Recomputed on every ~30 Hz playback tick (this view reads `model.currentIndex`
+    // directly), so this needs to stay cheap regardless of sample density. At the
+    // ~100 Hz IMU rate this project works with, the prior linear backward scan
+    // over a 20s window walked up to ~2000 samples per call, and handed all 2000
+    // to the load-history Chart as individual LineMarks — a continuous, sustained
+    // cost on top of everything else competing for the main thread. Binary search
+    // plus capping the chart to ~200 points (already more than a narrow sidebar
+    // chart can usefully render) removes both the O(n) scan and the oversized
+    // Chart workload.
     private var recentLoadSamples: [FlightSample] {
         guard model.samples.indices.contains(model.currentIndex) else { return [] }
         let startTime = max(0, model.currentTime - 20)
-        var startIndex = model.currentIndex
-        while startIndex > 0 && model.samples[startIndex - 1].elapsed >= startTime {
-            startIndex -= 1
+        let startIndex = firstSampleIndex(atOrAfter: startTime, upperBound: model.currentIndex)
+        let window = model.samples[startIndex...model.currentIndex]
+
+        let maximumPoints = 200
+        guard window.count > maximumPoints else { return Array(window) }
+        let strideValue = max(1, window.count / maximumPoints)
+        return window.enumerated().compactMap { offset, sample in
+            offset.isMultiple(of: strideValue) ? sample : nil
         }
-        return Array(model.samples[startIndex...model.currentIndex])
+    }
+
+    private func firstSampleIndex(atOrAfter time: TimeInterval, upperBound: Int) -> Int {
+        var lower = 0
+        var upper = upperBound
+        while lower < upper {
+            let middle = lower + (upper - lower) / 2
+            if model.samples[middle].elapsed < time {
+                lower = middle + 1
+            } else {
+                upper = middle
+            }
+        }
+        return lower
     }
 
     var body: some View {
         FlightPathScene(
             model: model,
-            cameraZoomCommand: 0
+            cameraZoomCommand: 0,
+            colorScheme: colorScheme
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .overlay(alignment: .topLeading) {
@@ -64,13 +97,18 @@ struct FlightPath3DView: View {
             .padding(12)
             .allowsHitTesting(false)
         }
-        .background(.white)
+        .background(backgroundColor)
     }
 }
 
 private struct FlightPathScene: PlatformViewRepresentable {
     let model: FlightViewModel
     let cameraZoomCommand: Int
+    let colorScheme: ColorScheme
+
+    private var platformBackgroundColor: PlatformColor {
+        colorScheme == .dark ? PlatformColor(white: 0.12, alpha: 1) : .white
+    }
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
@@ -96,7 +134,7 @@ private struct FlightPathScene: PlatformViewRepresentable {
 
     private func makeView(context: Context) -> SCNView {
         let view = SCNView()
-        view.backgroundColor = .white
+        view.backgroundColor = platformBackgroundColor
         view.antialiasingMode = .multisampling4X
         view.allowsCameraControl = true
         view.scene = context.coordinator.scene
@@ -110,6 +148,7 @@ private struct FlightPathScene: PlatformViewRepresentable {
     }
 
     private func updateView(_ view: SCNView, context: Context) {
+        view.backgroundColor = platformBackgroundColor
         context.coordinator.configure(
             samples: model.samples,
             currentIndex: model.currentIndex,
@@ -531,6 +570,11 @@ private struct FlightReference {
 private struct FlightPathSpeedScale: View {
     let speed: Double
     let maximumSpeed: Double
+    @Environment(\.colorScheme) private var colorScheme
+
+    private var labelColor: Color {
+        colorScheme == .dark ? .white : .black
+    }
 
     private var fillColor: Color {
         switch speed {
@@ -565,13 +609,18 @@ private struct FlightPathSpeedScale: View {
             }
             .frame(width: 9, height: 82)
         }
-        .foregroundStyle(.primary)
+        .foregroundStyle(labelColor)
         .padding(6)
     }
 }
 
 private struct FlightPathGScale: View {
     let loadFactor: Double
+    @Environment(\.colorScheme) private var colorScheme
+
+    private var labelColor: Color {
+        colorScheme == .dark ? .white : .black
+    }
 
     var body: some View {
         VStack(spacing: 3) {
@@ -592,7 +641,7 @@ private struct FlightPathGScale: View {
                     )
                     .frame(height: 12)
                     Rectangle()
-                        .fill(.black)
+                        .fill(labelColor)
                         .frame(width: 3, height: 22)
                         .offset(
                             x: min(
@@ -605,9 +654,8 @@ private struct FlightPathGScale: View {
             .frame(height: 22)
         }
         .font(.caption.monospacedDigit())
-        .foregroundStyle(.primary)
+        .foregroundStyle(labelColor)
         .padding(8)
-        .background(.white.opacity(0.84), in: RoundedRectangle(cornerRadius: 5))
     }
 }
 
@@ -615,6 +663,11 @@ private struct FlightPathLoadHistory: View {
     let samples: [FlightSample]
     let currentTime: TimeInterval
     let mountingPitch: Double
+    @Environment(\.colorScheme) private var colorScheme
+
+    private var labelColor: Color {
+        colorScheme == .dark ? .white : .black
+    }
 
     private var timeDomain: ClosedRange<TimeInterval> {
         let upperBound = max(20, currentTime)
@@ -652,9 +705,8 @@ private struct FlightPathLoadHistory: View {
             .chartXAxis(.hidden)
             .chartYAxis(.hidden)
         }
-        .foregroundStyle(.primary)
+        .foregroundStyle(labelColor)
         .padding(6)
-        .background(.white.opacity(0.84), in: RoundedRectangle(cornerRadius: 5))
         .accessibilityLabel("Facteur de charge")
     }
 }
@@ -662,6 +714,11 @@ private struct FlightPathLoadHistory: View {
 private struct FlightPathAltitudeScale: View {
     let altitude: Double
     let maximumAltitude: Double
+    @Environment(\.colorScheme) private var colorScheme
+
+    private var labelColor: Color {
+        colorScheme == .dark ? .white : .black
+    }
 
     var body: some View {
         HStack(alignment: .bottom, spacing: 5) {
@@ -683,7 +740,7 @@ private struct FlightPathAltitudeScale: View {
             }
             .frame(width: 9, height: 82)
         }
-        .foregroundStyle(.primary)
+        .foregroundStyle(labelColor)
         .padding(6)
     }
 }

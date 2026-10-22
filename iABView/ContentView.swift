@@ -14,9 +14,30 @@ private var isRunningOnIPhone: Bool {
     #endif
 }
 
+#if os(macOS)
+// `.navigationTitle` on a NavigationSplitView column doesn't reliably drive
+// the actual NSWindow title bar text, so the CPU readout never showed up
+// there. Reaching the window directly through its hosting NSView is the
+// dependable way to set it from SwiftUI.
+private struct WindowTitleSetter: NSViewRepresentable {
+    let title: String
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        DispatchQueue.main.async { view.window?.title = title }
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        nsView.window?.title = title
+    }
+}
+#endif
+
 struct ContentView: View {
     #if os(macOS)
     @Environment(\.openWindow) private var openWindow
+    @State private var cpuMonitor = CPUMonitor()
     #endif
     var initialBundleURL: URL? = nil
     @State private var model = FlightViewModel()
@@ -31,6 +52,14 @@ struct ContentView: View {
     @State private var isLastBundleDialogPresented = false
     @State private var didAskToRestoreLastBundle = false
     @State private var isBundleImporterPresented = false
+
+    private var cpuUsageText: String {
+        #if os(macOS)
+        cpuMonitor.usageText
+        #else
+        ""
+        #endif
+    }
 
     var body: some View {
         NavigationSplitView(
@@ -71,6 +100,14 @@ struct ContentView: View {
         }
         #if os(macOS)
         .frame(minWidth: 1_100, minHeight: 720)
+        .background(
+            WindowTitleSetter(
+                title: cpuUsageText.isEmpty ? "ABView" : "ABView — \(cpuUsageText)"
+            )
+        )
+        .task {
+            cpuMonitor.start()
+        }
         #endif
         .onAppear {
             guard !didAskToRestoreLastBundle else { return }
@@ -81,6 +118,10 @@ struct ContentView: View {
             } else {
                 isLastBundleDialogPresented = model.lastBundleName != nil
             }
+        }
+        .onOpenURL { url in
+            model.openBundle(url)
+            preferredCompactColumn = .detail
         }
         .task(id: isLastBundleDialogPresented) {
             guard isLastBundleDialogPresented else { return }
@@ -186,7 +227,7 @@ struct ContentView: View {
                     Button {
                         isChaseCamPresented = true
                     } label: {
-                        Label("Cam", systemImage: "map")
+                        Label("Cam", systemImage: "binoculars.fill")
                     }
                     .disabled(model.samples.isEmpty)
 
@@ -257,6 +298,13 @@ struct ContentView: View {
                         isOn: Binding(
                             get: { model.showsVerticalGrid },
                             set: { _ in model.toggleVerticalGrid() }
+                        )
+                    )
+                    Toggle(
+                        "Afficher la traînée 3D",
+                        isOn: Binding(
+                            get: { model.showsTrajectoryTrail },
+                            set: { _ in model.toggleTrajectoryTrail() }
                         )
                     )
 
@@ -386,10 +434,12 @@ struct FlightSidebar: View {
             Section("Vol") {
                 if let bundleName {
                     Label(bundleName, systemImage: "airplane")
-                } else {
-                    Button(action: onOpen) {
-                        Label("Ouvrir un bundle .abv", systemImage: "folder.badge.plus")
-                    }
+                }
+                Button(action: onOpen) {
+                    Label(
+                        bundleName == nil ? "Ouvrir un bundle .abv" : "Ouvrir un autre fichier…",
+                        systemImage: "folder.badge.plus"
+                    )
                 }
             }
 
@@ -464,13 +514,25 @@ struct FlightWorkspace: View {
     let onDetachAircraft: () -> Void
     let onDetachFlightPath: () -> Void
     @State private var fullScreenVideo: FlightVideoSelection?
-    @State private var finalRotationX = 90.0
-    @State private var finalRotationY = 0.0
-    @State private var finalRotationZ = 90.0
+    @State private var fullScreenInstrument: FlightInstrumentSelection?
 
     var body: some View {
         if model.isLoading {
-            ProgressView("Chargement du vol…")
+            VStack(spacing: 14) {
+                ProgressView(value: model.loadingProgress) {
+                    Text("Chargement du vol…")
+                } currentValueLabel: {
+                    Text(model.loadingProgress, format: .percent.precision(.fractionLength(0)))
+                }
+                .progressViewStyle(.linear)
+                .frame(maxWidth: 320)
+
+                Button("Annuler", role: .cancel) {
+                    model.cancelLoading()
+                }
+                .buttonStyle(.bordered)
+            }
+            .padding()
         } else if model.samples.isEmpty {
             ContentUnavailableView {
                 Label("Aucun vol ouvert", systemImage: "airplane.circle")
@@ -519,14 +581,35 @@ struct FlightWorkspace: View {
                     onDismiss: { fullScreenVideo = nil }
                 )
             }
+            .fullScreenCover(item: $fullScreenInstrument) { selection in
+                FullScreenFlightInstrument(model: model, onDismiss: { fullScreenInstrument = nil }) {
+                    instrumentContent(for: selection)
+                }
+            }
             #endif
+        }
+    }
+
+    @ViewBuilder
+    private func instrumentContent(for selection: FlightInstrumentSelection) -> some View {
+        switch selection {
+        case .aircraft:
+            aircraftView(sample: model.renderingSample)
+        case .flightPath:
+            FlightPath3DView(model: model)
+        case .map:
+            FlightMapView(
+                coordinates: model.routeCoordinates,
+                sample: model.currentSample,
+                metar: model.currentMETAR
+            )
         }
     }
 
     private func regularWorkspace(in size: CGSize) -> some View {
         VStack(spacing: 6) {
             videoRow
-                .frame(height: max(250, size.height * 0.36))
+                .frame(height: max(320, size.height * 0.48))
 
             instrumentRow
                 .frame(maxHeight: .infinity)
@@ -569,7 +652,7 @@ struct FlightWorkspace: View {
 
     private var videoRow: some View {
         HStack(spacing: 6) {
-            ZStack(alignment: .topLeading) {
+            ZStack(alignment: .topTrailing) {
                 VideoPane(
                     title: "Caméra avant",
                     player: model.displayedFrontPlayer,
@@ -593,7 +676,7 @@ struct FlightWorkspace: View {
             .onTapGesture(count: 2, perform: onDetachFront)
             #else
             .contentShape(Rectangle())
-            .onTapGesture(count: 2) {
+            .onTapGesture {
                 fullScreenVideo = .front
             }
             #endif
@@ -609,16 +692,25 @@ struct FlightWorkspace: View {
                     timestampAlignment: .bottomTrailing,
                     overlayStyle: isRunningOnIPhone ? .headingOnly : .standard
                 )
-                #if os(macOS)
-                detachButton(action: onDetachBack)
-                #endif
+                VStack(alignment: .trailing, spacing: 4) {
+                    #if os(macOS)
+                    detachButton(action: onDetachBack)
+                    #endif
+                    PlaybackDiagnosticsOverlay(
+                        currentFrame: model.currentVideoFrame,
+                        playbackCorrectionCount: model.playbackCorrectionCount,
+                        videoFrameRate: model.frontVideoFrameRate,
+                        synchronizationError: model.videoSynchronizationError
+                    )
+                }
+                .padding(8)
             }
             #if os(macOS)
             .contentShape(Rectangle())
             .onTapGesture(count: 2, perform: onDetachBack)
             #else
             .contentShape(Rectangle())
-            .onTapGesture(count: 2) {
+            .onTapGesture {
                 fullScreenVideo = .back
             }
             #endif
@@ -626,8 +718,13 @@ struct FlightWorkspace: View {
     }
 
     private var instrumentRow: some View {
-        ZStack(alignment: .topLeading) {
-            HStack(spacing: 6) {
+        GeometryReader { proxy in
+            instrumentRowContent(in: proxy.size)
+        }
+    }
+
+    private func instrumentRowContent(in workspaceSize: CGSize) -> some View {
+        HStack(spacing: 6) {
                 ZStack(alignment: .topTrailing) {
                     aircraftView(sample: model.renderingSample)
                     AircraftReadoutOverlay(
@@ -635,21 +732,11 @@ struct FlightWorkspace: View {
                         loadFactor: model.currentSignedLoadFactor,
                         minimumLoadFactor: model.minimumLoadFactor,
                         maximumLoadFactor: model.maximumLoadFactor,
-                        currentFrame: model.currentVideoFrame,
-                        playbackCorrectionCount: model.playbackCorrectionCount,
-                        videoFrameRate: model.frontVideoFrameRate,
-                        videoOffset: model.frontVideoOffset,
-                        synchronizationError: model.videoSynchronizationError,
                         mountingPitch: model.mountingPitch,
                         isCameraInverted: model.isCameraInverted
                     )
                     .padding(8)
                     #if os(macOS)
-                    rotationDebugPanel
-                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
-                        .padding(8)
-                        .zIndex(100)
-
                     detachButton(action: onDetachAircraft)
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
                     #endif
@@ -657,16 +744,57 @@ struct FlightWorkspace: View {
                 .clipShape(RoundedRectangle(cornerRadius: 7))
                 .frame(minWidth: 280)
                 .layoutPriority(1)
+                #if !os(macOS)
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    fullScreenInstrument = .aircraft
+                }
+                #endif
 
                 ZStack(alignment: .bottom) {
                     FlightPath3DView(model: model)
                     #if os(macOS)
                     detachButton(action: onDetachFlightPath)
                     #endif
+
+                    #if os(macOS)
+                    let windowScale = min(workspaceSize.width / 1_440, workspaceSize.height / 900)
+                    let horizonSize = min(260, max(140, 220 * windowScale))
+                    #else
+                    // The G-factor bar and load history chart already occupy the
+                    // top-leading corner of this same pane (via FlightPath3DView's
+                    // own overlay, ~120pt tall with padding); the horizon stack
+                    // below must leave that height alone or it grows up over it.
+                    let reservedTopHeight: CGFloat = 120
+                    let availableHeight = max(0, workspaceSize.height - reservedTopHeight)
+                    let horizonSize = min(
+                        140,
+                        max(70, min(workspaceSize.width / 8, (availableHeight - 16) / 2))
+                    )
+                    #endif
+
+                    TelemetryPanel(
+                        sample: model.currentSample,
+                        signedLoadFactor: model.currentSignedLoadFactor,
+                        mountingPitch: model.mountingPitch,
+                        isCameraInverted: model.isCameraInverted,
+                        horizonSize: horizonSize
+                    )
+                    .frame(width: horizonSize, height: horizonSize * 2 + 8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.leading, 8)
+                    .padding(.bottom, 8)
+                    .allowsHitTesting(false)
                 }
                 .clipShape(RoundedRectangle(cornerRadius: 7))
                 .frame(minWidth: 280)
                 .layoutPriority(1)
+                #if !os(macOS)
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    fullScreenInstrument = .flightPath
+                }
+                #endif
 
                 FlightMapView(
                     coordinates: model.routeCoordinates,
@@ -674,40 +802,12 @@ struct FlightWorkspace: View {
                     metar: model.currentMETAR
                 )
                 .frame(minWidth: 260)
-            }
-
-            #if os(macOS)
-            GeometryReader { proxy in
-                let horizonSize = min(140, max(58, (proxy.size.height - 36) / 2))
-
-                TelemetryPanel(
-                    sample: model.currentSample,
-                    signedLoadFactor: model.currentSignedLoadFactor,
-                    mountingPitch: model.mountingPitch,
-                    isCameraInverted: model.isCameraInverted,
-                    horizonSize: horizonSize
-                )
-                .frame(
-                    width: horizonSize,
-                    height: horizonSize * 2 + 8,
-                    alignment: .leading
-                )
-                .padding(.leading, 8)
-                .padding(.top, max(12, proxy.size.height * 0.06))
-            }
-            .allowsHitTesting(false)
-            #else
-            TelemetryPanel(
-                sample: model.currentSample,
-                signedLoadFactor: model.currentSignedLoadFactor,
-                mountingPitch: model.mountingPitch,
-                isCameraInverted: model.isCameraInverted
-            )
-            .frame(width: 145, height: 288, alignment: .leading)
-            .padding(.leading, 6)
-            .frame(maxHeight: .infinity, alignment: .bottom)
-            .padding(.bottom, 6)
-            #endif
+                #if !os(macOS)
+                .contentShape(Rectangle())
+                .onTapGesture(count: 2) {
+                    fullScreenInstrument = .map
+                }
+                #endif
         }
     }
 
@@ -722,66 +822,15 @@ struct FlightWorkspace: View {
             isInverted: model.isCameraInverted,
             showsAxes: model.shows3DAxes,
             showsVerticalGrid: model.showsVerticalGrid,
+            showsTrajectoryTrail: model.showsTrajectoryTrail,
             accelerationX: sample?.accelerationX ?? 0,
             accelerationY: sample?.accelerationY ?? 0,
             accelerationZ: sample?.accelerationZ ?? 0,
             speed: sample?.speed ?? 0,
             samples: model.samples,
-            player: model.frontPlayer,
-            finalRotationX: finalRotationX,
-            finalRotationY: finalRotationY,
-            finalRotationZ: finalRotationZ
+            player: model.frontPlayer
         )
     }
-
-    #if os(macOS)
-    private var rotationDebugPanel: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Text("Rotation finale")
-                .font(.caption.bold())
-
-            rotationControl("X", value: $finalRotationX, color: .red)
-            rotationControl("Y", value: $finalRotationY, color: .green)
-            rotationControl("Z", value: $finalRotationZ, color: .blue)
-        }
-        .padding(8)
-        .foregroundStyle(.white)
-        .background(.black.opacity(0.92), in: RoundedRectangle(cornerRadius: 8))
-        .overlay {
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(.orange, lineWidth: 2)
-        }
-        .shadow(color: .black.opacity(0.8), radius: 5)
-    }
-
-    private func rotationControl(
-        _ axis: String,
-        value: Binding<Double>,
-        color: Color
-    ) -> some View {
-        HStack(spacing: 5) {
-            Text(axis)
-                .fontWeight(.bold)
-                .foregroundStyle(color)
-                .frame(width: 14)
-
-            Button("−90°") {
-                value.wrappedValue -= 90
-            }
-
-            Text("\(value.wrappedValue, format: .number.precision(.fractionLength(0)))°")
-                .monospacedDigit()
-                .frame(width: 48)
-
-            Button("+90°") {
-                value.wrappedValue += 90
-            }
-        }
-        .font(.caption)
-        .buttonStyle(.bordered)
-        .controlSize(.small)
-    }
-    #endif
 
     private var playbackControls: some View {
         PlaybackControls(
@@ -812,6 +861,28 @@ struct FlightWorkspace: View {
         .controlSize(.small)
         .padding(6)
         .help("Détacher cette vue")
+    }
+}
+
+private struct PlaybackDiagnosticsOverlay: View {
+    let currentFrame: Int
+    let playbackCorrectionCount: Int
+    let videoFrameRate: Double
+    let synchronizationError: TimeInterval
+
+    var body: some View {
+        VStack(alignment: .trailing, spacing: 1) {
+            Text("Frame : \(currentFrame)")
+            Text("Corrections : \(playbackCorrectionCount)")
+            Text("FPS : \(videoFrameRate, format: .number.precision(.fractionLength(2)))")
+            Text("Dérive : \(synchronizationError * 1_000, format: .number.precision(.fractionLength(0))) ms")
+        }
+        .font(.caption2.monospacedDigit())
+        .foregroundStyle(.black.opacity(0.7))
+        .padding(.horizontal, 6)
+        .padding(.vertical, 3)
+        .background(.white.opacity(0.78), in: RoundedRectangle(cornerRadius: 4))
+        .allowsHitTesting(false)
     }
 }
 
@@ -860,9 +931,12 @@ private struct FullScreenFlightVideo: View {
             .buttonStyle(.plain)
             .foregroundStyle(.white)
             .padding(20)
+
+            FullScreenPlaybackScrubber(model: model)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
         }
         .contentShape(Rectangle())
-        .onTapGesture(perform: onDismiss)
+        .onTapGesture(count: 2, perform: onDismiss)
         #if os(iOS)
         .task {
             guard isRunningOnIPhone else { return }
@@ -878,16 +952,86 @@ private struct FullScreenFlightVideo: View {
     }
 }
 
+enum FlightInstrumentSelection: String, Identifiable {
+    case aircraft
+    case flightPath
+    case map
+
+    var id: String { rawValue }
+}
+
+private struct FullScreenFlightInstrument<Content: View>: View {
+    let model: FlightViewModel
+    let onDismiss: () -> Void
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        ZStack(alignment: .topTrailing) {
+            Color.black
+                .ignoresSafeArea()
+
+            content
+                .ignoresSafeArea()
+                .contentShape(Rectangle())
+                .onTapGesture(count: 2, perform: onDismiss)
+
+            Button(action: onDismiss) {
+                Label("Fermer le plein écran", systemImage: "xmark.circle.fill")
+                    .font(.title)
+            }
+            .labelStyle(.iconOnly)
+            .buttonStyle(.plain)
+            .foregroundStyle(.white)
+            .padding(20)
+
+            FullScreenPlaybackScrubber(model: model)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+        }
+        #if os(iOS)
+        .task {
+            guard isRunningOnIPhone else { return }
+            await Task.yield()
+            try? await Task.sleep(for: .milliseconds(100))
+            AppOrientationController.request(.landscape)
+        }
+        .onDisappear {
+            guard isRunningOnIPhone else { return }
+            AppOrientationController.request(.portrait)
+        }
+        #endif
+    }
+}
+
+private struct FullScreenPlaybackScrubber: View {
+    let model: FlightViewModel
+
+    var body: some View {
+        ZStack(alignment: .leading) {
+            BookmarkTimelineSlider(
+                value: Binding(
+                    get: { model.currentTime },
+                    set: model.seek
+                ),
+                duration: model.duration,
+                bookmarks: model.bookmarks,
+                videoFrameRate: model.frontVideoFrameRate
+            )
+
+            Text(model.currentTime.clockString)
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.white)
+                .frame(width: 48, alignment: .trailing)
+        }
+        .padding(.horizontal, 16)
+        .padding(.bottom, 20)
+    }
+}
+
 private struct AircraftReadoutOverlay: View {
     let sample: FlightSample?
     let loadFactor: Double
     let minimumLoadFactor: Double
     let maximumLoadFactor: Double
-    let currentFrame: Int
-    let playbackCorrectionCount: Int
-    let videoFrameRate: Double
-    let videoOffset: TimeInterval
-    let synchronizationError: TimeInterval
     let mountingPitch: Double
     let isCameraInverted: Bool
 
@@ -899,9 +1043,7 @@ private struct AircraftReadoutOverlay: View {
     var body: some View {
         VStack {
             HStack(alignment: .top) {
-                Spacer()
-
-                VStack(alignment: .trailing, spacing: 2) {
+                VStack(alignment: .leading, spacing: 2) {
                     readout("GS", value: sample?.speed ?? 0, unit: "km/h", color: .green, prominent: true)
                     readout("Alt", value: sample?.altitude ?? 0, unit: "ft", color: .blue, prominent: true)
                     Text("\(sample?.verticalSpeed ?? 0, format: .number.precision(.fractionLength(0))) ft/min")
@@ -909,7 +1051,7 @@ private struct AircraftReadoutOverlay: View {
                         .foregroundStyle(.secondary)
                 }
 
-                Spacer(minLength: 12)
+                Spacer()
 
                 VStack(alignment: .trailing, spacing: 1) {
                     Text("G: \(loadFactor, format: .number.precision(.fractionLength(1)))")
@@ -921,21 +1063,8 @@ private struct AircraftReadoutOverlay: View {
                 .font(.caption2.monospacedDigit())
                 .foregroundStyle(.secondary)
             }
-
-            Spacer()
-
-            VStack(spacing: 1) {
-                Text("Frame : \(currentFrame)")
-                Text("Corrections : \(playbackCorrectionCount)")
-                Text("FPS : \(videoFrameRate, format: .number.precision(.fractionLength(2)))")
-                Text("Dérive : \(synchronizationError * 1_000, format: .number.precision(.fractionLength(0))) ms")
-            }
-            .font(.caption2.monospacedDigit())
-            .foregroundStyle(.secondary)
-            .padding(.horizontal, 6)
-            .padding(.vertical, 3)
-            .background(.white.opacity(0.78), in: RoundedRectangle(cornerRadius: 4))
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .padding(8)
         .overlay(alignment: .bottomTrailing) {
             VStack(alignment: .trailing, spacing: 4) {
@@ -943,7 +1072,7 @@ private struct AircraftReadoutOverlay: View {
                 readout("Bank", value: attitude.roll, unit: "°", color: .blue)
             }
             .padding(.trailing, 8)
-            .padding(.bottom, 42)
+            .padding(.bottom, 8)
         }
         .allowsHitTesting(false)
     }
