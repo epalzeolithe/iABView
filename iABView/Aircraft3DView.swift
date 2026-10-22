@@ -64,7 +64,11 @@ struct Aircraft3DView: PlatformViewRepresentable {
         view.allowsCameraControl = true
         view.autoenablesDefaultLighting = false
         view.delegate = context.coordinator
-        view.preferredFramesPerSecond = 60
+        // This drives `updateAtTime` continuously for as long as a flight is
+        // open (not just while playing — see the `rendersContinuously` note
+        // below), so its rate sets a permanent floor on this view's CPU cost.
+        // 30 fps is still smooth for an attitude readout and halves that floor.
+        view.preferredFramesPerSecond = 30
         view.isPlaying = true
         // `rendersContinuously` would force a full GPU draw every frame even
         // while playback is paused and nothing on screen is actually moving —

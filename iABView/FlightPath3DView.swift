@@ -14,12 +14,14 @@ private typealias PlatformViewRepresentable = UIViewRepresentable
 struct FlightPath3DView: View {
     let model: FlightViewModel
     @Environment(\.colorScheme) private var colorScheme
+    @State private var cachedLoadSamples: [FlightSample] = []
+    @State private var lastLoadSamplesCacheTime: TimeInterval = -.infinity
 
     private var backgroundColor: Color {
         colorScheme == .dark ? Color(white: 0.12) : .white
     }
 
-    // Recomputed on every ~30 Hz playback tick (this view reads `model.currentIndex`
+    // Recomputed on every ~15 Hz playback tick (this view reads `model.currentIndex`
     // directly), so this needs to stay cheap regardless of sample density. At the
     // ~100 Hz IMU rate this project works with, the prior linear backward scan
     // over a 20s window walked up to ~2000 samples per call, and handed all 2000
@@ -28,7 +30,7 @@ struct FlightPath3DView: View {
     // plus capping the chart to ~200 points (already more than a narrow sidebar
     // chart can usefully render) removes both the O(n) scan and the oversized
     // Chart workload.
-    private var recentLoadSamples: [FlightSample] {
+    private func recentLoadSamples() -> [FlightSample] {
         guard model.samples.indices.contains(model.currentIndex) else { return [] }
         let startTime = max(0, model.currentTime - 20)
         let startIndex = firstSampleIndex(atOrAfter: startTime, upperBound: model.currentIndex)
@@ -40,6 +42,18 @@ struct FlightPath3DView: View {
         return window.enumerated().compactMap { offset, sample in
             offset.isMultiple(of: strideValue) ? sample : nil
         }
+    }
+
+    // A slowly-scrolling 20s trend line doesn't need to redraw at the same rate
+    // as the rest of the UI: Swift Charts laying out ~200 marks isn't free, and
+    // doing it on every tick added up on top of everything else. Refreshing the
+    // cache at most 5x/second (instead of relying on the ~15 Hz tick driving
+    // this view) is visually indistinguishable for this chart.
+    private func refreshLoadSamplesCacheIfNeeded() {
+        guard model.currentTime - lastLoadSamplesCacheTime >= 0.2
+            || model.currentTime < lastLoadSamplesCacheTime else { return }
+        lastLoadSamplesCacheTime = model.currentTime
+        cachedLoadSamples = recentLoadSamples()
     }
 
     private func firstSampleIndex(atOrAfter time: TimeInterval, upperBound: Int) -> Int {
@@ -69,8 +83,8 @@ struct FlightPath3DView: View {
                     .frame(width: 170)
 
                 FlightPathLoadHistory(
-                    samples: recentLoadSamples,
-                    currentTime: model.currentTime,
+                    samples: cachedLoadSamples,
+                    currentTime: lastLoadSamplesCacheTime,
                     mountingPitch: model.mountingPitch
                 )
                 .frame(maxWidth: .infinity)
@@ -80,6 +94,8 @@ struct FlightPath3DView: View {
             .padding(12)
             .allowsHitTesting(false)
         }
+        .onAppear(perform: refreshLoadSamplesCacheIfNeeded)
+        .onChange(of: model.currentIndex) { _, _ in refreshLoadSamplesCacheIfNeeded() }
         .overlay(alignment: .bottomTrailing) {
             HStack(alignment: .bottom, spacing: 1) {
                 Spacer()
