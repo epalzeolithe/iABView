@@ -159,7 +159,6 @@ struct DetachedAircraftView: View {
             isInverted: model.isCameraInverted,
             showsAxes: model.shows3DAxes,
             showsVerticalGrid: model.showsVerticalGrid,
-            showsTrajectoryTrail: model.showsTrajectoryTrail,
             accelerationX: sample?.accelerationX ?? 0,
             accelerationY: sample?.accelerationY ?? 0,
             accelerationZ: sample?.accelerationZ ?? 0,

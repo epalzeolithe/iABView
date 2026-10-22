@@ -56,7 +56,6 @@ final class FlightViewModel {
     private(set) var maximumSpeed = 0.0
     private(set) var shows3DAxes = true
     private(set) var showsVerticalGrid = false
-    private(set) var showsTrajectoryTrail = true
     private(set) var isAudioMuted = false
     private(set) var playbackCorrectionCount = 0
 
@@ -405,10 +404,6 @@ final class FlightViewModel {
 
     func toggleVerticalGrid() {
         showsVerticalGrid.toggle()
-    }
-
-    func toggleTrajectoryTrail() {
-        showsTrajectoryTrail.toggle()
     }
 
     func reloadBookmarks() {
