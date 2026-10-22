@@ -752,7 +752,6 @@ struct FlightWorkspace: View {
                 }
                 #endif
 
-                #if os(macOS)
                 let windowScale = min(workspaceSize.width / 1_440, workspaceSize.height / 900)
                 let horizonSize = min(260, max(140, 220 * windowScale))
 
@@ -765,36 +764,11 @@ struct FlightWorkspace: View {
                 )
                 .frame(width: horizonSize, height: horizonSize * 2 + 8)
                 .frame(maxHeight: .infinity)
-                #endif
 
                 ZStack(alignment: .bottom) {
                     FlightPath3DView(model: model)
                     #if os(macOS)
                     detachButton(action: onDetachFlightPath)
-                    #else
-                    // The G-factor bar and load history chart already occupy the
-                    // top-leading corner of this same pane (via FlightPath3DView's
-                    // own overlay, ~120pt tall with padding); the horizon stack
-                    // below must leave that height alone or it grows up over it.
-                    let reservedTopHeight: CGFloat = 120
-                    let availableHeight = max(0, workspaceSize.height - reservedTopHeight)
-                    let horizonSize = min(
-                        140,
-                        max(70, min(workspaceSize.width / 8, (availableHeight - 16) / 2))
-                    )
-
-                    TelemetryPanel(
-                        sample: model.currentSample,
-                        signedLoadFactor: model.currentSignedLoadFactor,
-                        mountingPitch: model.mountingPitch,
-                        isCameraInverted: model.isCameraInverted,
-                        horizonSize: horizonSize
-                    )
-                    .frame(width: horizonSize, height: horizonSize * 2 + 8)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.leading, 8)
-                    .padding(.bottom, 8)
-                    .allowsHitTesting(false)
                     #endif
                 }
                 .clipShape(RoundedRectangle(cornerRadius: 7))
