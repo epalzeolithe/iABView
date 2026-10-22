@@ -372,17 +372,27 @@ struct Aircraft3DView: PlatformViewRepresentable {
                 return
             }
 
+            // The full window can be thousands of samples at IMU sample rates;
+            // the per-sample quaternion rotation below (and the dominant cost of
+            // this whole function, confirmed by profiling) scales directly with
+            // that count. A cosmetic trail doesn't need sample-level density —
+            // downsampling first keeps the full `trajectoryWindowSeconds` of
+            // visual coverage while capping the actual math and geometry work,
+            // the same technique FlightPath3DView already uses for its own trail.
+            let windowSamples = downsampledTrailSamples(
+                Array(samples[startIndex...currentIndex])
+            )
+
             // Dead-reckons the recent path from attitude (gyro-derived quaternion) and speed,
             // walking backward from "now". This keeps the trail perfectly in sync with the
             // model's own rotation and avoids the jitter of raw GPS fixes.
-            let sampleCount = currentIndex - startIndex + 1
+            let sampleCount = windowSamples.count
             var relativePositions = [SIMD3<Float>](repeating: .zero, count: sampleCount)
             var rightVectors = [SIMD3<Float>](repeating: .zero, count: sampleCount)
             var accumulated = SIMD3<Float>.zero
             for offset in stride(from: sampleCount - 1, through: 1, by: -1) {
-                let index = startIndex + offset
-                let sample = samples[index]
-                let previous = samples[index - 1]
+                let sample = windowSamples[offset]
+                let previous = windowSamples[offset - 1]
                 let forward = sceneForward(
                     quaternionW: sample.quaternionW,
                     quaternionX: sample.quaternionX,
@@ -396,7 +406,7 @@ struct Aircraft3DView: PlatformViewRepresentable {
                 relativePositions[offset - 1] = accumulated
             }
             for offset in 0..<sampleCount {
-                let sample = samples[startIndex + offset]
+                let sample = windowSamples[offset]
                 rightVectors[offset] = sceneRight(
                     quaternionW: sample.quaternionW,
                     quaternionX: sample.quaternionX,
@@ -434,7 +444,7 @@ struct Aircraft3DView: PlatformViewRepresentable {
             )
 
             for offset in 1..<sampleCount {
-                let sample = samples[startIndex + offset]
+                let sample = windowSamples[offset]
                 let previousCenter = scenePositions[offset - 1]
                 let currentCenter = scenePositions[offset]
                 centerVertices.append(SCNVector3(previousCenter))
@@ -475,6 +485,17 @@ struct Aircraft3DView: PlatformViewRepresentable {
                 vertices: leftVertices,
                 colorComponents: leftColors
             )
+        }
+
+        private func downsampledTrailSamples(_ window: [FlightSample]) -> [FlightSample] {
+            let maximumCount = 300
+            guard window.count > maximumCount else { return window }
+            let strideValue = max(1, window.count / maximumCount)
+            var result = Swift.stride(from: 0, to: window.count, by: strideValue).map { window[$0] }
+            if let last = window.last, result.last?.id != last.id {
+                result.append(last)
+            }
+            return result
         }
 
         private func trailColorComponents(forSpeed speed: Double) -> (Float, Float, Float, Float) {
