@@ -192,6 +192,7 @@ private struct FlightPathScene: PlatformViewRepresentable {
         private var lastTrajectoryEndTime: TimeInterval?
         private var cameraTarget: SCNVector3?
         private var appliedZoomCommand = 0
+        private var colorComponentCache: [PlatformColor: (Float, Float, Float, Float)] = [:]
 
         override init() {
             super.init()
@@ -462,23 +463,17 @@ private struct FlightPathScene: PlatformViewRepresentable {
             thickness: SCNFloat
         ) -> SCNNode {
             let vertexSource = SCNGeometrySource(vertices: vertices)
-            let colorComponents: [Float] = colors.flatMap { color in
-                #if os(macOS)
-                let converted = color.usingColorSpace(.deviceRGB) ?? color
-                return [
-                    Float(converted.redComponent),
-                    Float(converted.greenComponent),
-                    Float(converted.blueComponent),
-                    Float(converted.alphaComponent)
-                ]
-                #else
-                var red: CGFloat = 0
-                var green: CGFloat = 0
-                var blue: CGFloat = 0
-                var alpha: CGFloat = 0
-                color.getRed(&red, green: &green, blue: &blue, alpha: &alpha)
-                return [Float(red), Float(green), Float(blue), Float(alpha)]
-                #endif
+            // Profiling showed this as the single biggest cost in the app: the
+            // trajectory is built from only a handful of distinct colors (the
+            // speed palette, plus the fixed shadow/wingtip colors), but with one
+            // array entry per vertex (up to tens of thousands for a long window)
+            // this used to re-run `usingColorSpace`/`getRed` — which goes through
+            // full ColorSync profile and HDR headroom evaluation — for every
+            // single one of them, every time the trajectory refreshed. Caching
+            // by color turns that into a handful of conversions, ever.
+            let colorComponents: [Float] = colors.flatMap { color -> [Float] in
+                let components = cachedComponents(for: color)
+                return [components.0, components.1, components.2, components.3]
             }
             let colorData = colorComponents.withUnsafeBytes { Data($0) }
             let colorSource = SCNGeometrySource(
@@ -544,6 +539,29 @@ private struct FlightPathScene: PlatformViewRepresentable {
             let north = (sample.latitude - reference.latitude) * metersPerDegree
             let altitudeMeters = max(0, sample.altitude * 0.3048)
             return SCNVector3(east / 500, altitudeMeters / 500, -north / 500)
+        }
+
+        private func cachedComponents(for color: PlatformColor) -> (Float, Float, Float, Float) {
+            if let cached = colorComponentCache[color] { return cached }
+            let components: (Float, Float, Float, Float)
+            #if os(macOS)
+            let converted = color.usingColorSpace(.deviceRGB) ?? color
+            components = (
+                Float(converted.redComponent),
+                Float(converted.greenComponent),
+                Float(converted.blueComponent),
+                Float(converted.alphaComponent)
+            )
+            #else
+            var red: CGFloat = 0
+            var green: CGFloat = 0
+            var blue: CGFloat = 0
+            var alpha: CGFloat = 0
+            color.getRed(&red, green: &green, blue: &blue, alpha: &alpha)
+            components = (Float(red), Float(green), Float(blue), Float(alpha))
+            #endif
+            colorComponentCache[color] = components
+            return components
         }
 
         private func speedColor(_ speed: Double) -> PlatformColor {

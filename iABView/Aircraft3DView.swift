@@ -142,6 +142,7 @@ struct Aircraft3DView: PlatformViewRepresentable {
         private let realtimeLock = NSLock()
         private var lastUpdateSeconds: TimeInterval?
         private var lastTrailRebuildSeconds: TimeInterval = -.infinity
+        private var colorComponentCache: [PlatformColor: (Float, Float, Float, Float)] = [:]
 
         override init() {
             super.init()
@@ -511,10 +512,18 @@ struct Aircraft3DView: PlatformViewRepresentable {
             }
         }
 
+        // Called per trail segment (up to 300 after downsampling, every rebuild),
+        // but only draws from a handful of distinct fixed colors — caching avoids
+        // re-running `usingColorSpace`/`getRed` (full ColorSync/HDR evaluation)
+        // for colors already converted. This is the same fix applied to
+        // FlightPath3DView.Coordinator.lineNode, which profiling showed was by
+        // far the most expensive place doing this.
         private func fixedColorComponents(_ color: PlatformColor) -> (Float, Float, Float, Float) {
+            if let cached = colorComponentCache[color] { return cached }
+            let components: (Float, Float, Float, Float)
             #if os(macOS)
             let converted = color.usingColorSpace(.deviceRGB) ?? color
-            return (
+            components = (
                 Float(converted.redComponent),
                 Float(converted.greenComponent),
                 Float(converted.blueComponent),
@@ -526,8 +535,10 @@ struct Aircraft3DView: PlatformViewRepresentable {
             var blue: CGFloat = 0
             var alpha: CGFloat = 0
             color.getRed(&red, green: &green, blue: &blue, alpha: &alpha)
-            return (Float(red), Float(green), Float(blue), Float(alpha))
+            components = (Float(red), Float(green), Float(blue), Float(alpha))
             #endif
+            colorComponentCache[color] = components
+            return components
         }
 
         private func coloredLineGeometry(
