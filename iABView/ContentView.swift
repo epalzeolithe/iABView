@@ -752,15 +752,25 @@ struct FlightWorkspace: View {
                 }
                 #endif
 
+                #if os(macOS)
+                let windowScale = min(workspaceSize.width / 1_440, workspaceSize.height / 900)
+                let horizonSize = min(260, max(140, 220 * windowScale))
+
+                TelemetryPanel(
+                    sample: model.currentSample,
+                    signedLoadFactor: model.currentSignedLoadFactor,
+                    mountingPitch: model.mountingPitch,
+                    isCameraInverted: model.isCameraInverted,
+                    horizonSize: horizonSize
+                )
+                .frame(width: horizonSize, height: horizonSize * 2 + 8)
+                .frame(maxHeight: .infinity)
+                #endif
+
                 ZStack(alignment: .bottom) {
                     FlightPath3DView(model: model)
                     #if os(macOS)
                     detachButton(action: onDetachFlightPath)
-                    #endif
-
-                    #if os(macOS)
-                    let windowScale = min(workspaceSize.width / 1_440, workspaceSize.height / 900)
-                    let horizonSize = min(260, max(140, 220 * windowScale))
                     #else
                     // The G-factor bar and load history chart already occupy the
                     // top-leading corner of this same pane (via FlightPath3DView's
@@ -772,7 +782,6 @@ struct FlightWorkspace: View {
                         140,
                         max(70, min(workspaceSize.width / 8, (availableHeight - 16) / 2))
                     )
-                    #endif
 
                     TelemetryPanel(
                         sample: model.currentSample,
@@ -786,6 +795,7 @@ struct FlightWorkspace: View {
                     .padding(.leading, 8)
                     .padding(.bottom, 8)
                     .allowsHitTesting(false)
+                    #endif
                 }
                 .clipShape(RoundedRectangle(cornerRadius: 7))
                 .frame(minWidth: 280)
