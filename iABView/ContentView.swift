@@ -14,30 +14,9 @@ private var isRunningOnIPhone: Bool {
     #endif
 }
 
-#if os(macOS)
-// `.navigationTitle` on a NavigationSplitView column doesn't reliably drive
-// the actual NSWindow title bar text, so the CPU readout never showed up
-// there. Reaching the window directly through its hosting NSView is the
-// dependable way to set it from SwiftUI.
-private struct WindowTitleSetter: NSViewRepresentable {
-    let title: String
-
-    func makeNSView(context: Context) -> NSView {
-        let view = NSView()
-        DispatchQueue.main.async { view.window?.title = title }
-        return view
-    }
-
-    func updateNSView(_ nsView: NSView, context: Context) {
-        nsView.window?.title = title
-    }
-}
-#endif
-
 struct ContentView: View {
     #if os(macOS)
     @Environment(\.openWindow) private var openWindow
-    @State private var cpuMonitor = CPUMonitor()
     #endif
     var initialBundleURL: URL? = nil
     @State private var model = FlightViewModel()
@@ -52,14 +31,6 @@ struct ContentView: View {
     @State private var isLastBundleDialogPresented = false
     @State private var didAskToRestoreLastBundle = false
     @State private var isBundleImporterPresented = false
-
-    private var cpuUsageText: String {
-        #if os(macOS)
-        cpuMonitor.usageText
-        #else
-        ""
-        #endif
-    }
 
     var body: some View {
         NavigationSplitView(
@@ -100,14 +71,6 @@ struct ContentView: View {
         }
         #if os(macOS)
         .frame(minWidth: 1_100, minHeight: 720)
-        .background(
-            WindowTitleSetter(
-                title: cpuUsageText.isEmpty ? "ABView" : "ABView — \(cpuUsageText)"
-            )
-        )
-        .task {
-            cpuMonitor.start()
-        }
         #endif
         .onAppear {
             guard !didAskToRestoreLastBundle else { return }
@@ -118,10 +81,6 @@ struct ContentView: View {
             } else {
                 isLastBundleDialogPresented = model.lastBundleName != nil
             }
-        }
-        .onOpenURL { url in
-            model.openBundle(url)
-            preferredCompactColumn = .detail
         }
         .task(id: isLastBundleDialogPresented) {
             guard isLastBundleDialogPresented else { return }
@@ -434,12 +393,10 @@ struct FlightSidebar: View {
             Section("Vol") {
                 if let bundleName {
                     Label(bundleName, systemImage: "airplane")
-                }
-                Button(action: onOpen) {
-                    Label(
-                        bundleName == nil ? "Ouvrir un bundle .abv" : "Ouvrir un autre fichier…",
-                        systemImage: "folder.badge.plus"
-                    )
+                } else {
+                    Button(action: onOpen) {
+                        Label("Ouvrir un bundle .abv", systemImage: "folder.badge.plus")
+                    }
                 }
             }
 
@@ -514,25 +471,10 @@ struct FlightWorkspace: View {
     let onDetachAircraft: () -> Void
     let onDetachFlightPath: () -> Void
     @State private var fullScreenVideo: FlightVideoSelection?
-    @State private var fullScreenInstrument: FlightInstrumentSelection?
 
     var body: some View {
         if model.isLoading {
-            VStack(spacing: 14) {
-                ProgressView(value: model.loadingProgress) {
-                    Text("Chargement du vol…")
-                } currentValueLabel: {
-                    Text(model.loadingProgress, format: .percent.precision(.fractionLength(0)))
-                }
-                .progressViewStyle(.linear)
-                .frame(maxWidth: 320)
-
-                Button("Annuler", role: .cancel) {
-                    model.cancelLoading()
-                }
-                .buttonStyle(.bordered)
-            }
-            .padding()
+            ProgressView("Chargement du vol…")
         } else if model.samples.isEmpty {
             ContentUnavailableView {
                 Label("Aucun vol ouvert", systemImage: "airplane.circle")
@@ -581,28 +523,7 @@ struct FlightWorkspace: View {
                     onDismiss: { fullScreenVideo = nil }
                 )
             }
-            .fullScreenCover(item: $fullScreenInstrument) { selection in
-                FullScreenFlightInstrument(model: model, onDismiss: { fullScreenInstrument = nil }) {
-                    instrumentContent(for: selection)
-                }
-            }
             #endif
-        }
-    }
-
-    @ViewBuilder
-    private func instrumentContent(for selection: FlightInstrumentSelection) -> some View {
-        switch selection {
-        case .aircraft:
-            aircraftView(sample: model.renderingSample)
-        case .flightPath:
-            FlightPath3DView(model: model)
-        case .map:
-            FlightMapView(
-                coordinates: model.routeCoordinates,
-                sample: model.currentSample,
-                metar: model.currentMETAR
-            )
         }
     }
 
@@ -676,7 +597,7 @@ struct FlightWorkspace: View {
             .onTapGesture(count: 2, perform: onDetachFront)
             #else
             .contentShape(Rectangle())
-            .onTapGesture {
+            .onTapGesture(count: 2) {
                 fullScreenVideo = .front
             }
             #endif
@@ -710,7 +631,7 @@ struct FlightWorkspace: View {
             .onTapGesture(count: 2, perform: onDetachBack)
             #else
             .contentShape(Rectangle())
-            .onTapGesture {
+            .onTapGesture(count: 2) {
                 fullScreenVideo = .back
             }
             #endif
@@ -724,7 +645,8 @@ struct FlightWorkspace: View {
     }
 
     private func instrumentRowContent(in workspaceSize: CGSize) -> some View {
-        HStack(spacing: 6) {
+        ZStack(alignment: .topLeading) {
+            HStack(spacing: 6) {
                 ZStack(alignment: .topTrailing) {
                     aircraftView(sample: model.renderingSample)
                     AircraftReadoutOverlay(
@@ -744,34 +666,14 @@ struct FlightWorkspace: View {
                 .clipShape(RoundedRectangle(cornerRadius: 7))
                 .frame(minWidth: 280)
                 .layoutPriority(1)
-                #if !os(macOS)
-                .contentShape(Rectangle())
-                .onTapGesture {
-                    fullScreenInstrument = .aircraft
-                }
-                #endif
 
                 ZStack(alignment: .bottom) {
                     FlightPath3DView(model: model)
                     #if os(macOS)
                     detachButton(action: onDetachFlightPath)
-                    #endif
 
-                    #if os(macOS)
                     let windowScale = min(workspaceSize.width / 1_440, workspaceSize.height / 900)
                     let horizonSize = min(260, max(140, 220 * windowScale))
-                    #else
-                    // The G-factor bar and load history chart already occupy the
-                    // top-leading corner of this same pane (via FlightPath3DView's
-                    // own overlay, ~120pt tall with padding); the horizon stack
-                    // below must leave that height alone or it grows up over it.
-                    let reservedTopHeight: CGFloat = 120
-                    let availableHeight = max(0, workspaceSize.height - reservedTopHeight)
-                    let horizonSize = min(
-                        140,
-                        max(70, min(workspaceSize.width / 8, (availableHeight - 16) / 2))
-                    )
-                    #endif
 
                     TelemetryPanel(
                         sample: model.currentSample,
@@ -785,16 +687,11 @@ struct FlightWorkspace: View {
                     .padding(.leading, 8)
                     .padding(.bottom, 8)
                     .allowsHitTesting(false)
+                    #endif
                 }
                 .clipShape(RoundedRectangle(cornerRadius: 7))
                 .frame(minWidth: 280)
                 .layoutPriority(1)
-                #if !os(macOS)
-                .contentShape(Rectangle())
-                .onTapGesture {
-                    fullScreenInstrument = .flightPath
-                }
-                #endif
 
                 FlightMapView(
                     coordinates: model.routeCoordinates,
@@ -802,12 +699,30 @@ struct FlightWorkspace: View {
                     metar: model.currentMETAR
                 )
                 .frame(minWidth: 260)
-                #if !os(macOS)
-                .contentShape(Rectangle())
-                .onTapGesture(count: 2) {
-                    fullScreenInstrument = .map
-                }
-                #endif
+            }
+
+            #if !os(macOS)
+            let horizonSize = min(
+                140,
+                max(100, min(workspaceSize.width / 8, workspaceSize.height / 3))
+            )
+
+            TelemetryPanel(
+                sample: model.currentSample,
+                signedLoadFactor: model.currentSignedLoadFactor,
+                mountingPitch: model.mountingPitch,
+                isCameraInverted: model.isCameraInverted,
+                horizonSize: horizonSize
+            )
+            .frame(
+                width: horizonSize,
+                height: horizonSize * 2 + 8,
+                alignment: .leading
+            )
+            .padding(.leading, 6)
+            .frame(maxHeight: .infinity, alignment: .bottom)
+            .padding(.bottom, 6)
+            #endif
         }
     }
 
@@ -931,12 +846,9 @@ private struct FullScreenFlightVideo: View {
             .buttonStyle(.plain)
             .foregroundStyle(.white)
             .padding(20)
-
-            FullScreenPlaybackScrubber(model: model)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
         }
         .contentShape(Rectangle())
-        .onTapGesture(count: 2, perform: onDismiss)
+        .onTapGesture(perform: onDismiss)
         #if os(iOS)
         .task {
             guard isRunningOnIPhone else { return }
@@ -949,81 +861,6 @@ private struct FullScreenFlightVideo: View {
             AppOrientationController.request(.portrait)
         }
         #endif
-    }
-}
-
-enum FlightInstrumentSelection: String, Identifiable {
-    case aircraft
-    case flightPath
-    case map
-
-    var id: String { rawValue }
-}
-
-private struct FullScreenFlightInstrument<Content: View>: View {
-    let model: FlightViewModel
-    let onDismiss: () -> Void
-    @ViewBuilder let content: Content
-
-    var body: some View {
-        ZStack(alignment: .topTrailing) {
-            Color.black
-                .ignoresSafeArea()
-
-            content
-                .ignoresSafeArea()
-                .contentShape(Rectangle())
-                .onTapGesture(count: 2, perform: onDismiss)
-
-            Button(action: onDismiss) {
-                Label("Fermer le plein écran", systemImage: "xmark.circle.fill")
-                    .font(.title)
-            }
-            .labelStyle(.iconOnly)
-            .buttonStyle(.plain)
-            .foregroundStyle(.white)
-            .padding(20)
-
-            FullScreenPlaybackScrubber(model: model)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
-        }
-        #if os(iOS)
-        .task {
-            guard isRunningOnIPhone else { return }
-            await Task.yield()
-            try? await Task.sleep(for: .milliseconds(100))
-            AppOrientationController.request(.landscape)
-        }
-        .onDisappear {
-            guard isRunningOnIPhone else { return }
-            AppOrientationController.request(.portrait)
-        }
-        #endif
-    }
-}
-
-private struct FullScreenPlaybackScrubber: View {
-    let model: FlightViewModel
-
-    var body: some View {
-        ZStack(alignment: .leading) {
-            BookmarkTimelineSlider(
-                value: Binding(
-                    get: { model.currentTime },
-                    set: model.seek
-                ),
-                duration: model.duration,
-                bookmarks: model.bookmarks,
-                videoFrameRate: model.frontVideoFrameRate
-            )
-
-            Text(model.currentTime.clockString)
-                .font(.caption.monospacedDigit())
-                .foregroundStyle(.white)
-                .frame(width: 48, alignment: .trailing)
-        }
-        .padding(.horizontal, 16)
-        .padding(.bottom, 20)
     }
 }
 
