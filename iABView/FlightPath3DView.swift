@@ -565,7 +565,7 @@ private struct FlightPathSpeedScale: View {
             }
             .frame(width: 9, height: 82)
         }
-        .foregroundStyle(.black)
+        .foregroundStyle(.primary)
         .padding(6)
     }
 }
@@ -605,8 +605,9 @@ private struct FlightPathGScale: View {
             .frame(height: 22)
         }
         .font(.caption.monospacedDigit())
-        .foregroundStyle(.black)
+        .foregroundStyle(.primary)
         .padding(8)
+        .background(.white.opacity(0.84), in: RoundedRectangle(cornerRadius: 5))
     }
 }
 
@@ -651,8 +652,9 @@ private struct FlightPathLoadHistory: View {
             .chartXAxis(.hidden)
             .chartYAxis(.hidden)
         }
-        .foregroundStyle(.black)
+        .foregroundStyle(.primary)
         .padding(6)
+        .background(.white.opacity(0.84), in: RoundedRectangle(cornerRadius: 5))
         .accessibilityLabel("Facteur de charge")
     }
 }
@@ -681,7 +683,7 @@ private struct FlightPathAltitudeScale: View {
             }
             .frame(width: 9, height: 82)
         }
-        .foregroundStyle(.black)
+        .foregroundStyle(.primary)
         .padding(6)
     }
 }
