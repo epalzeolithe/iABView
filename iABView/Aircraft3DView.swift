@@ -349,7 +349,10 @@ struct Aircraft3DView: PlatformViewRepresentable {
             // playback, which made this the dominant cost behind ~200% sustained
             // CPU — throttling the rebuild to 10 Hz is visually indistinguishable
             // for a trail covering tens of seconds, but cuts that work 5-10x.
-            if seconds - lastTrailRebuildSeconds >= 0.1 {
+            // abs(): a backward seek or loop restart makes `seconds` smaller than the
+            // last rebuild time, which would otherwise freeze the trail until
+            // playback caught back up to the old position.
+            if abs(seconds - lastTrailRebuildSeconds) >= 0.1 {
                 lastTrailRebuildSeconds = seconds
                 updateTrajectoryTrail(samples: samples, currentIndex: index)
             }

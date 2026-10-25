@@ -108,19 +108,6 @@ struct MyApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     #endif
 
-    #if os(macOS)
-    init() {
-        let iconURL = Bundle.main.url(
-            forResource: "AppIcon-1024",
-            withExtension: "png",
-            subdirectory: "AppIcons"
-        ) ?? Bundle.main.url(forResource: "AppIcon-1024", withExtension: "png")
-        if let iconURL, let icon = NSImage(contentsOf: iconURL) {
-            NSApplication.shared.applicationIconImage = icon
-        }
-    }
-    #endif
-
     var body: some Scene {
         #if os(macOS)
         WindowGroup("ABView", id: "abview", for: URL.self) { $bundleURL in
