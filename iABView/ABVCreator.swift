@@ -1126,7 +1126,15 @@ private enum ABVCreatorPipeline {
             guard XMLParser(contentsOf: url)?.parse(using: parser) == true else {
                 throw ABVCreatorError.invalidData("Le fichier GPX est invalide.")
             }
-            return enrichGPS(parser.points)
+            // Le GPX de la caméra répète un même point des centaines de fois (même horodatage) et n'est
+            // pas ordonné : on trie puis on écarte les points quasi simultanés, sinon la vitesse
+            // dérivée (distance / intervalle) explose.
+            var unique: [GPSSample] = []
+            for point in parser.points.sorted(by: { $0.date < $1.date }) {
+                if let last = unique.last, point.date.timeIntervalSince(last.date) < 0.05 { continue }
+                unique.append(point)
+            }
+            return enrichGPS(unique)
         }
         let text = try String(contentsOf: url, encoding: .utf8)
         var pending: (time: String, lat: Double, lon: Double, alt: Double)?
@@ -1342,6 +1350,13 @@ private final class GPXPointParser: NSObject, XMLParserDelegate {
     private var currentElement = ""
     private var text = ""
     private let iso = ISO8601DateFormatter()
+    /// Les GPX d'exiftool datent leurs points avec des millisecondes (`08:07:19.166Z`),
+    /// que `ISO8601DateFormatter` n'accepte pas sans l'option `.withFractionalSeconds`.
+    private let isoFractional: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
 
     nonisolated func parser(
         _ parser: XMLParser, didStartElement elementName: String, namespaceURI: String?,
@@ -1367,7 +1382,7 @@ private final class GPXPointParser: NSObject, XMLParserDelegate {
     ) {
         let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if elementName == "ele" { elevation = Double(value) }
-        if elementName == "time" { date = iso.date(from: value) }
+        if elementName == "time" { date = isoFractional.date(from: value) ?? iso.date(from: value) }
         if elementName == "trkpt", let latitude, let longitude, let date {
             points.append(.init(
                 date: date, latitude: latitude, longitude: longitude,
