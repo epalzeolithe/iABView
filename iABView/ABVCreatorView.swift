@@ -8,6 +8,9 @@ struct ABVCreatorView: View {
     @State private var model = ABVCreatorModel()
     @State private var isImporterPresented = false
     @State private var isDropTargeted = false
+    @State private var isTestingGyroflow = false
+    @AppStorage("ABVCreator.showConsole") private var showConsole = false
+    @State private var gyroflowTestResult: (succeeded: Bool, message: String)?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -15,6 +18,10 @@ struct ABVCreatorView: View {
             Divider()
             sourceList
             Divider()
+            if showConsole {
+                Divider()
+                console
+            }
             footer
         }
         .frame(minWidth: 720, idealWidth: 820, minHeight: 560, idealHeight: 650)
@@ -154,7 +161,7 @@ struct ABVCreatorView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(source.url.lastPathComponent)
                     .lineLimit(1)
-                Text(source.kind.rawValue)
+                Text(model.cameraModels[source.url] ?? source.kind.rawValue)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -197,10 +204,15 @@ struct ABVCreatorView: View {
                 HStack(spacing: 16) {
                     if let start = model.creationStartDate {
                         Label {
-                            Text(start, style: .timer)
-                                .monospacedDigit()
+                            if let pausedAt = model.pauseStartDate {
+                                Text("\(formattedDuration(pausedAt.timeIntervalSince(start))) (en pause)")
+                                    .monospacedDigit()
+                            } else {
+                                Text(start, style: .timer)
+                                    .monospacedDigit()
+                            }
                         } icon: {
-                            Image(systemName: "clock")
+                            Image(systemName: model.isPaused ? "pause.circle" : "clock")
                         }
                     }
 
@@ -210,6 +222,13 @@ struct ABVCreatorView: View {
                     }
 
                     Spacer()
+
+                    Button(
+                        model.isPaused ? "Reprendre" : "Pause",
+                        systemImage: model.isPaused ? "play.circle.fill" : "pause.circle.fill"
+                    ) {
+                        model.togglePause()
+                    }
 
                     Button("Arrêter", systemImage: "stop.circle.fill") {
                         model.cancel()
@@ -249,6 +268,18 @@ struct ABVCreatorView: View {
         VStack(alignment: .leading, spacing: 12) {
             toolStatusRow
 
+            HStack(spacing: 12) {
+                Toggle("Aperçu (1 min de vidéo)", isOn: $model.isPreview)
+                if model.isPreview {
+                    Stepper(value: $model.previewOffsetMinutes, in: 0...600) {
+                        Text("à partir de t0 + \(model.previewOffsetMinutes) min")
+                            .monospacedDigit()
+                    }
+                }
+                Spacer()
+            }
+            .disabled(model.state == .running)
+
             HStack {
                 if let outputURL = model.outputURL {
                     Button("Afficher dans le Finder", systemImage: "folder") {
@@ -285,7 +316,78 @@ struct ABVCreatorView: View {
             ForEach(ABVTool.allCases) { tool in
                 toolStatusBadge(tool)
             }
+
+            Toggle("Console", systemImage: "terminal", isOn: $showConsole)
+                .toggleStyle(.button)
+                .controlSize(.small)
+
+            Button(isTestingGyroflow ? "Test en cours…" : "Tester Gyroflow") {
+                testGyroflow()
+            }
+            .controlSize(.small)
+            .disabled(isTestingGyroflow || !ABVTool.gyroflow.isAvailable)
+
+            if let gyroflowTestResult {
+                Label(gyroflowTestResult.message, systemImage: gyroflowTestResult.succeeded
+                    ? "checkmark.circle.fill" : "xmark.octagon.fill")
+                    .font(.caption)
+                    .foregroundStyle(gyroflowTestResult.succeeded ? Color.green : Color.red)
+            }
             Spacer()
+        }
+    }
+
+    private var console: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Label("Console de débogage", systemImage: "terminal")
+                    .font(.caption.weight(.medium))
+                Spacer()
+                Button("Copier tout", systemImage: "doc.on.doc") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(model.consoleLines.joined(separator: "\n"), forType: .string)
+                }
+                Button("Effacer", systemImage: "trash") {
+                    model.clearConsole()
+                }
+            }
+            .controlSize(.small)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+
+            ScrollViewReader { proxy in
+                ScrollView {
+                    // Un seul Text permet de sélectionner et copier plusieurs lignes à la fois.
+                    Text(model.consoleLines.isEmpty
+                        ? "Les commandes lancées apparaîtront ici."
+                        : model.consoleLines.joined(separator: "\n"))
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(model.consoleLines.isEmpty ? .secondary : .primary)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 12)
+                        .padding(.bottom, 8)
+                    Color.clear.frame(height: 1).id("console-end")
+                }
+                .onChange(of: model.consoleLines.count) {
+                    proxy.scrollTo("console-end", anchor: .bottom)
+                }
+            }
+        }
+        .frame(height: 200)
+        .background(.black.opacity(0.06))
+    }
+
+    private func testGyroflow() {
+        isTestingGyroflow = true
+        gyroflowTestResult = nil
+        Task {
+            let outcome = await Task.detached { Result { try ABVTool.gyroflow.selfTest() } }.value
+            switch outcome {
+            case .success(let version): gyroflowTestResult = (true, "\(version) fonctionne")
+            case .failure(let error): gyroflowTestResult = (false, error.localizedDescription)
+            }
+            isTestingGyroflow = false
         }
     }
 
@@ -319,6 +421,19 @@ struct ABVCreatorView: View {
 
         let alert = NSAlert()
         alert.alertStyle = .warning
+        if !model.isPreview, model.hasConvertedVideo(at: finalURL) {
+            alert.messageText = "Le fichier « \(finalURL.lastPathComponent) » contient déjà une conversion vidéo."
+            alert.informativeText = "Conserver la vidéo existante (seules les données sont régénérées) ou tout écraser et reconvertir ?"
+            alert.addButton(withTitle: "Garder la vidéo")
+            alert.addButton(withTitle: "Tout écraser")
+            alert.addButton(withTitle: "Annuler")
+            switch alert.runModal() {
+            case .alertFirstButtonReturn: model.create(at: url, overwrite: true, keepVideo: true)
+            case .alertSecondButtonReturn: model.create(at: url, overwrite: true)
+            default: break
+            }
+            return
+        }
         alert.messageText = "Le fichier « \(finalURL.lastPathComponent) » existe déjà."
         alert.informativeText = "Voulez-vous le remplacer ? Cette action est irréversible."
         alert.addButton(withTitle: "Remplacer")

@@ -64,6 +64,9 @@ enum ABVCreatorError: LocalizedError {
 final class ABVCreatorCancellationToken: @unchecked Sendable {
     private let lock = NSLock()
     private nonisolated(unsafe) var cancelled = false
+    private nonisolated(unsafe) var paused = false
+    private nonisolated(unsafe) var pausedSince: Date?
+    private nonisolated(unsafe) var accumulatedPause: TimeInterval = 0
     private nonisolated(unsafe) weak var currentProcess: Process?
 
     nonisolated init() {}
@@ -83,14 +86,47 @@ final class ABVCreatorCancellationToken: @unchecked Sendable {
         let process = currentProcess
         lock.unlock()
         process?.terminate()
+        // A stopped process only handles SIGTERM once it is resumed.
+        if let process, process.isRunning { kill(process.processIdentifier, SIGCONT) }
+    }
+
+    /// Suspends the running child process (SIGSTOP); processes started while paused are
+    /// suspended as soon as they are tracked.
+    nonisolated func pause() {
+        lock.lock()
+        guard !paused, !cancelled else { lock.unlock(); return }
+        paused = true
+        pausedSince = Date()
+        let process = currentProcess
+        lock.unlock()
+        if let process, process.isRunning { kill(process.processIdentifier, SIGSTOP) }
+    }
+
+    nonisolated func resume() {
+        lock.lock()
+        guard paused else { lock.unlock(); return }
+        paused = false
+        if let pausedSince { accumulatedPause += Date().timeIntervalSince(pausedSince) }
+        pausedSince = nil
+        let process = currentProcess
+        lock.unlock()
+        if let process, process.isRunning { kill(process.processIdentifier, SIGCONT) }
+    }
+
+    /// Total time spent paused so far, including a pause currently in progress.
+    nonisolated var totalPausedDuration: TimeInterval {
+        lock.lock(); defer { lock.unlock() }
+        return accumulatedPause + (pausedSince.map { Date().timeIntervalSince($0) } ?? 0)
     }
 
     nonisolated func track(_ process: Process) {
         lock.lock()
         currentProcess = process
         let shouldTerminate = cancelled
+        let shouldStop = paused
         lock.unlock()
         if shouldTerminate { process.terminate() }
+        else if shouldStop { kill(process.processIdentifier, SIGSTOP) }
     }
 
     nonisolated func untrack() {
@@ -125,10 +161,71 @@ enum ABVCreatorProcessRegistry {
     }
 }
 
+/// Dernier état lu dans les statistiques de ffmpeg (`time=00:01:23.45 … speed=1.23x`).
+final class ABVFFmpegStatus: @unchecked Sendable {
+    private let lock = NSLock()
+    private nonisolated(unsafe) var time: TimeInterval?
+    private nonisolated(unsafe) var speed: Double?
+
+    nonisolated init() {}
+
+    /// Position atteinte dans la vidéo de sortie (s) et vitesse moyenne (×), si déjà connues.
+    nonisolated var snapshot: (time: TimeInterval?, speed: Double?) {
+        lock.lock(); defer { lock.unlock() }
+        return (time, speed)
+    }
+
+    /// Analyse un morceau de sortie ffmpeg et retient les dernières valeurs `time=` et `speed=`.
+    nonisolated func ingest(_ chunk: String) {
+        func lastMatch(_ pattern: String) -> [String]? {
+            guard let regex = try? NSRegularExpression(pattern: pattern),
+                  let match = regex.matches(in: chunk, range: NSRange(chunk.startIndex..., in: chunk)).last
+            else { return nil }
+            return (1..<match.numberOfRanges).compactMap { index in
+                Range(match.range(at: index), in: chunk).map { String(chunk[$0]) }
+            }
+        }
+        let parsedTime = lastMatch(#"time=\s*(\d+):(\d{2}):(\d{2}(?:\.\d+)?)"#).flatMap { parts -> TimeInterval? in
+            guard parts.count == 3, let hours = Double(parts[0]), let minutes = Double(parts[1]),
+                  let seconds = Double(parts[2]) else { return nil }
+            return hours * 3_600 + minutes * 60 + seconds
+        }
+        let parsedSpeed = lastMatch(#"speed=\s*(\d+(?:\.\d+)?)x"#).flatMap { Double($0.first ?? "") }
+        lock.lock()
+        if let parsedTime { time = parsedTime }
+        if let parsedSpeed { speed = parsedSpeed }
+        lock.unlock()
+    }
+}
+
+/// Reçoit en direct les lignes de commande et leur sortie, pour la console de débogage.
+enum ABVDebugConsole {
+    private nonisolated(unsafe) static var handler: (@Sendable (String) -> Void)?
+    private static let lock = NSLock()
+
+    nonisolated static func setHandler(_ newHandler: (@Sendable (String) -> Void)?) {
+        lock.lock(); defer { lock.unlock() }
+        handler = newHandler
+    }
+
+    nonisolated static func emit(_ text: String) {
+        lock.lock()
+        let current = handler
+        lock.unlock()
+        current?(text)
+    }
+
+    nonisolated static func quoted(_ argument: String) -> String {
+        let safe = argument.allSatisfy { $0.isLetter || $0.isNumber || "/._-=:,+@%".contains($0) }
+        return safe && !argument.isEmpty ? argument : "'" + argument.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+}
+
 enum ABVTool: String, CaseIterable, Identifiable, Sendable {
     case exiftool
     case ffmpeg
     case gyro2bb
+    case gyroflow
 
     var id: String { rawValue }
 
@@ -137,6 +234,7 @@ enum ABVTool: String, CaseIterable, Identifiable, Sendable {
         case .exiftool: "exiftool"
         case .ffmpeg: "ffmpeg"
         case .gyro2bb: "gyro2bb"
+        case .gyroflow: "Gyroflow"
         }
     }
 
@@ -163,7 +261,45 @@ enum ABVTool: String, CaseIterable, Identifiable, Sendable {
                 "/Users/drax/Dev/ABView/ressources/gyro2bb-mac-arm64",
                 "/usr/local/bin/gyro2bb"
             ]
+        case .gyroflow:
+            [
+                "/Applications/Gyroflow.app/Contents/MacOS/gyroflow",
+                NSHomeDirectory() + "/Applications/Gyroflow.app/Contents/MacOS/gyroflow",
+                "/opt/homebrew/bin/gyroflow",
+                "/usr/local/bin/gyroflow"
+            ]
         }
+    }
+
+    /// Lance l'outil pour vérifier qu'il démarre réellement (et pas seulement qu'il existe).
+    /// Renvoie un message de succès (version détectée) ou lève une erreur décrivant le problème.
+    nonisolated func selfTest() throws -> String {
+        guard let path = candidates.first(where: { !$0.isEmpty && FileManager.default.isExecutableFile(atPath: $0) }) else {
+            throw ABVCreatorError.invalidData("\(displayName) est introuvable.")
+        }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = ["--help"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        try process.run()
+        // Garde-fou : un outil qui ne rend pas la main est arrêté après 15 s.
+        let watchdog = DispatchWorkItem { if process.isRunning { process.terminate() } }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 15, execute: watchdog)
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        watchdog.cancel()
+        let output = String(decoding: data, as: UTF8.self)
+        guard process.terminationStatus == 0, output.localizedCaseInsensitiveContains("gyroflow") else {
+            throw ABVCreatorError.invalidData(
+                "\(displayName) ne démarre pas correctement (code \(process.terminationStatus))."
+            )
+        }
+        if let range = output.range(of: #"Gyroflow v?\d+(\.\d+)+"#, options: .regularExpression) {
+            return String(output[range])
+        }
+        return displayName
     }
 
     nonisolated var isAvailable: Bool {
@@ -175,6 +311,8 @@ enum ABVTool: String, CaseIterable, Identifiable, Sendable {
 @Observable
 final class ABVCreatorModel {
     var sources: [ABVSourceFile] = []
+    /// Modèle de caméra détecté (exiftool) pour chaque fichier .insv.
+    var cameraModels: [URL: String] = [:]
     var state: State = .ready
     var log: [String] = []
     var outputURL: URL?
@@ -183,6 +321,13 @@ final class ABVCreatorModel {
     var creationStartDate: Date?
     var lastDuration: TimeInterval?
     var currentStep: String?
+    var isPaused = false
+    var pauseStartDate: Date?
+    /// Mode aperçu : seule 1 minute de vidéo est convertie, à partir de `previewOffsetMinutes`.
+    var isPreview = false
+    var consoleLines: [String] = []
+    private static let maxConsoleLines = 5_000
+    var previewOffsetMinutes = 15
     private var cancellationToken: ABVCreatorCancellationToken?
 
     private static let lastSessionBookmarksKey = "ABVCreator.lastSessionBookmarks"
@@ -228,6 +373,20 @@ final class ABVCreatorModel {
         state = .ready
         outputURL = nil
         saveLastSession()
+        detectCameraModels(for: additions)
+    }
+
+    /// Détecte en arrière-plan le modèle de caméra des nouveaux fichiers .insv.
+    private func detectCameraModels(for additions: [ABVSourceFile]) {
+        for source in additions where source.kind == .insta360 && cameraModels[source.url] == nil {
+            let url = source.url
+            Task {
+                let model = await Task.detached(priority: .utility) {
+                    ABVCreatorPipeline.detectCameraModel(of: url)
+                }.value
+                if let model { cameraModels[url] = model }
+            }
+        }
     }
 
     func remove(_ source: ABVSourceFile) {
@@ -243,10 +402,49 @@ final class ABVCreatorModel {
         state = .ready
     }
 
+    /// Vrai si le paquet de destination contient déjà une conversion vidéo réutilisable.
+    func hasConvertedVideo(at url: URL) -> Bool {
+        ABVCreatorPipeline.hasConvertedVideo(in: url)
+    }
+
+    func appendConsole(_ chunk: String) {
+        // ffmpeg -stats rafraîchit sa ligne avec \r : on traite chaque rafraîchissement comme une ligne.
+        let lines = chunk.split(whereSeparator: { $0 == "\n" || $0 == "\r" }).map(String.init)
+        consoleLines.append(contentsOf: lines)
+        if consoleLines.count > Self.maxConsoleLines {
+            consoleLines.removeFirst(consoleLines.count - Self.maxConsoleLines)
+        }
+    }
+
+    func clearConsole() {
+        consoleLines.removeAll()
+    }
+
     func cancel() {
         guard state == .running else { return }
         log.append("Annulation demandée…")
         cancellationToken?.cancel()
+        isPaused = false
+        pauseStartDate = nil
+    }
+
+    func togglePause() {
+        guard state == .running, let token = cancellationToken else { return }
+        if isPaused {
+            token.resume()
+            // Shift the start date so the elapsed timer excludes the pause.
+            if let pausedAt = pauseStartDate, let start = creationStartDate {
+                creationStartDate = start.addingTimeInterval(Date().timeIntervalSince(pausedAt))
+            }
+            pauseStartDate = nil
+            isPaused = false
+            log.append("Reprise de la création.")
+        } else {
+            token.pause()
+            pauseStartDate = Date()
+            isPaused = true
+            log.append("Création mise en pause.")
+        }
     }
 
     var canReloadLastSession: Bool {
@@ -280,10 +478,16 @@ final class ABVCreatorModel {
         UserDefaults.standard.set(bookmarks, forKey: Self.lastSessionBookmarksKey)
     }
 
-    func create(at destination: URL, overwrite: Bool = false) {
+    func create(at destination: URL, overwrite: Bool = false, keepVideo: Bool = false) {
         guard canCreate else { return }
         state = .running
+        isPaused = false
+        pauseStartDate = nil
         log = ["Validation des fichiers…"]
+        consoleLines.removeAll()
+        ABVDebugConsole.setHandler { [weak self] text in
+            Task { @MainActor in self?.appendConsole(text) }
+        }
         outputURL = nil
         progress = 0
         ffmpegCPUUsage = nil
@@ -292,6 +496,7 @@ final class ABVCreatorModel {
         creationStartDate = startDate
         lastDuration = nil
         let selectedSources = sources
+        let previewOffset: TimeInterval? = isPreview ? Double(max(0, previewOffsetMinutes)) * 60 : nil
         saveLastSession()
         let token = ABVCreatorCancellationToken()
         cancellationToken = token
@@ -317,13 +522,14 @@ final class ABVCreatorModel {
                 let result = try await Task.detached(priority: .userInitiated) {
                     try ABVCreatorPipeline.create(
                         sources: selectedSources, destination: destination,
-                        overwrite: overwrite, cancellation: token
+                        overwrite: overwrite, keepVideo: keepVideo, previewOffset: previewOffset, cancellation: token
                     ) { update in
                         continuation.yield(update)
                     }
                 }.value
                 continuation.finish()
                 ABVCreatorProcessRegistry.unregister(token)
+                ABVDebugConsole.setHandler(nil)
                 ffmpegCPUUsage = nil
                 currentStep = "Téléchargement des METAR…"
                 do {
@@ -344,6 +550,7 @@ final class ABVCreatorModel {
             } catch {
                 continuation.finish()
                 ABVCreatorProcessRegistry.unregister(token)
+                ABVDebugConsole.setHandler(nil)
                 ffmpegCPUUsage = nil
                 lastDuration = Date().timeIntervalSince(startDate)
                 creationStartDate = nil
@@ -388,6 +595,7 @@ private enum ABVCreatorPipeline {
         var values: [String: Double]
     }
 
+    private nonisolated static let previewDuration: TimeInterval = 60
     private nonisolated static let stageWeight = 0.05
     private nonisolated static let videoWeight = 0.5
     private nonisolated static let cameraWeight = 0.35
@@ -399,6 +607,8 @@ private enum ABVCreatorPipeline {
         sources: [ABVSourceFile],
         destination: URL,
         overwrite: Bool,
+        keepVideo: Bool = false,
+        previewOffset: TimeInterval? = nil,
         cancellation: ABVCreatorCancellationToken,
         progress: @escaping @Sendable (ABVCreatorProgress) -> Void
     ) throws -> CreationResult {
@@ -430,7 +640,11 @@ private enum ABVCreatorPipeline {
             guard overwrite else {
                 throw ABVCreatorError.invalidSources("Le fichier \(output.lastPathComponent) existe déjà.")
             }
-            try fileManager.removeItem(at: output)
+            if keepVideo {
+                removeAllExceptVideos(in: output)
+            } else {
+                try fileManager.removeItem(at: output)
+            }
         }
         try fileManager.createDirectory(at: output, withIntermediateDirectories: true)
         markAsPackage(output)
@@ -441,6 +655,8 @@ private enum ABVCreatorPipeline {
 
             announce("Copie des fichiers sources…")
             let stagedCameras = try cameras.map { source in
+                // En aperçu, on lit les originaux pour éviter de copier des dizaines de Go.
+                if previewOffset != nil || keepVideo { return source.url }
                 let target = work.appendingPathComponent(source.url.lastPathComponent)
                 try fileManager.copyItem(at: source.url, to: target)
                 return target
@@ -449,39 +665,18 @@ private enum ABVCreatorPipeline {
             try fileManager.copyItem(at: gpsSource.url, to: stagedGPS)
             advance(stageWeight, message: "Fichiers copiés.")
 
-            try cancellation.checkCancelled()
-            let totalBytes: Int64 = stagedCameras.reduce(0) { total, url in
-                let attributes = try? fileManager.attributesOfItem(atPath: url.path)
-                let size = (attributes?[.size] as? NSNumber)?.int64Value ?? 0
-                return total + size
-            }
-            let totalGB = Double(totalBytes) / 1_000_000_000
-            // Calibré sur un retour empirique de cette machine : 46 min pour 22 Go, soit ~2.1 min/Go.
-            let estimatedSeconds = totalGB * 125.5
-            let estimateText = totalGB > 0.05
-                ? " (~\(formattedMinutes(estimatedSeconds)) estimées pour \(String(format: "%.1f", totalGB)) Go)"
-                : ""
-            announce("Conversion vidéo en cours…" + estimateText)
-            let front = output.appendingPathComponent("front.mp4")
-            let back = output.appendingPathComponent("back.mp4")
-            let videoStepFraction = fraction
-            let videoStart = Date()
-            try convertVideo(
-                cameras: stagedCameras, front: front, back: back, work: work, cancellation: cancellation
-            ) { cpu in
-                let elapsed = Date().timeIntervalSince(videoStart)
-                let estimatedProgress = estimatedSeconds > 0 ? min(elapsed / estimatedSeconds, 0.96) : 0
-                let liveFraction = min(1, videoStepFraction + videoWeight * estimatedProgress)
-                progress(ABVCreatorProgress(fraction: liveFraction, message: nil, ffmpegCPUUsage: cpu))
-            }
-            advance(videoWeight, message: "Conversion vidéo terminée.")
-
             var cameraSamples: [CameraSample] = []
             var segmentStart: Date?
+            var segmentDurations: [TimeInterval] = []
             for camera in stagedCameras {
                 try cancellation.checkCancelled()
                 announce("Extraction de la télémétrie caméra : \(camera.lastPathComponent)…")
                 var segment = try cameraData(from: camera, work: work, cancellation: cancellation)
+                if let first = segment.first?.date, let last = segment.last?.date {
+                    segmentDurations.append(last.timeIntervalSince(first))
+                } else {
+                    segmentDurations.append(0)
+                }
                 if let previousEnd = cameraSamples.last?.date, let first = segment.first?.date {
                     let offset = previousEnd.timeIntervalSince(first)
                     for index in segment.indices {
@@ -496,6 +691,95 @@ private enum ABVCreatorPipeline {
             guard !cameraSamples.isEmpty, segmentStart != nil else {
                 throw ABVCreatorError.invalidData("Aucune télémétrie caméra n’a été extraite.")
             }
+
+            // Durée de chaque fichier (exiftool, à défaut celle de la télémétrie) : elle sert à
+            // convertir la vitesse mesurée par ffmpeg en progression et en temps restant.
+            let fileDurations = stagedCameras.enumerated().map { index, url in
+                videoDuration(of: url) ?? segmentDurations[index]
+            }
+            var videoOutputDuration = fileDurations.reduce(0, +)
+
+            // Aperçu : on ne garde que la minute demandée, dans le fichier caméra qui la contient.
+            var videoCameras = stagedCameras
+            var videoWindow: (offset: TimeInterval, duration: TimeInterval)?
+            if let previewOffset {
+                var elapsed = 0.0
+                var selected: Int?
+                for (index, duration) in segmentDurations.enumerated() {
+                    if previewOffset < elapsed + duration { selected = index; break }
+                    elapsed += duration
+                }
+                guard let selected else {
+                    throw ABVCreatorError.invalidData(
+                        "Le décalage de l’aperçu dépasse la durée du vol (\(formattedMinutes(elapsed)))."
+                    )
+                }
+                let windowStart = cameraSamples[0].date.addingTimeInterval(previewOffset)
+                let windowEnd = windowStart.addingTimeInterval(previewDuration)
+                cameraSamples = cameraSamples.filter { $0.date >= windowStart && $0.date <= windowEnd }
+                for index in cameraSamples.indices {
+                    cameraSamples[index].milliseconds = cameraSamples[index].date.timeIntervalSince(windowStart) * 1_000
+                }
+                guard !cameraSamples.isEmpty else {
+                    throw ABVCreatorError.invalidData("Aucune télémétrie caméra dans la fenêtre d’aperçu.")
+                }
+                videoCameras = [stagedCameras[selected]]
+                videoWindow = (previewOffset - elapsed, previewDuration)
+                let available = fileDurations[selected] - (previewOffset - elapsed)
+                videoOutputDuration = available > 0 ? min(previewDuration, available) : previewDuration
+                announce("Aperçu : 1 min à partir de \(formattedMinutes(previewOffset)).")
+            }
+
+            try cancellation.checkCancelled()
+            let totalBytes: Int64 = videoCameras.reduce(0) { total, url in
+                let attributes = try? fileManager.attributesOfItem(atPath: url.path)
+                let size = (attributes?[.size] as? NSNumber)?.int64Value ?? 0
+                return total + size
+            }
+            let totalGB = Double(totalBytes) / 1_000_000_000
+            // Calibré sur un retour empirique de cette machine : 46 min pour 22 Go, soit ~2.1 min/Go.
+            let estimatedSeconds = videoWindow == nil ? totalGB * 125.5 : 60
+            let estimateText = totalGB > 0.05
+                ? " (~\(formattedMinutes(estimatedSeconds)) estimées pour \(String(format: "%.1f", totalGB)) Go)"
+                : ""
+            let front = output.appendingPathComponent("front.mp4")
+            let back = output.appendingPathComponent("back.mp4")
+            let videoStepFraction = fraction
+            let videoStart = Date()
+            let pausedAtVideoStart = cancellation.totalPausedDuration
+            let outputDuration = videoOutputDuration
+            let ffmpegStatus = ABVFFmpegStatus()
+            if keepVideo {
+                announce("Vidéo existante conservée.")
+            } else {
+                announce("Conversion vidéo en cours…" + estimateText)
+            try convertVideo(
+                cameras: videoCameras, window: videoWindow, front: front, back: back, work: work,
+                status: ffmpegStatus, cancellation: cancellation
+            ) { cpu in
+                let snapshot = ffmpegStatus.snapshot
+                if outputDuration > 0, let time = snapshot.time {
+                    // Progression réelle (position ffmpeg / durée) ; la vitesse moyenne donne le temps restant.
+                    let liveFraction = min(1, videoStepFraction + videoWeight * min(time / outputDuration, 0.99))
+                    var step: String?
+                    if let speed = snapshot.speed, speed > 0 {
+                        let remaining = max(0, outputDuration - time) / speed
+                        let remainingText = remaining < 60 ? "moins d’une minute" : "~" + formattedMinutes(remaining)
+                        step = "Conversion vidéo en cours… \(String(format: "%.2f", speed))× — temps restant : \(remainingText)"
+                    }
+                    progress(ABVCreatorProgress(fraction: liveFraction, message: nil, ffmpegCPUUsage: cpu, step: step))
+                } else {
+                    // Pas encore de statistiques ffmpeg : estimation initiale d'après la taille des fichiers.
+                    // Exclude time spent paused so the estimate doesn't jump after a resume.
+                    let elapsed = Date().timeIntervalSince(videoStart)
+                        - (cancellation.totalPausedDuration - pausedAtVideoStart)
+                    let estimatedProgress = estimatedSeconds > 0 ? min(elapsed / estimatedSeconds, 0.96) : 0
+                    let liveFraction = min(1, videoStepFraction + videoWeight * estimatedProgress)
+                    progress(ABVCreatorProgress(fraction: liveFraction, message: nil, ffmpegCPUUsage: cpu))
+                }
+            }
+            }
+            advance(videoWeight, message: keepVideo ? "Vidéo conservée." : "Conversion vidéo terminée.")
 
             announce("Chargement des données GPS…")
             let gps = try loadGPS(from: stagedGPS, flightDate: cameraSamples[0].date)
@@ -516,8 +800,28 @@ private enum ABVCreatorPipeline {
             advance(mergeWeight, message: "Fusion des données terminée.")
             return CreationResult(url: output, flightDate: cameraSamples[0].date)
         } catch {
-            try? fileManager.removeItem(at: output)
+            if keepVideo {
+                removeAllExceptVideos(in: output)
+            } else {
+                try? fileManager.removeItem(at: output)
+            }
             throw error
+        }
+    }
+
+    /// Supprime tout le contenu du paquet sauf les vidéos déjà converties.
+    nonisolated static func removeAllExceptVideos(in package: URL) {
+        let keep: Set<String> = ["front.mp4", "back.mp4"]
+        let items = (try? FileManager.default.contentsOfDirectory(atPath: package.path)) ?? []
+        for name in items where !keep.contains(name) {
+            try? FileManager.default.removeItem(at: package.appendingPathComponent(name))
+        }
+    }
+
+    /// Indique si le paquet contient déjà les deux vidéos converties.
+    nonisolated static func hasConvertedVideo(in package: URL) -> Bool {
+        ["front.mp4", "back.mp4"].allSatisfy {
+            FileManager.default.fileExists(atPath: package.appendingPathComponent($0).path)
         }
     }
 
@@ -554,12 +858,59 @@ private enum ABVCreatorPipeline {
         try executable("exiftool", candidates: ABVTool.exiftool.candidates)
     }
 
+    /// Lit le modèle de caméra dans les métadonnées d'un fichier .insv via exiftool
+    /// (ex. « Insta360 X3 »). Renvoie nil si exiftool est absent ou si le tag est vide.
+    nonisolated static func detectCameraModel(of url: URL) -> String? {
+        // Le modèle est stocké en clair (« Insta360 X6 », suivi de la version du firmware) dans le
+        // trailer en fin de fichier : on lit seulement la fin du fichier, sans dépendre d'exiftool.
+        guard let handle = try? FileHandle(forReadingFrom: url), let end = try? handle.seekToEnd() else { return nil }
+        defer { try? handle.close() }
+        let window: UInt64 = 1_000_000
+        guard (try? handle.seek(toOffset: end > window ? end - window : 0)) != nil,
+              let data = try? handle.readToEnd(),
+              let text = String(data: data, encoding: .isoLatin1),
+              let range = text.range(of: #"Insta360 [A-Za-z0-9 ]+"#, options: .regularExpression)
+        else { return nil }
+        return text[range].trimmingCharacters(in: .whitespaces)
+    }
+
+    /// Durée (en secondes) d'un fichier vidéo, lue par exiftool. Nil si elle est illisible.
+    nonisolated static func videoDuration(of url: URL) -> TimeInterval? {
+        guard let text = exiftoolValue(tag: "Duration", numeric: true, of: url),
+              let duration = Double(text), duration > 0 else { return nil }
+        return duration
+    }
+
+    /// Première ligne non vide renvoyée par `exiftool -s3 -<tag>`, ou nil.
+    private nonisolated static func exiftoolValue(tag: String, numeric: Bool = false, of url: URL) -> String? {
+        guard let exiftool = try? findExiftool() else { return nil }
+        let process = Process()
+        process.executableURL = exiftool
+        process.arguments = ["-s3"] + (numeric ? ["-n"] : []) + ["-\(tag)", url.path]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+        guard (try? process.run()) != nil else { return nil }
+        // Garde-fou : exiftool ne doit pas bloquer la détection indéfiniment.
+        let watchdog = DispatchWorkItem { if process.isRunning { process.terminate() } }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 15, execute: watchdog)
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        watchdog.cancel()
+        guard process.terminationStatus == 0 else { return nil }
+        return String(decoding: data, as: UTF8.self)
+            .split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .first { !$0.isEmpty }
+    }
+
     nonisolated static func run(
         _ executable: URL,
         _ arguments: [String],
         work: URL,
         cancellation: ABVCreatorCancellationToken,
-        onCPUSample: (@Sendable (Double) -> Void)? = nil
+        onCPUSample: (@Sendable (Double) -> Void)? = nil,
+        onOutput: (@Sendable (String) -> Void)? = nil
     ) throws {
         try cancellation.checkCancelled()
         let logURL = work.appendingPathComponent("process.log")
@@ -572,9 +923,30 @@ private enum ABVCreatorPipeline {
         process.standardOutput = handle
         process.standardError = handle
         process.currentDirectoryURL = work
+        ABVDebugConsole.emit("$ " + ([executable.path] + arguments).map(ABVDebugConsole.quoted).joined(separator: " "))
         try process.run()
         cancellation.track(process)
         defer { cancellation.untrack() }
+
+        // Diffuse la sortie de la commande vers la console au fil de l'eau.
+        let tail = Thread {
+            guard let reader = try? FileHandle(forReadingFrom: logURL) else { return }
+            defer { try? reader.close() }
+            func flush() {
+                let data = reader.availableData
+                if !data.isEmpty {
+                    let text = String(decoding: data, as: UTF8.self)
+                    ABVDebugConsole.emit(text)
+                    onOutput?(text)
+                }
+            }
+            while process.isRunning {
+                flush()
+                Thread.sleep(forTimeInterval: 0.5)
+            }
+            flush()
+        }
+        tail.start()
 
         if let onCPUSample {
             let pid = process.processIdentifier
@@ -589,6 +961,8 @@ private enum ABVCreatorPipeline {
         }
 
         process.waitUntilExit()
+        Thread.sleep(forTimeInterval: 0.6) // laisse le dernier vidage de la sortie se terminer
+        ABVDebugConsole.emit("→ \(executable.lastPathComponent) terminé (code \(process.terminationStatus))")
         if cancellation.isCancelled {
             throw ABVCreatorError.cancelled
         }
@@ -614,13 +988,18 @@ private enum ABVCreatorPipeline {
     }
 
     nonisolated static func convertVideo(
-        cameras: [URL], front: URL, back: URL, work: URL,
+        cameras: [URL], window: (offset: TimeInterval, duration: TimeInterval)? = nil,
+        front: URL, back: URL, work: URL,
+        status: ABVFFmpegStatus? = nil,
         cancellation: ABVCreatorCancellationToken,
         onCPUSample: @escaping @Sendable (Double) -> Void
     ) throws {
         let ffmpeg = try executable("FFmpeg", candidates: ABVTool.ffmpeg.candidates)
         var arguments = ["-hide_banner", "-loglevel", "error", "-stats", "-y", "-hwaccel", "videotoolbox"]
-        cameras.forEach { arguments += ["-i", $0.path] }
+        cameras.forEach {
+            if let window { arguments += ["-ss", String(format: "%.3f", window.offset)] }
+            arguments += ["-i", $0.path]
+        }
         let filter: String
         if cameras.count == 2 {
             filter = """
@@ -641,27 +1020,56 @@ private enum ABVCreatorPipeline {
         }
         arguments += ["-filter_complex", filter]
         func outputArguments(map: String, audio: String, url: URL) -> [String] {
-            ["-map", map, "-map", audio, "-c:v", "h264_videotoolbox", "-b:v", "8M",
+            (window.map { ["-t", String(format: "%.3f", $0.duration)] } ?? []) + ["-map", map, "-map", audio, "-c:v", "h264_videotoolbox", "-b:v", "8M",
              "-maxrate", "8M", "-bufsize", "24M", "-profile:v", "high", "-g", "60",
              "-allow_sw", "1", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", url.path]
         }
         arguments += outputArguments(map: "[front]", audio: "[a1]", url: front)
         arguments += outputArguments(map: "[back]", audio: "[a2]", url: back)
-        try run(ffmpeg, arguments, work: work, cancellation: cancellation, onCPUSample: onCPUSample)
+        try run(
+            ffmpeg, arguments, work: work, cancellation: cancellation, onCPUSample: onCPUSample,
+            onOutput: status.map { status in { @Sendable text in status.ingest(text) } }
+        )
     }
 
     nonisolated static func cameraData(
         from camera: URL, work: URL, cancellation: ABVCreatorCancellationToken
     ) throws -> [CameraSample] {
-        let gyroflow = try executable("Gyroflow", candidates: [
-            "/Applications/Gyroflow.app/Contents/MacOS/gyroflow"
-        ])
+        let gyroflow = try executable("Gyroflow", candidates: ABVTool.gyroflow.candidates)
         let gyro2bb = try executable("gyro2bb", candidates: ABVTool.gyro2bb.candidates)
         let quaternionURL = work.appendingPathComponent(camera.lastPathComponent + ".cli.csv")
-        try run(gyroflow, [camera.path, "--export-metadata", "3:\(quaternionURL.path)"], work: work, cancellation: cancellation)
-        try run(gyro2bb, [camera.path], work: work, cancellation: cancellation)
+        try? FileManager.default.removeItem(at: quaternionURL)
+        do {
+            try run(gyroflow, [camera.path, "--export-metadata", "3:\(quaternionURL.path)"], work: work, cancellation: cancellation)
+        } catch ABVCreatorError.commandFailed(let name, let output) {
+            // Gyroflow 1.6.x peut planter à la fermeture (assertion libc++ dans Allocator.cpp)
+            // après avoir écrit l'export : on accepte alors le fichier produit.
+            let size = (try? FileManager.default.attributesOfItem(atPath: quaternionURL.path)[.size] as? NSNumber)?.intValue ?? 0
+            guard size > 0 else { throw ABVCreatorError.commandFailed(name, output) }
+        }
+        // gyro2bb écrit « <fichier>.csv » à côté du fichier qu'on lui donne. Quand la caméra n'a pas été
+        // copiée dans `work` (aperçu, vidéo conservée), on passe par un lien symbolique pour que le CSV
+        // arrive dans `work` et non dans le dossier des originaux.
+        let fileManager = FileManager.default
         let motionURL = work.appendingPathComponent(camera.lastPathComponent + ".csv")
-        guard FileManager.default.fileExists(atPath: motionURL.path) else {
+        var gyroInput = camera
+        if camera.deletingLastPathComponent().standardizedFileURL != work.standardizedFileURL {
+            let link = work.appendingPathComponent(camera.lastPathComponent)
+            try? fileManager.removeItem(at: link)
+            try fileManager.createSymbolicLink(at: link, withDestinationURL: camera)
+            gyroInput = link
+        }
+        let gyroStart = Date()
+        try run(gyro2bb, [gyroInput.path], work: work, cancellation: cancellation)
+        if !fileManager.fileExists(atPath: motionURL.path), gyroInput != camera {
+            // Si gyro2bb a résolu le lien, le CSV est à côté de l'original : on le récupère s'il est récent.
+            let beside = camera.appendingPathExtension("csv")
+            let modified = (try? beside.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+            if let modified, modified >= gyroStart.addingTimeInterval(-1) {
+                try fileManager.moveItem(at: beside, to: motionURL)
+            }
+        }
+        guard fileManager.fileExists(atPath: motionURL.path) else {
             throw ABVCreatorError.invalidData("gyro2bb n’a pas produit \(motionURL.lastPathComponent).")
         }
 
@@ -723,8 +1131,6 @@ private enum ABVCreatorPipeline {
         let text = try String(contentsOf: url, encoding: .utf8)
         var pending: (time: String, lat: Double, lon: Double, alt: Double)?
         var points: [GPSSample] = []
-        let calendar = Calendar(identifier: .gregorian)
-        let start = calendar.startOfDay(for: flightDate)
         for line in text.split(whereSeparator: \.isNewline).map(String.init) {
             let parts = line.split(separator: ",", omittingEmptySubsequences: false).map(String.init)
             if line.hasPrefix("$GNGGA"), parts.count > 9,
@@ -733,7 +1139,7 @@ private enum ABVCreatorPipeline {
                let altitude = Double(parts[9]) {
                 pending = (parts[1], lat, lon, altitude * 3.28084)
             } else if line.hasPrefix("$GNRMC"), parts.count > 8, let pending,
-                      let date = nmeaDate(parts[1], day: start) {
+                      let date = nmeaDate(parts[1], dateField: parts.count > 9 ? parts[9] : nil, fallbackDay: flightDate) {
                 points.append(GPSSample(
                     date: date, latitude: pending.lat, longitude: pending.lon, altitude: pending.alt,
                     speed: (Double(parts[7]) ?? 0) * 1.852, heading: Double(parts[8]) ?? 0, verticalSpeed: 0
@@ -863,12 +1269,26 @@ private enum ABVCreatorPipeline {
         return decimal
     }
 
-    nonisolated static func nmeaDate(_ value: String, day: Date) -> Date? {
+    /// Date absolue d'une trame NMEA. L'heure (`hhmmss.sss`) et la date (`ddmmyy`) sont en UTC ;
+    /// sans champ date valide, on retombe sur le jour UTC de `fallbackDay`.
+    nonisolated static func nmeaDate(_ value: String, dateField: String?, fallbackDay: Date) -> Date? {
         guard let raw = Double(value) else { return nil }
-        let hour = Int(raw / 10_000)
-        let minute = Int(raw.truncatingRemainder(dividingBy: 10_000) / 100)
-        let second = Int(raw.truncatingRemainder(dividingBy: 100))
-        return Calendar(identifier: .gregorian).date(bySettingHour: hour, minute: minute, second: second, of: day)
+        var utc = Calendar(identifier: .gregorian)
+        utc.timeZone = TimeZone(identifier: "UTC") ?? .gmt
+        var components = DateComponents()
+        if let dateField, dateField.count == 6, let ddmmyy = Int(dateField) {
+            components.day = ddmmyy / 10_000
+            components.month = ddmmyy / 100 % 100
+            components.year = 2_000 + ddmmyy % 100
+        } else {
+            components = utc.dateComponents([.year, .month, .day], from: fallbackDay)
+        }
+        components.hour = Int(raw / 10_000)
+        components.minute = Int(raw.truncatingRemainder(dividingBy: 10_000) / 100)
+        components.second = Int(raw.truncatingRemainder(dividingBy: 100))
+        components.timeZone = utc.timeZone
+        // Les fractions de seconde (4 trames par seconde) évitent les dates en double.
+        return utc.date(from: components)?.addingTimeInterval(raw.truncatingRemainder(dividingBy: 1))
     }
 
     nonisolated static func nearestIndex(in values: [Double], to target: Double) -> Int {
