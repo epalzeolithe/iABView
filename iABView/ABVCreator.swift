@@ -2,6 +2,7 @@
 import Darwin
 import Foundation
 import Observation
+import simd
 
 struct ABVSourceFile: Identifiable, Equatable, Sendable {
     enum Kind: String, Sendable {
@@ -683,12 +684,14 @@ private enum ABVCreatorPipeline {
             var cameraSamples: [CameraSample] = []
             var segmentStart: Date?
             var segmentDurations: [TimeInterval] = []
+            var usesX6 = false
             for camera in stagedCameras {
                 try cancellation.checkCancelled()
                 announce("Extraction de la télémétrie caméra : \(camera.lastPathComponent)…")
                 var segment: [CameraSample]
                 switch CameraModel(detected: detectCameraModel(of: camera)) {
                 case .x6:
+                    usesX6 = true
                     segment = try cameraDataX6(from: camera, work: work, cancellation: cancellation)
                 case .x4:
                     segment = try cameraData(from: camera, work: work, cancellation: cancellation)
@@ -817,6 +820,10 @@ private enum ABVCreatorPipeline {
             announce("Fusion des données…")
             try writeMergedCSV(camera: cameraSamples, gps: gps, phone: phone, to: output)
             try "1.11-native".write(to: output.appendingPathComponent("version.txt"), atomically: true, encoding: .utf8)
+            if usesX6 {
+                // Angle de montage par défaut : 0° pour l'X6 (15° pour l'X4, valeur du viewer).
+                try "0.0".write(to: output.appendingPathComponent("mounting_pitch.txt"), atomically: true, encoding: .utf8)
+            }
             try writeMETARPlaceholder(to: output, start: cameraSamples[0].date)
             advance(mergeWeight, message: "Fusion des données terminée.")
             return CreationResult(url: output, flightDate: cameraSamples[0].date)
@@ -1127,6 +1134,13 @@ private enum ABVCreatorPipeline {
         return samples
     }
 
+    /// Rotation du repère capteur X6 vers le repère X4 attendu par la chaîne d'attitude :
+    /// Rz(−90°) · Ry(−90°), soit le quaternion (w, x, y, z) = (½, −½, −½, −½).
+    /// Vérifiée numériquement : à plat → roulis/tangage 0 ; roulis ±30° → ±30° ; cabré 20° → +20°.
+    private nonisolated static let x6SensorCorrection = simd_quatd(
+        angle: -.pi / 2, axis: SIMD3<Double>(0, 0, 1)
+    ) * simd_quatd(angle: -.pi / 2, axis: SIMD3<Double>(0, 1, 0))
+
     /// Pipeline Insta360 X6 : copie de `cameraData` (X4), à adapter aux particularités de l'X6
     /// (format du CSV gyro2bb, échelle de l'accéléromètre, axes…).
     nonisolated static func cameraDataX6(
@@ -1187,16 +1201,27 @@ private enum ABVCreatorPipeline {
             guard milliseconds >= 0 else { continue }
             let qIndex = nearestIndex(in: qTimes, to: milliseconds)
             let q = quaternions[qIndex]
+            // Repère capteur X6 différent du X4 : q ← q · x6SensorCorrection, et l'accélération suit la
+            // rotation inverse pour que le signe du facteur de charge reste cohérent.
+            let raw = simd_quatd(
+                ix: q["org_quat_x"] ?? 0, iy: q["org_quat_y"] ?? 0, iz: q["org_quat_z"] ?? 0, r: q["org_quat_w"] ?? 1
+            )
+            let corrected = raw * x6SensorCorrection
+            let acceleration = x6SensorCorrection.inverse.act(SIMD3<Double>(
+                (row["accSmooth[0]"] ?? 0) * 9.81 / 20_234,
+                (row["accSmooth[1]"] ?? 0) * 9.81 / 20_234,
+                (row["accSmooth[2]"] ?? 0) * 9.81 / 20_234
+            ))
             samples.append(CameraSample(
                 date: firstDate.addingTimeInterval(milliseconds / 1_000),
                 milliseconds: milliseconds,
-                accelerationX: (row["accSmooth[0]"] ?? 0) * 9.81 / 20_234,
-                accelerationY: (row["accSmooth[1]"] ?? 0) * 9.81 / 20_234,
-                accelerationZ: (row["accSmooth[2]"] ?? 0) * 9.81 / 20_234,
-                quaternionW: q["org_quat_w"] ?? 1,
-                quaternionX: q["org_quat_x"] ?? 0,
-                quaternionY: q["org_quat_y"] ?? 0,
-                quaternionZ: q["org_quat_z"] ?? 0
+                accelerationX: acceleration.x,
+                accelerationY: acceleration.y,
+                accelerationZ: acceleration.z,
+                quaternionW: corrected.real,
+                quaternionX: corrected.imag.x,
+                quaternionY: corrected.imag.y,
+                quaternionZ: corrected.imag.z
             ))
         }
         smoothAccelerations(&samples, radius: 25)
