@@ -222,6 +222,30 @@ enum ABVDebugConsole {
     }
 }
 
+/// Outil qui fournit les accélérations du CSV (le quaternion vient toujours de Gyroflow).
+enum ABVAccelerationSource: String, CaseIterable, Identifiable, Sendable {
+    /// gyro2bb : `accSmooth` en LSB, converti en m/s².
+    case gyro2bb
+    /// Gyroflow : export de tous les échantillons IMU, déjà en m/s².
+    case gyroflow
+
+    static let storageKey = "ABVCreator.accelerationSource"
+
+    var id: String { rawValue }
+
+    nonisolated var displayName: String {
+        switch self {
+        case .gyro2bb: "gyro2bb"
+        case .gyroflow: "Gyroflow"
+        }
+    }
+
+    /// Valeur choisie dans le créateur (Gyroflow par défaut).
+    static var stored: ABVAccelerationSource {
+        UserDefaults.standard.string(forKey: storageKey).flatMap(ABVAccelerationSource.init(rawValue:)) ?? .gyroflow
+    }
+}
+
 enum ABVTool: String, CaseIterable, Identifiable, Sendable {
     case exiftool
     case ffmpeg
@@ -497,6 +521,7 @@ final class ABVCreatorModel {
         creationStartDate = startDate
         lastDuration = nil
         let selectedSources = sources
+        let accelerationSource = ABVAccelerationSource.stored
         let previewOffset: TimeInterval? = isPreview ? Double(max(0, previewOffsetMinutes)) * 60 : nil
         saveLastSession()
         let token = ABVCreatorCancellationToken()
@@ -523,7 +548,8 @@ final class ABVCreatorModel {
                 let result = try await Task.detached(priority: .userInitiated) {
                     try ABVCreatorPipeline.create(
                         sources: selectedSources, destination: destination,
-                        overwrite: overwrite, keepVideo: keepVideo, previewOffset: previewOffset, cancellation: token
+                        overwrite: overwrite, keepVideo: keepVideo, previewOffset: previewOffset,
+                        accelerationSource: accelerationSource, cancellation: token
                     ) { update in
                         continuation.yield(update)
                     }
@@ -625,6 +651,7 @@ private enum ABVCreatorPipeline {
         overwrite: Bool,
         keepVideo: Bool = false,
         previewOffset: TimeInterval? = nil,
+        accelerationSource: ABVAccelerationSource = .gyroflow,
         cancellation: ABVCreatorCancellationToken,
         progress: @escaping @Sendable (ABVCreatorProgress) -> Void
     ) throws -> CreationResult {
@@ -687,14 +714,18 @@ private enum ABVCreatorPipeline {
             var usesX6 = false
             for camera in stagedCameras {
                 try cancellation.checkCancelled()
-                announce("Extraction de la télémétrie caméra : \(camera.lastPathComponent)…")
+                announce("Extraction de la télémétrie caméra : \(camera.lastPathComponent) (accélérations : \(accelerationSource.displayName))…")
                 var segment: [CameraSample]
                 switch CameraModel(detected: detectCameraModel(of: camera)) {
                 case .x6:
                     usesX6 = true
-                    segment = try cameraDataX6(from: camera, work: work, cancellation: cancellation)
+                    segment = try cameraDataX6(
+                        from: camera, work: work, accelerationSource: accelerationSource, cancellation: cancellation
+                    )
                 case .x4:
-                    segment = try cameraData(from: camera, work: work, cancellation: cancellation)
+                    segment = try cameraData(
+                        from: camera, work: work, accelerationSource: accelerationSource, cancellation: cancellation
+                    )
                 }
                 if let first = segment.first?.date, let last = segment.last?.date {
                     segmentDurations.append(last.timeIntervalSince(first))
@@ -1061,20 +1092,41 @@ private enum ABVCreatorPipeline {
     }
 
     nonisolated static func cameraData(
-        from camera: URL, work: URL, cancellation: ABVCreatorCancellationToken
+        from camera: URL, work: URL, accelerationSource: ABVAccelerationSource = .gyroflow,
+        cancellation: ABVCreatorCancellationToken
     ) throws -> [CameraSample] {
         let gyroflow = try executable("Gyroflow", candidates: ABVTool.gyroflow.candidates)
-        let gyro2bb = try executable("gyro2bb", candidates: ABVTool.gyro2bb.candidates)
         let quaternionURL = work.appendingPathComponent(camera.lastPathComponent + ".cli.csv")
         try? FileManager.default.removeItem(at: quaternionURL)
         do {
-            try run(gyroflow, [camera.path, "--export-metadata", "3:\(quaternionURL.path)"], work: work, cancellation: cancellation)
+            try run(
+                gyroflow, gyroflowExportArguments(camera: camera, output: quaternionURL, source: accelerationSource),
+                work: work, cancellation: cancellation
+            )
         } catch ABVCreatorError.commandFailed(let name, let output) {
             // Gyroflow 1.6.x peut planter à la fermeture (assertion libc++ dans Allocator.cpp)
             // après avoir écrit l'export : on accepte alors le fichier produit.
             let size = (try? FileManager.default.attributesOfItem(atPath: quaternionURL.path)[.size] as? NSNumber)?.intValue ?? 0
             guard size > 0 else { throw ABVCreatorError.commandFailed(name, output) }
         }
+        if accelerationSource == .gyroflow {
+            // Quaternion et accélération (m/s²) viennent du même export Gyroflow, un échantillon IMU sur 10.
+            guard let firstDate = dateFromCameraName(camera.lastPathComponent) else {
+                throw ABVCreatorError.invalidData("La date est absente du nom \(camera.lastPathComponent).")
+            }
+            var samples = try gyroflowSamples(at: quaternionURL).map { row in
+                CameraSample(
+                    date: firstDate.addingTimeInterval(row.milliseconds / 1_000),
+                    milliseconds: row.milliseconds,
+                    accelerationX: row.accelerationX, accelerationY: row.accelerationY, accelerationZ: row.accelerationZ,
+                    quaternionW: row.quaternionW, quaternionX: row.quaternionX,
+                    quaternionY: row.quaternionY, quaternionZ: row.quaternionZ
+                )
+            }
+            smoothAccelerations(&samples, radius: 25)
+            return samples
+        }
+        let gyro2bb = try executable("gyro2bb", candidates: ABVTool.gyro2bb.candidates)
         // gyro2bb écrit « <fichier>.csv » à côté du fichier qu'on lui donne. Quand la caméra n'a pas été
         // copiée dans `work` (aperçu, vidéo conservée), on passe par un lien symbolique pour que le CSV
         // arrive dans `work` et non dans le dossier des originaux.
@@ -1144,20 +1196,44 @@ private enum ABVCreatorPipeline {
     /// Pipeline Insta360 X6 : copie de `cameraData` (X4), à adapter aux particularités de l'X6
     /// (format du CSV gyro2bb, échelle de l'accéléromètre, axes…).
     nonisolated static func cameraDataX6(
-        from camera: URL, work: URL, cancellation: ABVCreatorCancellationToken
+        from camera: URL, work: URL, accelerationSource: ABVAccelerationSource = .gyroflow,
+        cancellation: ABVCreatorCancellationToken
     ) throws -> [CameraSample] {
         let gyroflow = try executable("Gyroflow", candidates: ABVTool.gyroflow.candidates)
-        let gyro2bb = try executable("gyro2bb", candidates: ABVTool.gyro2bb.candidates)
         let quaternionURL = work.appendingPathComponent(camera.lastPathComponent + ".cli.csv")
         try? FileManager.default.removeItem(at: quaternionURL)
         do {
-            try run(gyroflow, [camera.path, "--export-metadata", "3:\(quaternionURL.path)"], work: work, cancellation: cancellation)
+            try run(
+                gyroflow, gyroflowExportArguments(camera: camera, output: quaternionURL, source: accelerationSource),
+                work: work, cancellation: cancellation
+            )
         } catch ABVCreatorError.commandFailed(let name, let output) {
             // Gyroflow 1.6.x peut planter à la fermeture (assertion libc++ dans Allocator.cpp)
             // après avoir écrit l'export : on accepte alors le fichier produit.
             let size = (try? FileManager.default.attributesOfItem(atPath: quaternionURL.path)[.size] as? NSNumber)?.intValue ?? 0
             guard size > 0 else { throw ABVCreatorError.commandFailed(name, output) }
         }
+        if accelerationSource == .gyroflow {
+            // Mêmes corrections de repère que ci-dessous : q · x6SensorCorrection, accélération (−x, −y, z).
+            guard let firstDate = dateFromCameraName(camera.lastPathComponent) else {
+                throw ABVCreatorError.invalidData("La date est absente du nom \(camera.lastPathComponent).")
+            }
+            var samples = try gyroflowSamples(at: quaternionURL).map { row in
+                let corrected = simd_quatd(
+                    ix: row.quaternionX, iy: row.quaternionY, iz: row.quaternionZ, r: row.quaternionW
+                ) * x6SensorCorrection
+                return CameraSample(
+                    date: firstDate.addingTimeInterval(row.milliseconds / 1_000),
+                    milliseconds: row.milliseconds,
+                    accelerationX: -row.accelerationX, accelerationY: -row.accelerationY, accelerationZ: row.accelerationZ,
+                    quaternionW: corrected.real, quaternionX: corrected.imag.x,
+                    quaternionY: corrected.imag.y, quaternionZ: corrected.imag.z
+                )
+            }
+            smoothAccelerations(&samples, radius: 25)
+            return samples
+        }
+        let gyro2bb = try executable("gyro2bb", candidates: ABVTool.gyro2bb.candidates)
         // gyro2bb écrit « <fichier>.csv » à côté du fichier qu'on lui donne. Quand la caméra n'a pas été
         // copiée dans `work` (aperçu, vidéo conservée), on passe par un lien symbolique pour que le CSV
         // arrive dans `work` et non dans le dossier des originaux.
@@ -1222,6 +1298,79 @@ private enum ABVCreatorPipeline {
             ))
         }
         smoothAccelerations(&samples, radius: 25)
+        return samples
+    }
+
+    /// Champs exportés par Gyroflow avec `export_all_samples` : un échantillon par mesure IMU, quaternion
+    /// et accéléromètre (m/s²) inclus. Toutes les clés sont requises : Gyroflow plante si l'une manque.
+    private nonisolated static let gyroflowAllSamplesFields = """
+        { 'export_all_samples': true, 'original': { 'quaternion': true, 'euler_angles': true, \
+        'gyroscope': true, 'accelerometer': true }, 'stabilized': { 'quaternion': true, \
+        'euler_angles': true }, 'zooming': { 'minimal_fovs': true, 'fovs': true, 'focal_length': true } }
+        """
+
+    nonisolated static func gyroflowExportArguments(
+        camera: URL, output: URL, source: ABVAccelerationSource
+    ) -> [String] {
+        var arguments = [camera.path, "--export-metadata", "3:\(output.path)"]
+        if source == .gyroflow {
+            arguments += ["--export-metadata-fields", gyroflowAllSamplesFields]
+        }
+        return arguments
+    }
+
+    struct GyroflowSample: Sendable {
+        var milliseconds: Double
+        var accelerationX: Double
+        var accelerationY: Double
+        var accelerationZ: Double
+        var quaternionW: Double
+        var quaternionX: Double
+        var quaternionY: Double
+        var quaternionZ: Double
+    }
+
+    /// Lit l'export Gyroflow « tous les échantillons » (~1,8 million de lignes, ~400 Mo pour 30 min)
+    /// sans le charger en mémoire sous forme de dictionnaires : seule une ligne sur `step` est analysée.
+    nonisolated static func gyroflowSamples(at url: URL, step: Int = 10) throws -> [GyroflowSample] {
+        let data = try Data(contentsOf: url, options: .alwaysMapped)
+        let wanted = ["timestamp_ms", "org_acc_x", "org_acc_y", "org_acc_z",
+                      "org_quat_w", "org_quat_x", "org_quat_y", "org_quat_z"]
+        var columns: [Int] = []
+        var samples: [GyroflowSample] = []
+        try data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            guard let base = raw.baseAddress else { return }
+            let count = raw.count
+            var offset = 0
+            var line = -1
+            while offset < count {
+                let newline = memchr(base + offset, 0x0A, count - offset)
+                var length = newline.map { base.advanced(by: offset).distance(to: UnsafeRawPointer($0)) } ?? count - offset
+                let lineStart = offset
+                offset += length + 1
+                line += 1
+                if line > 0, (line - 1) % step != 0 { continue }
+                if length > 0, base.load(fromByteOffset: lineStart + length - 1, as: UInt8.self) == 0x0D { length -= 1 }
+                let text = String(decoding: UnsafeRawBufferPointer(start: base + lineStart, count: length), as: UTF8.self)
+                let fields = text.split(separator: ",", omittingEmptySubsequences: false)
+                if line == 0 {
+                    let names = fields.map(String.init)
+                    columns = wanted.compactMap { names.firstIndex(of: $0) }
+                    guard columns.count == wanted.count else {
+                        throw ABVCreatorError.invalidData("Export Gyroflow : colonnes quaternion/accélération absentes.")
+                    }
+                    continue
+                }
+                let values = columns.compactMap { fields.indices.contains($0) ? Double(fields[$0]) : nil }
+                guard values.count == wanted.count, values[0] >= 0 else { continue }
+                samples.append(GyroflowSample(
+                    milliseconds: values[0],
+                    accelerationX: values[1], accelerationY: values[2], accelerationZ: values[3],
+                    quaternionW: values[4], quaternionX: values[5], quaternionY: values[6], quaternionZ: values[7]
+                ))
+            }
+        }
+        guard !samples.isEmpty else { throw ABVCreatorError.invalidData("Export Gyroflow vide.") }
         return samples
     }
 

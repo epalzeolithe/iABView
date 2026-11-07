@@ -10,6 +10,7 @@ struct ABVCreatorView: View {
     @State private var isDropTargeted = false
     @State private var isTestingGyroflow = false
     @AppStorage("ABVCreator.showConsole") private var showConsole = false
+    @AppStorage(ABVAccelerationSource.storageKey) private var accelerationSource = ABVAccelerationSource.gyroflow
     @State private var gyroflowTestResult: (succeeded: Bool, message: String)?
 
     var body: some View {
@@ -276,6 +277,21 @@ struct ABVCreatorView: View {
                             .monospacedDigit()
                     }
                 }
+                Spacer()
+            }
+            .disabled(model.state == .running)
+
+            HStack(spacing: 12) {
+                Text("Accélérations")
+                Picker("Accélérations", selection: $accelerationSource) {
+                    ForEach(ABVAccelerationSource.allCases) { source in
+                        Text(source.displayName).tag(source)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .fixedSize()
+                .help("Outil qui extrait les accélérations : gyro2bb (accSmooth) ou Gyroflow (export de tous les échantillons IMU, en m/s²).")
                 Spacer()
             }
             .disabled(model.state == .running)
