@@ -580,6 +580,21 @@ private enum ABVCreatorPipeline {
         var quaternionZ: Double
     }
 
+    /// Pipeline de télémétrie à appliquer, d'après le modèle lu dans le fichier .insv.
+    /// Tout modèle non reconnu retombe sur le pipeline X4 (comportement historique).
+    enum CameraModel {
+        case x4
+        case x6
+
+        nonisolated init(detected: String?) {
+            if let detected, detected.localizedCaseInsensitiveContains("X6") {
+                self = .x6
+            } else {
+                self = .x4
+            }
+        }
+    }
+
     struct GPSSample: Sendable {
         var date: Date
         var latitude: Double
@@ -671,7 +686,13 @@ private enum ABVCreatorPipeline {
             for camera in stagedCameras {
                 try cancellation.checkCancelled()
                 announce("Extraction de la télémétrie caméra : \(camera.lastPathComponent)…")
-                var segment = try cameraData(from: camera, work: work, cancellation: cancellation)
+                var segment: [CameraSample]
+                switch CameraModel(detected: detectCameraModel(of: camera)) {
+                case .x6:
+                    segment = try cameraDataX6(from: camera, work: work, cancellation: cancellation)
+                case .x4:
+                    segment = try cameraData(from: camera, work: work, cancellation: cancellation)
+                }
                 if let first = segment.first?.date, let last = segment.last?.date {
                     segmentDurations.append(last.timeIntervalSince(first))
                 } else {
@@ -1033,6 +1054,82 @@ private enum ABVCreatorPipeline {
     }
 
     nonisolated static func cameraData(
+        from camera: URL, work: URL, cancellation: ABVCreatorCancellationToken
+    ) throws -> [CameraSample] {
+        let gyroflow = try executable("Gyroflow", candidates: ABVTool.gyroflow.candidates)
+        let gyro2bb = try executable("gyro2bb", candidates: ABVTool.gyro2bb.candidates)
+        let quaternionURL = work.appendingPathComponent(camera.lastPathComponent + ".cli.csv")
+        try? FileManager.default.removeItem(at: quaternionURL)
+        do {
+            try run(gyroflow, [camera.path, "--export-metadata", "3:\(quaternionURL.path)"], work: work, cancellation: cancellation)
+        } catch ABVCreatorError.commandFailed(let name, let output) {
+            // Gyroflow 1.6.x peut planter à la fermeture (assertion libc++ dans Allocator.cpp)
+            // après avoir écrit l'export : on accepte alors le fichier produit.
+            let size = (try? FileManager.default.attributesOfItem(atPath: quaternionURL.path)[.size] as? NSNumber)?.intValue ?? 0
+            guard size > 0 else { throw ABVCreatorError.commandFailed(name, output) }
+        }
+        // gyro2bb écrit « <fichier>.csv » à côté du fichier qu'on lui donne. Quand la caméra n'a pas été
+        // copiée dans `work` (aperçu, vidéo conservée), on passe par un lien symbolique pour que le CSV
+        // arrive dans `work` et non dans le dossier des originaux.
+        let fileManager = FileManager.default
+        let motionURL = work.appendingPathComponent(camera.lastPathComponent + ".csv")
+        var gyroInput = camera
+        if camera.deletingLastPathComponent().standardizedFileURL != work.standardizedFileURL {
+            let link = work.appendingPathComponent(camera.lastPathComponent)
+            try? fileManager.removeItem(at: link)
+            try fileManager.createSymbolicLink(at: link, withDestinationURL: camera)
+            gyroInput = link
+        }
+        let gyroStart = Date()
+        try run(gyro2bb, [gyroInput.path], work: work, cancellation: cancellation)
+        if !fileManager.fileExists(atPath: motionURL.path), gyroInput != camera {
+            // Si gyro2bb a résolu le lien, le CSV est à côté de l'original : on le récupère s'il est récent.
+            let beside = camera.appendingPathExtension("csv")
+            let modified = (try? beside.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+            if let modified, modified >= gyroStart.addingTimeInterval(-1) {
+                try fileManager.moveItem(at: beside, to: motionURL)
+            }
+        }
+        guard fileManager.fileExists(atPath: motionURL.path) else {
+            throw ABVCreatorError.invalidData("gyro2bb n’a pas produit \(motionURL.lastPathComponent).")
+        }
+
+        let quaternions = try numericCSV(at: quaternionURL)
+        let motion = try numericCSV(at: motionURL, headerLine: 66)
+        guard let firstDate = dateFromCameraName(camera.lastPathComponent) else {
+            throw ABVCreatorError.invalidData("La date est absente du nom \(camera.lastPathComponent).")
+        }
+        let qTimes = quaternions.compactMap { $0["timestamp_ms"] }
+        guard !qTimes.isEmpty else {
+            throw ABVCreatorError.invalidData("Export Gyroflow vide.")
+        }
+        var samples: [CameraSample] = []
+        samples.reserveCapacity(motion.count / 10)
+        for (index, row) in motion.enumerated() where index.isMultiple(of: 10) {
+            guard let rawTime = row["time"] else { continue }
+            let milliseconds = rawTime / 1_000
+            guard milliseconds >= 0 else { continue }
+            let qIndex = nearestIndex(in: qTimes, to: milliseconds)
+            let q = quaternions[qIndex]
+            samples.append(CameraSample(
+                date: firstDate.addingTimeInterval(milliseconds / 1_000),
+                milliseconds: milliseconds,
+                accelerationX: (row["accSmooth[0]"] ?? 0) * 9.81 / 20_234,
+                accelerationY: (row["accSmooth[1]"] ?? 0) * 9.81 / 20_234,
+                accelerationZ: (row["accSmooth[2]"] ?? 0) * 9.81 / 20_234,
+                quaternionW: q["org_quat_w"] ?? 1,
+                quaternionX: q["org_quat_x"] ?? 0,
+                quaternionY: q["org_quat_y"] ?? 0,
+                quaternionZ: q["org_quat_z"] ?? 0
+            ))
+        }
+        smoothAccelerations(&samples, radius: 25)
+        return samples
+    }
+
+    /// Pipeline Insta360 X6 : copie de `cameraData` (X4), à adapter aux particularités de l'X6
+    /// (format du CSV gyro2bb, échelle de l'accéléromètre, axes…).
+    nonisolated static func cameraDataX6(
         from camera: URL, work: URL, cancellation: ABVCreatorCancellationToken
     ) throws -> [CameraSample] {
         let gyroflow = try executable("Gyroflow", candidates: ABVTool.gyroflow.candidates)
