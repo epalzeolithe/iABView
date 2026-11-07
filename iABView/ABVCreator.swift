@@ -1201,23 +1201,20 @@ private enum ABVCreatorPipeline {
             guard milliseconds >= 0 else { continue }
             let qIndex = nearestIndex(in: qTimes, to: milliseconds)
             let q = quaternions[qIndex]
-            // Repère capteur X6 différent du X4 : q ← q · x6SensorCorrection, et l'accélération suit la
-            // rotation inverse pour que le signe du facteur de charge reste cohérent.
+            // Repère capteur X6 différent du X4 : q ← q · x6SensorCorrection.
+            // Accélération gyro2bb : l'axe avant est −Z comme sur l'X4 (corrélé à l'accélération GPS au
+            // décollage), mais la gravité est sur −Y au lieu de +Y. Le repère X6 est donc celui de l'X4
+            // tourné de 180° autour de l'axe avant : (x, y, z) → (−x, −y, z).
             let raw = simd_quatd(
                 ix: q["org_quat_x"] ?? 0, iy: q["org_quat_y"] ?? 0, iz: q["org_quat_z"] ?? 0, r: q["org_quat_w"] ?? 1
             )
             let corrected = raw * x6SensorCorrection
-            let acceleration = x6SensorCorrection.inverse.act(SIMD3<Double>(
-                (row["accSmooth[0]"] ?? 0) * 9.81 / 20_234,
-                (row["accSmooth[1]"] ?? 0) * 9.81 / 20_234,
-                (row["accSmooth[2]"] ?? 0) * 9.81 / 20_234
-            ))
             samples.append(CameraSample(
                 date: firstDate.addingTimeInterval(milliseconds / 1_000),
                 milliseconds: milliseconds,
-                accelerationX: acceleration.x,
-                accelerationY: acceleration.y,
-                accelerationZ: acceleration.z,
+                accelerationX: -(row["accSmooth[0]"] ?? 0) * 9.81 / 20_234,
+                accelerationY: -(row["accSmooth[1]"] ?? 0) * 9.81 / 20_234,
+                accelerationZ: (row["accSmooth[2]"] ?? 0) * 9.81 / 20_234,
                 quaternionW: corrected.real,
                 quaternionX: corrected.imag.x,
                 quaternionY: corrected.imag.y,
