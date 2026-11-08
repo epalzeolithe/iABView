@@ -392,6 +392,10 @@ struct ABVCreatorView: View {
                         .padding(.bottom, 8)
                     Color.clear.frame(height: 1).id("console-end")
                 }
+                // Le nombre de lignes est plafonné : on suit aussi la dernière ligne pour continuer à défiler.
+                .onChange(of: model.consoleLines.last) {
+                    proxy.scrollTo("console-end", anchor: .bottom)
+                }
                 .onChange(of: model.consoleLines.count) {
                     proxy.scrollTo("console-end", anchor: .bottom)
                 }

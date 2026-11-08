@@ -360,7 +360,7 @@ final class ABVCreatorModel {
     /// Mode aperçu : seule 1 minute de vidéo est convertie, à partir de `previewOffsetMinutes`.
     var isPreview = false
     var consoleLines: [String] = []
-    private static let maxConsoleLines = 5_000
+    private static let maxConsoleLines = 2_000
     var previewOffsetMinutes = 15
     private var cancellationToken: ABVCreatorCancellationToken?
 
@@ -452,10 +452,22 @@ final class ABVCreatorModel {
     func appendConsole(_ chunk: String) {
         // ffmpeg -stats rafraîchit sa ligne avec \r : on traite chaque rafraîchissement comme une ligne.
         let lines = chunk.split(whereSeparator: { $0 == "\n" || $0 == "\r" }).map(String.init)
-        consoleLines.append(contentsOf: lines)
+        for line in lines {
+            // Les lignes de progression de ffmpeg se remplacent : sinon elles saturent la console
+            // (des milliers de lignes à recomposer) et figent l'interface pendant les longues conversions.
+            if Self.isFFmpegStatsLine(line), let last = consoleLines.last, Self.isFFmpegStatsLine(last) {
+                consoleLines[consoleLines.count - 1] = line
+            } else {
+                consoleLines.append(line)
+            }
+        }
         if consoleLines.count > Self.maxConsoleLines {
             consoleLines.removeFirst(consoleLines.count - Self.maxConsoleLines)
         }
+    }
+
+    private static func isFFmpegStatsLine(_ line: String) -> Bool {
+        line.hasPrefix("frame=") || (line.contains("fps=") && line.contains("time="))
     }
 
     func clearConsole() {
