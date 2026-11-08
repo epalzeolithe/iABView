@@ -246,6 +246,15 @@ enum ABVAccelerationSource: String, CaseIterable, Identifiable, Sendable {
     }
 }
 
+/// Option « Haute résolution » de la conversion vidéo (proposée uniquement pour les vidéos X6).
+enum ABVHighResolution {
+    static let storageKey = "ABVCreator.highResolution"
+
+    static var stored: Bool {
+        UserDefaults.standard.bool(forKey: storageKey)
+    }
+}
+
 enum ABVTool: String, CaseIterable, Identifiable, Sendable {
     case exiftool
     case ffmpeg
@@ -362,6 +371,14 @@ final class ABVCreatorModel {
         case running
         case succeeded
         case failed(String)
+    }
+
+    /// Vrai si au moins un des fichiers .insv a été détecté comme provenant d'un X6.
+    var hasX6Camera: Bool {
+        sources.contains {
+            $0.kind == .insta360
+                && ABVCreatorPipeline.CameraModel(detected: cameraModels[$0.url]) == .x6
+        }
     }
 
     var canCreate: Bool {
@@ -522,6 +539,7 @@ final class ABVCreatorModel {
         lastDuration = nil
         let selectedSources = sources
         let accelerationSource = ABVAccelerationSource.stored
+        let highResolution = ABVHighResolution.stored && hasX6Camera
         let previewOffset: TimeInterval? = isPreview ? Double(max(0, previewOffsetMinutes)) * 60 : nil
         saveLastSession()
         let token = ABVCreatorCancellationToken()
@@ -549,7 +567,7 @@ final class ABVCreatorModel {
                     try ABVCreatorPipeline.create(
                         sources: selectedSources, destination: destination,
                         overwrite: overwrite, keepVideo: keepVideo, previewOffset: previewOffset,
-                        accelerationSource: accelerationSource, cancellation: token
+                        accelerationSource: accelerationSource, highResolution: highResolution, cancellation: token
                     ) { update in
                         continuation.yield(update)
                     }
@@ -652,6 +670,7 @@ private enum ABVCreatorPipeline {
         keepVideo: Bool = false,
         previewOffset: TimeInterval? = nil,
         accelerationSource: ABVAccelerationSource = .gyroflow,
+        highResolution: Bool = false,
         cancellation: ABVCreatorCancellationToken,
         progress: @escaping @Sendable (ABVCreatorProgress) -> Void
     ) throws -> CreationResult {
@@ -671,7 +690,9 @@ private enum ABVCreatorPipeline {
         guard (1...2).contains(cameras.count) else {
             throw ABVCreatorError.invalidSources("Déposez un ou deux fichiers .insv.")
         }
-        let gpsSource = sources.first { $0.kind == .gpx || $0.kind == .nmea }
+        // Avec un GNS3000 et un GPX, le GNS3000 fournit les données principales et le GPX le second jeu (GPS2).
+        let gpsSource = sources.first { $0.kind == .nmea } ?? sources.first { $0.kind == .gpx }
+        let secondaryGPSSource = gpsSource?.kind == .nmea ? sources.first { $0.kind == .gpx } : nil
         guard let gpsSource else {
             throw ABVCreatorError.invalidSources("Déposez un fichier GPS .gpx ou un journal GNS3000 .txt.")
         }
@@ -706,6 +727,12 @@ private enum ABVCreatorPipeline {
             }
             let stagedGPS = work.appendingPathComponent(gpsSource.url.lastPathComponent)
             try fileManager.copyItem(at: gpsSource.url, to: stagedGPS)
+            var stagedGPS2: URL?
+            if let secondaryGPSSource {
+                let target = work.appendingPathComponent("gps2_" + secondaryGPSSource.url.lastPathComponent)
+                try fileManager.copyItem(at: secondaryGPSSource.url, to: target)
+                stagedGPS2 = target
+            }
             advance(stageWeight, message: "Fichiers copiés.")
 
             var cameraSamples: [CameraSample] = []
@@ -810,6 +837,7 @@ private enum ABVCreatorPipeline {
                 announce("Conversion vidéo en cours…" + estimateText)
             try convertVideo(
                 cameras: videoCameras, window: videoWindow, front: front, back: back, work: work,
+                highResolution: highResolution,
                 status: ffmpegStatus, cancellation: cancellation
             ) { cpu in
                 let snapshot = ffmpegStatus.snapshot
@@ -841,6 +869,14 @@ private enum ABVCreatorPipeline {
             guard !gps.isEmpty else {
                 throw ABVCreatorError.invalidData("Le fichier GPS ne contient aucun point utilisable.")
             }
+            var gps2: [GPSSample] = []
+            if let stagedGPS2 {
+                announce("Chargement des données GPS2…")
+                gps2 = try loadGPS(from: stagedGPS2, flightDate: cameraSamples[0].date)
+                guard !gps2.isEmpty else {
+                    throw ABVCreatorError.invalidData("Le fichier GPX ne contient aucun point utilisable.")
+                }
+            }
             advance(gpsWeight, message: "Données GPS chargées.")
             let phoneSource = sources.first { $0.kind == .sensorLog }
             if phoneSource != nil {
@@ -849,7 +885,7 @@ private enum ABVCreatorPipeline {
             let phone = try phoneSource.map { try loadIPhone(from: $0.url) } ?? []
             advance(phoneWeight)
             announce("Fusion des données…")
-            try writeMergedCSV(camera: cameraSamples, gps: gps, phone: phone, to: output)
+            try writeMergedCSV(camera: cameraSamples, gps: gps, gps2: gps2, phone: phone, to: output)
             try "1.11-native".write(to: output.appendingPathComponent("version.txt"), atomically: true, encoding: .utf8)
             if usesX6 {
                 // Angle de montage par défaut : 0° pour l'X6 (15° pour l'X4, valeur du viewer).
@@ -1049,6 +1085,7 @@ private enum ABVCreatorPipeline {
     nonisolated static func convertVideo(
         cameras: [URL], window: (offset: TimeInterval, duration: TimeInterval)? = nil,
         front: URL, back: URL, work: URL,
+        highResolution: Bool = false,
         status: ABVFFmpegStatus? = nil,
         cancellation: ABVCreatorCancellationToken,
         onCPUSample: @escaping @Sendable (Double) -> Void
@@ -1059,6 +1096,20 @@ private enum ABVCreatorPipeline {
             if let window { arguments += ["-ss", String(format: "%.3f", window.offset)] }
             arguments += ["-i", $0.path]
         }
+        // Vues avant/arrière. En haute résolution, v360 produit une projection assez grande pour que la
+        // zone recadrée fasse déjà 1920×1080 en pixels natifs (pas d'agrandissement après le crop).
+        let views: String
+        if highResolution {
+            views = """
+            [vf]v360=input=hammer:output=hammer:yaw=0:pitch=-25:w=3413:h=1920,crop=1920:1080[front];
+            [vb]v360=input=hammer:output=hammer:yaw=180:w=3840:h=2160,crop=1920:1080[back]
+            """
+        } else {
+            views = """
+            [vf]v360=input=hammer:output=hammer:yaw=0:pitch=-25:w=1920:h=1080,crop=1080:608,scale=1920:1080:flags=lanczos[front];
+            [vb]v360=input=hammer:output=hammer:yaw=180:w=1920:h=1080,crop=960:540,scale=1920:1080:flags=lanczos[back]
+            """
+        }
         let filter: String
         if cameras.count == 2 {
             filter = """
@@ -1066,15 +1117,13 @@ private enum ABVCreatorPipeline {
             [v0][v1]concat=n=2:v=1:a=0[v];
             [0:a][1:a]concat=n=2:v=0:a=1[a];[a]asplit=2[a1][a2];
             [v]v360=input=dfisheye:output=hammer:ih_fov=193:iv_fov=193[vh];[vh]split=2[vf][vb];
-            [vf]v360=input=hammer:output=hammer:yaw=0:pitch=-25:w=1920:h=1080,crop=1080:608,scale=1920:1080:flags=lanczos[front];
-            [vb]v360=input=hammer:output=hammer:yaw=180:w=1920:h=1080,crop=960:540,scale=1920:1080:flags=lanczos[back]
+            \(views)
             """
         } else {
             filter = """
             [0:v:0][0:v:1]hstack[v];[0:a]asplit=2[a1][a2];
             [v]v360=input=dfisheye:output=hammer:ih_fov=193:iv_fov=193[vh];[vh]split=2[vf][vb];
-            [vf]v360=input=hammer:output=hammer:yaw=0:pitch=-25:w=1920:h=1080,crop=1080:608,scale=1920:1080:flags=lanczos[front];
-            [vb]v360=input=hammer:output=hammer:yaw=180:w=1920:h=1080,crop=960:540,scale=1920:1080:flags=lanczos[back]
+            \(views)
             """
         }
         arguments += ["-filter_complex", filter]
@@ -1476,7 +1525,7 @@ private enum ABVCreatorPipeline {
     }
 
     nonisolated static func writeMergedCSV(
-        camera: [CameraSample], gps: [GPSSample], phone: [IPhoneSample], to output: URL
+        camera: [CameraSample], gps: [GPSSample], gps2: [GPSSample] = [], phone: [IPhoneSample], to output: URL
     ) throws {
         let phoneColumns = ["iphone_lat", "iphone_lon", "iphone_alt", "iphone_speed", "iphone_heading",
                             "iphone_acc_x", "iphone_acc_y", "iphone_acc_z",
@@ -1486,15 +1535,20 @@ private enum ABVCreatorPipeline {
         headers += phoneColumns
         headers += ["gps_lat", "gps_lon", "gps_alt", "gps_speed", "gps_heading", "gps_fpm",
                     "era5_wind_speed", "era5_wind_direction", "gps_ias"]
+        let hasGPS2 = !gps2.isEmpty
+        if hasGPS2 {
+            headers += ["gps2_lat", "gps2_lon", "gps2_alt", "gps2_speed", "gps2_heading", "gps2_fpm", "gps2_ias"]
+        }
         var outputText = headers.joined(separator: ",") + "\n"
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         let gpsDates = gps.map(\.date)
+        let gps2Dates = gps2.map(\.date)
         let phoneDates = phone.map(\.date)
         for (index, sample) in camera.enumerated() {
             let g = gps[nearestIndex(in: gpsDates, to: sample.date)]
             let p = phone.isEmpty ? nil : phone[nearestIndex(in: phoneDates, to: sample.date)]
-            let values: [String] = [
+            var values: [String] = [
                 String(index), formatter.string(from: sample.date),
                 number(sample.accelerationX), number(sample.accelerationY), number(sample.accelerationZ),
                 number(sample.quaternionW), number(sample.quaternionX), number(sample.quaternionY), number(sample.quaternionZ),
@@ -1503,6 +1557,13 @@ private enum ABVCreatorPipeline {
                 number(g.latitude), number(g.longitude), number(g.altitude), number(g.speed),
                 number(g.heading), number(g.verticalSpeed), "0", "0", number(g.speed)
             ]
+            if hasGPS2 {
+                let g2 = gps2[nearestIndex(in: gps2Dates, to: sample.date)]
+                values += [
+                    number(g2.latitude), number(g2.longitude), number(g2.altitude), number(g2.speed),
+                    number(g2.heading), number(g2.verticalSpeed), number(g2.speed)
+                ]
+            }
             outputText += values.joined(separator: ",") + "\n"
         }
         try outputText.write(to: output.appendingPathComponent("merged_data.csv"), atomically: true, encoding: .utf8)

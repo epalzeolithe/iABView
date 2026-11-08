@@ -90,6 +90,7 @@ struct IPhonePortraitFlightView: View {
                 accelerationZ: model.renderingSample?.accelerationZ ?? 0,
                 speed: model.renderingSample?.speed ?? 0,
                 samples: model.samples,
+                samplesRevision: model.samplesRevision,
                 player: model.frontPlayer
             )
 

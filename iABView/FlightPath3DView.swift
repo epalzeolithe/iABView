@@ -1,5 +1,6 @@
 import Charts
 import SceneKit
+import simd
 import SwiftUI
 #if os(macOS)
 import AppKit
@@ -96,19 +97,35 @@ struct FlightPath3DView: View {
         }
         .onAppear(perform: refreshLoadSamplesCacheIfNeeded)
         .onChange(of: model.currentIndex) { _, _ in refreshLoadSamplesCacheIfNeeded() }
+        .overlay(alignment: .bottomLeading) {
+            if model.currentSample?.gps2 != nil {
+                FlightPathGPSLegend()
+                .padding(12)
+                .allowsHitTesting(false)
+            }
+        }
         .overlay(alignment: .bottomTrailing) {
-            HStack(alignment: .bottom, spacing: 1) {
-                Spacer()
-
-                FlightPathAltitudeScale(
-                    altitude: model.currentSample?.altitude ?? 0,
-                    maximumAltitude: model.maximumAltitude
-                )
-
-                FlightPathSpeedScale(
-                    speed: model.currentSample?.speed ?? 0,
-                    maximumSpeed: model.maximumSpeed
-                )
+            Group {
+                if let sample = model.currentSample, let other = sample.gps2 {
+                    FlightPathDualGauges(
+                        primary: model.activeGPSSource == .primary ? sample.gps : other,
+                        secondary: model.activeGPSSource == .primary ? other : sample.gps,
+                        maximumAltitude: max(model.maximumAltitude, model.secondaryMaximumAltitude),
+                        maximumSpeed: max(model.maximumSpeed, model.secondaryMaximumSpeed)
+                    )
+                } else {
+                    HStack(alignment: .bottom, spacing: 1) {
+                        Spacer()
+                        FlightPathAltitudeScale(
+                            altitude: model.currentSample?.altitude ?? 0,
+                            maximumAltitude: model.maximumAltitude
+                        )
+                        FlightPathSpeedScale(
+                            speed: model.currentSample?.speed ?? 0,
+                            maximumSpeed: model.maximumSpeed
+                        )
+                    }
+                }
             }
             .padding(12)
             .allowsHitTesting(false)
@@ -159,8 +176,11 @@ private struct FlightPathScene: PlatformViewRepresentable {
         view.scene = context.coordinator.scene
         context.coordinator.configure(
             samples: model.samples,
+            samplesRevision: model.samplesRevision,
             currentIndex: model.currentIndex,
             bundleURL: model.bundleURL,
+            showsSecondaryGPS: model.showsBothGPSTrajectories,
+            activeIsPrimary: model.activeGPSSource == .primary,
             view: view
         )
         return view
@@ -170,12 +190,18 @@ private struct FlightPathScene: PlatformViewRepresentable {
         view.backgroundColor = platformBackgroundColor
         context.coordinator.configure(
             samples: model.samples,
+            samplesRevision: model.samplesRevision,
             currentIndex: model.currentIndex,
             bundleURL: model.bundleURL,
+            showsSecondaryGPS: model.showsBothGPSTrajectories,
+            activeIsPrimary: model.activeGPSSource == .primary,
             view: view
         )
         if let sample = model.currentSample {
-            context.coordinator.updateMarker(sample: sample, view: view)
+            context.coordinator.updateMarker(
+                sample: sample, showsSecondaryGPS: model.showsBothGPSTrajectories,
+                activeIsPrimary: model.activeGPSSource == .primary, view: view
+            )
         }
         context.coordinator.applyZoomCommand(cameraZoomCommand, view: view)
     }
@@ -185,10 +211,16 @@ private struct FlightPathScene: PlatformViewRepresentable {
         private let marker = SCNNode(
             geometry: SCNSphere(radius: 0.045)
         )
+        private let secondaryMarker = SCNNode(
+            geometry: SCNSphere(radius: 0.045)
+        )
         private let verticalLine = SCNNode()
+        private var mainLineColor: PlatformColor?
+        private var otherLineColor = PlatformColor.systemPink
         private let cameraNode = SCNNode()
         private var reference: FlightReference?
         private var configuredBundleURL: URL?
+        private var configuredRevision = -1
         private var lastTrajectoryEndTime: TimeInterval?
         private var cameraTarget: SCNVector3?
         private var appliedZoomCommand = 0
@@ -198,6 +230,9 @@ private struct FlightPathScene: PlatformViewRepresentable {
             super.init()
             marker.geometry?.firstMaterial?.diffuse.contents = PlatformColor.systemRed
             scene.rootNode.addChildNode(marker)
+            secondaryMarker.geometry?.firstMaterial?.diffuse.contents = PlatformColor.systemPink
+            secondaryMarker.isHidden = true
+            scene.rootNode.addChildNode(secondaryMarker)
             scene.rootNode.addChildNode(verticalLine)
             addCamera()
             addLights()
@@ -205,13 +240,20 @@ private struct FlightPathScene: PlatformViewRepresentable {
 
         func configure(
             samples: [FlightSample],
+            samplesRevision: Int,
             currentIndex: Int,
             bundleURL: URL?,
+            showsSecondaryGPS: Bool,
+            activeIsPrimary: Bool,
             view: SCNView
         ) {
             guard let first = samples.first, samples.indices.contains(currentIndex) else { return }
             let currentSample = samples[currentIndex]
             let bundleChanged = configuredBundleURL != bundleURL
+            // Échantillons remplacés (ex. décalage GPS) : la trajectoire doit être reconstruite
+            // même à l'arrêt, sans attendre la seconde de lecture suivante.
+            let samplesChanged = configuredRevision != samplesRevision
+            configuredRevision = samplesRevision
 
             if bundleChanged {
                 configuredBundleURL = bundleURL
@@ -224,7 +266,14 @@ private struct FlightPathScene: PlatformViewRepresentable {
                 cameraTarget = nil
             }
 
+            // Avec 2 GPS : GPS principal en bleu uni, GPS2 en rose uni (au lieu des couleurs de vitesse).
+            let principalColor = PlatformColor.systemBlue
+            let secondaryColor = PlatformColor.systemPink
+            mainLineColor = showsSecondaryGPS ? (activeIsPrimary ? principalColor : secondaryColor) : nil
+            otherLineColor = activeIsPrimary ? secondaryColor : principalColor
+
             let shouldRefreshTrajectory = bundleChanged
+                || samplesChanged
                 || lastTrajectoryEndTime == nil
                 || currentSample.elapsed < (lastTrajectoryEndTime ?? 0)
                 || currentSample.elapsed - (lastTrajectoryEndTime ?? 0) >= 1
@@ -242,6 +291,10 @@ private struct FlightPathScene: PlatformViewRepresentable {
                 withName: "ground",
                 recursively: false
             )
+            let previousSecondary = scene.rootNode.childNode(
+                withName: "secondaryTrajectory",
+                recursively: false
+            )
 
             let startTime = max(0, currentSample.elapsed - 90)
             let startIndex = firstSampleIndex(
@@ -253,6 +306,8 @@ private struct FlightPathScene: PlatformViewRepresentable {
             let visibleSamples = downsampled(windowSamples, maximumCount: 8_000)
             addTrajectory(samples: visibleSamples)
             addGround(samples: visibleSamples)
+            if showsSecondaryGPS { addSecondaryTrajectory(samples: visibleSamples) }
+            previousSecondary?.removeFromParentNode()
             previousTrajectory?.removeFromParentNode()
             previousShadow?.removeFromParentNode()
             previousGround?.removeFromParentNode()
@@ -291,10 +346,18 @@ private struct FlightPathScene: PlatformViewRepresentable {
             return result
         }
 
-        func updateMarker(sample: FlightSample, view: SCNView) {
+        func updateMarker(sample: FlightSample, showsSecondaryGPS: Bool, activeIsPrimary: Bool, view: SCNView) {
             guard let reference else { return }
             let position = position(for: sample, reference: reference)
             marker.position = position
+            marker.geometry?.firstMaterial?.diffuse.contents = mainLineColor ?? PlatformColor.systemRed
+            secondaryMarker.geometry?.firstMaterial?.diffuse.contents = otherLineColor
+            if showsSecondaryGPS, let secondary = sample.gps2 {
+                secondaryMarker.position = self.position(for: secondary, reference: reference)
+                secondaryMarker.isHidden = false
+            } else {
+                secondaryMarker.isHidden = true
+            }
             verticalLine.geometry = lineGeometry(
                 from: SCNVector3(position.x, 0, position.z),
                 to: position,
@@ -344,32 +407,18 @@ private struct FlightPathScene: PlatformViewRepresentable {
 
         private func addTrajectory(samples: [FlightSample]) {
             guard let reference, samples.count > 1 else { return }
-            var vertices: [SCNVector3] = []
-            var colors: [PlatformColor] = []
-            var shadowVertices: [SCNVector3] = []
+            let points = samples.map { position(for: $0, reference: reference) }
+            let colors = samples.map { mainLineColor ?? speedColor($0.speed) }
 
-            for index in 1..<samples.count {
-                let previous = position(for: samples[index - 1], reference: reference)
-                let current = position(for: samples[index], reference: reference)
-                vertices.append(contentsOf: [previous, current])
-                shadowVertices.append(
-                    contentsOf: [
-                        SCNVector3(previous.x, 0, previous.z),
-                        SCNVector3(current.x, 0, current.z)
-                    ]
-                )
-                let color = speedColor(samples[index].speed)
-                colors.append(contentsOf: [color, color])
-            }
-
-            let visualExtent = vertices.reduce(SCNFloat(0)) { extent, vertex in
+            let visualExtent = points.reduce(SCNFloat(0)) { extent, vertex in
                 max(extent, abs(vertex.x), abs(vertex.y), abs(vertex.z))
             }
             let trajectoryThickness = max(SCNFloat(0.008), visualExtent * 0.0015)
-            let trajectory = lineNode(
-                vertices: vertices,
+            let trajectory = tubeNode(
+                points: points,
                 colors: colors,
-                thickness: trajectoryThickness
+                radius: trajectoryThickness * 0.8,
+                sides: 6
             )
             trajectory.name = "trajectory"
 
@@ -391,17 +440,32 @@ private struct FlightPathScene: PlatformViewRepresentable {
             }
             scene.rootNode.addChildNode(trajectory)
 
-            let shadowColors = Array(
-                repeating: PlatformColor.brown.withAlphaComponent(0.85),
-                count: shadowVertices.count
-            )
-            let shadow = lineNode(
-                vertices: shadowVertices,
-                colors: shadowColors,
-                thickness: trajectoryThickness * 0.75
+            let shadow = tubeNode(
+                points: points.map { SCNVector3($0.x, 0, $0.z) },
+                colors: Array(repeating: PlatformColor.brown.withAlphaComponent(0.85), count: points.count),
+                radius: trajectoryThickness * 0.6,
+                sides: 4
             )
             shadow.name = "shadow"
             scene.rootNode.addChildNode(shadow)
+        }
+
+        /// Trajectoire du second jeu GPS, en rose uni pour la distinguer de la trajectoire colorée par la vitesse.
+        private func addSecondaryTrajectory(samples: [FlightSample]) {
+            guard let reference else { return }
+            let points = samples.compactMap { $0.gps2 }.map { position(for: $0, reference: reference) }
+            guard points.count > 1 else { return }
+            let visualExtent = points.reduce(SCNFloat(0)) { extent, vertex in
+                max(extent, abs(vertex.x), abs(vertex.y), abs(vertex.z))
+            }
+            let node = tubeNode(
+                points: points,
+                colors: Array(repeating: otherLineColor, count: points.count),
+                radius: max(SCNFloat(0.008), visualExtent * 0.0015) * 0.8,
+                sides: 6
+            )
+            node.name = "secondaryTrajectory"
+            scene.rootNode.addChildNode(node)
         }
 
         private func addGround(samples: [FlightSample]) {
@@ -457,60 +521,89 @@ private struct FlightPathScene: PlatformViewRepresentable {
             scene.rootNode.addChildNode(grid)
         }
 
-        private func lineNode(
-            vertices: [SCNVector3],
-            colors: [PlatformColor],
-            thickness: SCNFloat
+        /// Tube triangulé (un seul maillage) le long de `points`, une couleur par point. Remplace les
+        /// lignes SceneKit d'un pixel dupliquées : plus épais, lisible à toute distance et une seule
+        /// géométrie à dessiner. Les points trop proches sont fusionnés pour limiter le nombre de sommets.
+        private func tubeNode(
+            points rawPoints: [SCNVector3],
+            colors rawColors: [PlatformColor],
+            radius: SCNFloat,
+            sides: Int
         ) -> SCNNode {
-            let vertexSource = SCNGeometrySource(vertices: vertices)
-            // Profiling showed this as the single biggest cost in the app: the
-            // trajectory is built from only a handful of distinct colors (the
-            // speed palette, plus the fixed shadow/wingtip colors), but with one
-            // array entry per vertex (up to tens of thousands for a long window)
-            // this used to re-run `usingColorSpace`/`getRed` — which goes through
-            // full ColorSync profile and HDR headroom evaluation — for every
-            // single one of them, every time the trajectory refreshed. Caching
-            // by color turns that into a handful of conversions, ever.
-            let colorComponents: [Float] = colors.flatMap { color -> [Float] in
-                let components = cachedComponents(for: color)
-                return [components.0, components.1, components.2, components.3]
+            var points: [SIMD3<Float>] = []
+            var colors: [PlatformColor] = []
+            let minimumSpacing = Float(radius) * 0.8
+            for (index, point) in rawPoints.enumerated() {
+                let candidate = SIMD3<Float>(Float(point.x), Float(point.y), Float(point.z))
+                let isLast = index == rawPoints.count - 1
+                if let last = points.last, simd_distance(last, candidate) < minimumSpacing {
+                    if isLast { points[points.count - 1] = candidate; colors[colors.count - 1] = rawColors[index] }
+                    continue
+                }
+                points.append(candidate)
+                colors.append(rawColors[index])
             }
-            let colorData = colorComponents.withUnsafeBytes { Data($0) }
+            let node = SCNNode()
+            guard points.count > 1 else { return node }
+
+            var vertices: [SCNVector3] = []
+            var colorValues: [Float] = []
+            vertices.reserveCapacity(points.count * sides)
+            colorValues.reserveCapacity(points.count * sides * 4)
+            var normal = SIMD3<Float>(0, 1, 0)
+            for index in points.indices {
+                let tangent = simd_normalize(
+                    points[min(index + 1, points.count - 1)] - points[max(index - 1, 0)]
+                )
+                // Transport parallèle : le repère du tube ne vrille pas d'un anneau à l'autre.
+                var candidate = normal - simd_dot(normal, tangent) * tangent
+                if simd_length(candidate) < 0.001 {
+                    candidate = abs(tangent.y) < 0.9 ? SIMD3<Float>(0, 1, 0) : SIMD3<Float>(1, 0, 0)
+                    candidate -= simd_dot(candidate, tangent) * tangent
+                }
+                normal = simd_normalize(candidate)
+                let binormal = simd_cross(tangent, normal)
+                let components = cachedComponents(for: colors[index])
+                for side in 0..<sides {
+                    let angle = Float(side) / Float(sides) * 2 * .pi
+                    let offset = (cos(angle) * normal + sin(angle) * binormal) * Float(radius)
+                    let vertex = points[index] + offset
+                    vertices.append(SCNVector3(CGFloat(vertex.x), CGFloat(vertex.y), CGFloat(vertex.z)))
+                    colorValues.append(contentsOf: [components.0, components.1, components.2, components.3])
+                }
+            }
+
+            var indices: [Int32] = []
+            indices.reserveCapacity((points.count - 1) * sides * 6)
+            for ring in 0..<(points.count - 1) {
+                for side in 0..<sides {
+                    let next = (side + 1) % sides
+                    let a = Int32(ring * sides + side)
+                    let b = Int32(ring * sides + next)
+                    let c = Int32((ring + 1) * sides + side)
+                    let d = Int32((ring + 1) * sides + next)
+                    indices.append(contentsOf: [a, c, b, b, c, d])
+                }
+            }
+
             let colorSource = SCNGeometrySource(
-                data: colorData,
+                data: colorValues.withUnsafeBytes { Data($0) },
                 semantic: .color,
-                vectorCount: colors.count,
+                vectorCount: vertices.count,
                 usesFloatComponents: true,
                 componentsPerVector: 4,
                 bytesPerComponent: MemoryLayout<Float>.size,
                 dataOffset: 0,
                 dataStride: MemoryLayout<Float>.size * 4
             )
-            let indices = vertices.indices.map(Int32.init)
-            let element = SCNGeometryElement(indices: indices, primitiveType: .line)
             let geometry = SCNGeometry(
-                sources: [vertexSource, colorSource],
-                elements: [element]
+                sources: [SCNGeometrySource(vertices: vertices), colorSource],
+                elements: [SCNGeometryElement(indices: indices, primitiveType: .triangles)]
             )
             geometry.firstMaterial?.lightingModel = .constant
-
-            // SceneKit draws line primitives one pixel wide. Reuse the same geometry
-            // around the original path to keep it legible at every camera distance.
-            let container = SCNNode()
-            let offsets = [
-                SCNVector3Zero,
-                SCNVector3(thickness, 0, 0),
-                SCNVector3(-thickness, 0, 0),
-                SCNVector3(0, thickness, 0),
-                SCNVector3(0, 0, thickness),
-                SCNVector3(0, 0, -thickness)
-            ]
-            for offset in offsets {
-                let line = SCNNode(geometry: geometry)
-                line.position = offset
-                container.addChildNode(line)
-            }
-            return container
+            geometry.firstMaterial?.isDoubleSided = true
+            node.geometry = geometry
+            return node
         }
 
         private func lineGeometry(
@@ -533,11 +626,28 @@ private struct FlightPathScene: PlatformViewRepresentable {
             for sample: FlightSample,
             reference: FlightReference
         ) -> SCNVector3 {
+            position(
+                latitude: sample.latitude, longitude: sample.longitude,
+                altitude: sample.altitude, reference: reference
+            )
+        }
+
+        private func position(for gps: SecondaryGPS, reference: FlightReference) -> SCNVector3 {
+            position(
+                latitude: gps.latitude, longitude: gps.longitude,
+                altitude: gps.altitude, reference: reference
+            )
+        }
+
+        private func position(
+            latitude: Double, longitude: Double, altitude: Double,
+            reference: FlightReference
+        ) -> SCNVector3 {
             let metersPerDegree = 111_320.0
-            let east = (sample.longitude - reference.longitude)
+            let east = (longitude - reference.longitude)
                 * metersPerDegree * reference.cosineLatitude
-            let north = (sample.latitude - reference.latitude) * metersPerDegree
-            let altitudeMeters = max(0, sample.altitude * 0.3048)
+            let north = (latitude - reference.latitude) * metersPerDegree
+            let altitudeMeters = max(0, altitude * 0.3048)
             return SCNVector3(east / 500, altitudeMeters / 500, -north / 500)
         }
 
@@ -779,5 +889,96 @@ private struct FlightPathAltitudeScale: View {
         }
         .foregroundStyle(labelColor)
         .padding(6)
+    }
+}
+
+/// Légende des couleurs de la vue trajectoire quand les deux jeux GPS sont affichés.
+private struct FlightPathGPSLegend: View {
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 6) {
+                Capsule().fill(.blue).frame(width: 26, height: 5)
+                Text("GPS principal GNS3000")
+            }
+            HStack(spacing: 6) {
+                Capsule().fill(.pink).frame(width: 26, height: 5)
+                Text("GPS2 GPX")
+            }
+        }
+        .font(.caption2)
+        .foregroundStyle(colorScheme == .dark ? .white : .black)
+        .padding(6)
+        .background(.background.opacity(0.6), in: RoundedRectangle(cornerRadius: 6))
+    }
+}
+
+/// Jauges altitude, vitesse et vitesse verticale des deux jeux GPS, accolées deux à deux (même échelle)
+/// pour comparer les écarts. La barre de gauche est le GPS principal (bleu), celle de droite le GPS2 (rose).
+private struct FlightPathDualGauges: View {
+    let primary: SecondaryGPS
+    let secondary: SecondaryGPS
+    let maximumAltitude: Double
+    let maximumSpeed: Double
+    private let verticalSpeedRange = 2_000.0
+
+    var body: some View {
+        HStack(alignment: .bottom, spacing: 4) {
+            gauge(
+                "ft", primary.altitude, secondary.altitude,
+                lower: 0, upper: max(1, maximumAltitude),
+                primaryColor: .blue
+            )
+            gauge(
+                "km/h", primary.speed, secondary.speed,
+                lower: 0, upper: max(1, maximumSpeed), primaryColor: .blue
+            )
+            gauge(
+                "ft/min", primary.verticalSpeed, secondary.verticalSpeed,
+                lower: -verticalSpeedRange, upper: verticalSpeedRange, primaryColor: .blue
+            )
+        }
+    }
+
+    private func gauge(
+        _ unit: String, _ first: Double, _ second: Double,
+        lower: Double, upper: Double, primaryColor: Color
+    ) -> some View {
+        HStack(alignment: .bottom, spacing: 4) {
+            VStack(alignment: .trailing, spacing: 2) {
+                Text("\(first, format: .number.precision(.fractionLength(0))) \(unit)")
+                    .font(.caption.monospacedDigit().bold())
+                    .foregroundStyle(.blue)
+                Text("\(second, format: .number.precision(.fractionLength(0))) \(unit)")
+                    .font(.caption.monospacedDigit().bold())
+                    .foregroundStyle(.pink)
+            }
+            HStack(alignment: .bottom, spacing: 0) {
+                bar(first, lower: lower, upper: upper, color: primaryColor)
+                bar(second, lower: lower, upper: upper, color: .pink)
+            }
+        }
+        .padding(6)
+    }
+
+    /// Barre de 9 pt : remplie depuis le bas, ou depuis le zéro quand l'échelle est signée.
+    private func bar(_ value: Double, lower: Double, upper: Double, color: Color) -> some View {
+        GeometryReader { proxy in
+            let height = proxy.size.height
+            let zero = height * (upper / (upper - lower))
+            let position = height * (upper - max(lower, min(upper, value))) / (upper - lower)
+            ZStack(alignment: .topLeading) {
+                Rectangle().fill(.gray.opacity(0.25))
+                Rectangle()
+                    .fill(color)
+                    .frame(height: abs(zero - position))
+                    .offset(y: min(zero, position))
+                if lower < 0 {
+                    Rectangle().fill(.gray).frame(height: 1).offset(y: zero)
+                }
+            }
+        }
+        .frame(width: 9, height: 82)
     }
 }

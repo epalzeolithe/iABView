@@ -8,6 +8,11 @@ import CoreLocation
 import Foundation
 import Observation
 
+enum GPSSourceChoice: Sendable {
+    case primary
+    case secondary
+}
+
 struct RecentBundle: Identifiable, Hashable, Sendable {
     var id: String { url.path }
     let name: String
@@ -28,7 +33,14 @@ final class FlightViewModel {
 
     private(set) var bundleURL: URL?
     private(set) var recentBundles: [RecentBundle] = []
+    /// Échantillons tels que lus dans merged_data.csv ; `samples` en dérive en appliquant `gpsOffset`.
+    private var rawSamples: [FlightSample] = []
     private(set) var samples: [FlightSample] = []
+    /// Incrémenté à chaque remplacement de `samples`, pour invalider les caches des vues 3D.
+    private(set) var samplesRevision = 0
+    /// Avance du GPS en secondes (mémorisée par ABV dans gps_offset.txt) : positive, le GPS est
+    /// affiché plus tôt ; à utiliser quand la trajectoire GPS est en retard sur la vidéo.
+    private(set) var gpsOffset = 0.0
     private(set) var chartSamples: [FlightSample] = []
     private(set) var routeCoordinates: [CLLocationCoordinate2D] = []
     private(set) var bookmarks: [FlightBookmark] = []
@@ -58,6 +70,12 @@ final class FlightViewModel {
     private(set) var shows3DAxes = true
     private(set) var showsVerticalGrid = false
     private(set) var showsTrajectoryTrail = true
+    /// Jeu GPS affiché (le GPS2 n'existe que si l'ABV contient des colonnes `gps2_*`).
+    private(set) var activeGPSSource: GPSSourceChoice = .primary
+    /// Affiche aussi l'autre jeu GPS dans la vue trajectoire 3D.
+    private(set) var showsBothGPSTrajectories = false
+    private(set) var secondaryMaximumAltitude = 0.0
+    private(set) var secondaryMaximumSpeed = 0.0
     private(set) var isAudioMuted = false
     private(set) var playbackCorrectionCount = 0
 
@@ -66,6 +84,9 @@ final class FlightViewModel {
     private var timeObserver: Any?
     private var securityScopedURL: URL?
     private var isCorrectingVideoDrift = false
+    /// Seeks en cours sur le lecteur avant : tant qu'il y en a, l'observateur de lecture voit encore
+    /// l'ancien temps et ne doit pas ramener `currentIndex` en arrière.
+    private var pendingSeekCount = 0
     private var loadTask: Task<FlightBundle, Error>?
     private var loadGeneration = 0
     private var lastDriftSeekTime: TimeInterval = 0
@@ -255,14 +276,9 @@ final class FlightViewModel {
                     try FlightBundleLoader.load(from: bundleURL)
                 }.value
 
-                samples = refreshedBundle.samples
+                rawSamples = refreshedBundle.samples
                 metar = updatedReadings
-                let strideValue = max(1, samples.count / 2_500)
-                chartSamples = samples.enumerated().compactMap { index, sample in
-                    index.isMultiple(of: strideValue) ? sample : nil
-                }
-                maximumAltitude = samples.map(\.altitude).max() ?? 0
-                maximumSpeed = samples.map(\.speed).max() ?? 0
+                refreshSamples()
                 updateLoadFactorExtrema()
                 currentIndex = sampleIndex(at: playbackPosition)
                 metarUpdateMessage = "\(updatedReadings.count) relevés METAR enregistrés et gps_ias recalculé dans merged_data.csv."
@@ -427,6 +443,97 @@ final class FlightViewModel {
         saveCalibration()
     }
 
+    /// Avance (delta > 0) ou retarde (delta < 0) la trajectoire GPS par rapport à la vidéo et à
+    /// l'orientation. Le réglage est enregistré dans l'ABV (gps_offset.txt).
+    func adjustGPSOffset(by delta: Double) {
+        setGPSOffset(gpsOffset + delta)
+    }
+
+    func resetGPSOffset() {
+        setGPSOffset(0)
+    }
+
+    private func setGPSOffset(_ value: Double) {
+        let rounded = (max(-60, min(60, value)) * 10).rounded() / 10
+        guard rounded != gpsOffset else { return }
+        gpsOffset = rounded
+        refreshSamples()
+        saveGPSOffset()
+    }
+
+    /// Recalcule `samples` (GPS décalé) et tout ce qui en dérive. L'indice courant reste valable :
+    /// le nombre d'échantillons et leurs temps ne changent pas.
+    private func refreshSamples() {
+        samples = Self.applyingGPSOffset(gpsOffset, to: Self.selectingGPS(activeGPSSource, in: rawSamples))
+        samplesRevision += 1
+        let strideValue = max(1, samples.count / 2_500)
+        chartSamples = samples.enumerated().compactMap { index, sample in
+            index.isMultiple(of: strideValue) ? sample : nil
+        }
+        let routeStride = max(1, samples.count / 3_000)
+        routeCoordinates = samples.enumerated().compactMap { index, sample in
+            index.isMultiple(of: routeStride) ? sample.coordinate : nil
+        }
+        maximumAltitude = samples.map(\.altitude).max() ?? 0
+        maximumSpeed = samples.map(\.speed).max() ?? 0
+        secondaryMaximumAltitude = samples.compactMap { $0.gps2?.altitude }.max() ?? 0
+        secondaryMaximumSpeed = samples.compactMap { $0.gps2?.speed }.max() ?? 0
+    }
+
+    /// Avec le GPS2 actif, ses valeurs prennent la place des champs GPS principaux (le vent reste celui
+    /// de l'ABV) et le GPS principal passe dans `gps2`, pour pouvoir afficher les deux trajectoires.
+    nonisolated private static func selectingGPS(_ source: GPSSourceChoice, in raw: [FlightSample]) -> [FlightSample] {
+        guard source == .secondary else { return raw }
+        return raw.map { sample in
+            guard let other = sample.gps2 else { return sample }
+            return FlightSample(
+                id: sample.id, timestamp: sample.timestamp, elapsed: sample.elapsed,
+                latitude: other.latitude, longitude: other.longitude, altitude: other.altitude,
+                speed: other.speed, heading: other.heading, verticalSpeed: other.verticalSpeed,
+                indicatedAirspeed: other.indicatedAirspeed,
+                windSpeed: sample.windSpeed, windDirection: sample.windDirection,
+                accelerationX: sample.accelerationX, accelerationY: sample.accelerationY,
+                accelerationZ: sample.accelerationZ,
+                quaternionW: sample.quaternionW, quaternionX: sample.quaternionX,
+                quaternionY: sample.quaternionY, quaternionZ: sample.quaternionZ,
+                gps2: SecondaryGPS(
+                    latitude: sample.latitude, longitude: sample.longitude, altitude: sample.altitude,
+                    speed: sample.speed, heading: sample.heading, verticalSpeed: sample.verticalSpeed,
+                    indicatedAirspeed: sample.indicatedAirspeed
+                )
+            )
+        }
+    }
+
+    /// Reprend, pour chaque instant, les champs dérivés du GPS (position, altitude, vitesses, cap,
+    /// vent) à l'instant `elapsed + offset` ; orientation et accélération restent à leur instant.
+    nonisolated private static func applyingGPSOffset(_ offset: Double, to raw: [FlightSample]) -> [FlightSample] {
+        guard offset != 0, raw.count > 1 else { return raw }
+        var result = raw
+        var source = 0
+        for index in raw.indices {
+            let target = raw[index].elapsed + offset
+            // Le pointeur source avance presque toujours dans le même sens : parcours en O(n).
+            while source < raw.count - 1,
+                  abs(raw[source + 1].elapsed - target) <= abs(raw[source].elapsed - target) { source += 1 }
+            while source > 0,
+                  abs(raw[source - 1].elapsed - target) < abs(raw[source].elapsed - target) { source -= 1 }
+            let own = raw[index]
+            let gps = raw[source]
+            result[index] = FlightSample(
+                id: own.id, timestamp: own.timestamp, elapsed: own.elapsed,
+                latitude: gps.latitude, longitude: gps.longitude, altitude: gps.altitude,
+                speed: gps.speed, heading: gps.heading, verticalSpeed: gps.verticalSpeed,
+                indicatedAirspeed: gps.indicatedAirspeed, windSpeed: gps.windSpeed, windDirection: gps.windDirection,
+                accelerationX: own.accelerationX, accelerationY: own.accelerationY, accelerationZ: own.accelerationZ,
+                quaternionW: own.quaternionW, quaternionX: own.quaternionX,
+                quaternionY: own.quaternionY, quaternionZ: own.quaternionZ,
+                gps2: gps.gps2
+            )
+        }
+        return result
+    }
+
     func toggleAudioMuted() {
         isAudioMuted.toggle()
         frontPlayer.isMuted = isAudioMuted
@@ -443,6 +550,26 @@ final class FlightViewModel {
 
     func toggleVerticalGrid() {
         showsVerticalGrid.toggle()
+    }
+
+    var hasSecondaryGPS: Bool {
+        rawSamples.first?.gps2 != nil
+    }
+
+    func setGPSSource(_ source: GPSSourceChoice) {
+        let target = hasSecondaryGPS ? source : .primary
+        guard target != activeGPSSource else { return }
+        activeGPSSource = target
+        refreshSamples()
+    }
+
+    func toggleGPSSource() {
+        setGPSSource(activeGPSSource == .primary ? .secondary : .primary)
+    }
+
+    func toggleBothGPSTrajectories() {
+        showsBothGPSTrajectories.toggle()
+        samplesRevision += 1
     }
 
     func toggleTrajectoryTrail() {
@@ -538,7 +665,14 @@ final class FlightViewModel {
         let frontTarget = CMTime(seconds: frontTime, preferredTimescale: 600)
         let backTime = max(0, frontTime + backVideoOffset)
         let backTarget = CMTime(seconds: backTime, preferredTimescale: 600)
-        frontPlayer.seek(to: frontTarget, toleranceBefore: .zero, toleranceAfter: .zero)
+        pendingSeekCount += 1
+        let model = WeakFlightViewModel(self)
+        // Un seek remplacé par un plus récent est aussi terminé (finished == false) : le compte reste juste.
+        frontPlayer.seek(to: frontTarget, toleranceBefore: .zero, toleranceAfter: .zero) { _ in
+            Task { @MainActor in
+                if let value = model.value { value.pendingSeekCount = max(0, value.pendingSeekCount - 1) }
+            }
+        }
         backPlayer.seek(to: backTarget, toleranceBefore: .zero, toleranceAfter: .zero)
         currentIndex = sampleIndex(at: clamped)
     }
@@ -581,22 +715,15 @@ final class FlightViewModel {
 
     private func apply(_ bundle: FlightBundle) {
         bundleURL = bundle.url
-        samples = bundle.samples
+        rawSamples = bundle.samples
         bookmarks = bundle.bookmarks
         metar = bundle.metar
         currentIndex = 0
         playbackCorrectionCount = 0
 
-        let strideValue = max(1, samples.count / 2_500)
-        chartSamples = samples.enumerated().compactMap { index, sample in
-            index.isMultiple(of: strideValue) ? sample : nil
-        }
-        let routeStride = max(1, samples.count / 3_000)
-        routeCoordinates = samples.enumerated().compactMap { index, sample in
-            index.isMultiple(of: routeStride) ? sample.coordinate : nil
-        }
-        maximumAltitude = samples.map(\.altitude).max() ?? 0
-        maximumSpeed = samples.map(\.speed).max() ?? 0
+        loadGPSOffset()
+        activeGPSSource = .primary
+        refreshSamples()
 
         configure(player: frontPlayer, file: "front.mp4")
         configure(player: backPlayer, file: "back.mp4")
@@ -697,6 +824,28 @@ final class FlightViewModel {
         }
     }
 
+    private func loadGPSOffset() {
+        gpsOffset = 0
+        guard let bundleURL,
+              let value = try? String(contentsOf: bundleURL.appendingPathComponent("gps_offset.txt"), encoding: .utf8),
+              let offset = Double(value.trimmingCharacters(in: .whitespacesAndNewlines)),
+              offset.isFinite else { return }
+        gpsOffset = max(-60, min(60, offset))
+    }
+
+    private func saveGPSOffset() {
+        guard let bundleURL else { return }
+        do {
+            try String(gpsOffset).write(
+                to: bundleURL.appendingPathComponent("gps_offset.txt"),
+                atomically: true,
+                encoding: .utf8
+            )
+        } catch {
+            errorMessage = "Impossible d’enregistrer le décalage GPS : \(error.localizedDescription)"
+        }
+    }
+
     private func updateLoadFactorExtrema() {
         let values = samples.map {
             $0.signedLoadFactor(mountingPitch: mountingPitch)
@@ -762,7 +911,7 @@ final class FlightViewModel {
         ) { time in
             let seconds = time.seconds
             MainActor.assumeIsolated {
-                guard let value = model.value, !value.samples.isEmpty else { return }
+                guard let value = model.value, !value.samples.isEmpty, value.pendingSeekCount == 0 else { return }
                 value.currentIndex = value.sampleIndex(at: seconds)
                 value.correctVideoDrift(frontTime: seconds)
             }

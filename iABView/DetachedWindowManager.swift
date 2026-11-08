@@ -165,6 +165,7 @@ struct DetachedAircraftView: View {
             accelerationZ: sample?.accelerationZ ?? 0,
             speed: sample?.speed ?? 0,
             samples: model.samples,
+            samplesRevision: model.samplesRevision,
             player: model.frontPlayer
         )
     }

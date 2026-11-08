@@ -11,6 +11,7 @@ struct ABVCreatorView: View {
     @State private var isTestingGyroflow = false
     @AppStorage("ABVCreator.showConsole") private var showConsole = false
     @AppStorage(ABVAccelerationSource.storageKey) private var accelerationSource = ABVAccelerationSource.gyroflow
+    @AppStorage(ABVHighResolution.storageKey) private var highResolution = false
     @State private var gyroflowTestResult: (succeeded: Bool, message: String)?
 
     var body: some View {
@@ -75,7 +76,7 @@ struct ABVCreatorView: View {
                 ContentUnavailableView {
                     Label("Déposez les fichiers ici", systemImage: "arrow.down.doc")
                 } description: {
-                    Text("1 ou 2 fichiers .insv et un fichier GPS .gpx ou GNS3000 .txt")
+                    Text("1 ou 2 fichiers .insv et un fichier GPS .gpx ou GNS3000 .txt (ou les deux)")
                 } actions: {
                     Button("Choisir les fichiers") {
                         isImporterPresented = true
@@ -123,7 +124,7 @@ struct ABVCreatorView: View {
             )
             requirement(
                 title: "Position",
-                detail: "GPX ou GNS3000",
+                detail: "GPX ou GNS3000 (les deux : GPS2)",
                 satisfied: model.sources.contains { $0.kind == .gpx || $0.kind == .nmea }
             )
             requirement(
@@ -280,6 +281,12 @@ struct ABVCreatorView: View {
                 Spacer()
             }
             .disabled(model.state == .running)
+
+            if model.hasX6Camera {
+                Toggle("Haute résolution", isOn: $highResolution)
+                    .help("Vidéo X6 : génère la projection à plus haute résolution avant le recadrage pour une image plus nette. La conversion est nettement plus lente.")
+                    .disabled(model.state == .running)
+            }
 
             HStack(spacing: 12) {
                 Text("Accélérations")

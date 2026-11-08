@@ -27,6 +27,9 @@ struct Aircraft3DView: PlatformViewRepresentable {
     let accelerationZ: Double
     let speed: Double
     let samples: [FlightSample]
+    /// Change quand `samples` est remplacé par un contenu différent à nombre et bornes identiques
+    /// (ex. décalage GPS) : la traînée doit alors être reconstruite.
+    let samplesRevision: Int
     let player: AVPlayer
 
     func makeCoordinator() -> Coordinator {
@@ -87,6 +90,7 @@ struct Aircraft3DView: PlatformViewRepresentable {
     private func updateView(_ view: SCNView, context: Context) {
         context.coordinator.configureRealtimeUpdates(
             samples: samples,
+            samplesRevision: samplesRevision,
             player: player,
             mountingPitch: mountingPitch,
             isInverted: isInverted
@@ -136,6 +140,7 @@ struct Aircraft3DView: PlatformViewRepresentable {
         private let wingHalfSpan: Float = 2.1
         private var currentModelURL: URL?
         private var realtimeSamples: [FlightSample] = []
+        private var realtimeRevision = -1
         private weak var player: AVPlayer?
         private var realtimeMountingPitch = 15.0
         private var realtimeIsInverted = false
@@ -151,6 +156,7 @@ struct Aircraft3DView: PlatformViewRepresentable {
 
         func configureRealtimeUpdates(
             samples: [FlightSample],
+            samplesRevision: Int,
             player: AVPlayer,
             mountingPitch: Double,
             isInverted: Bool
@@ -161,12 +167,14 @@ struct Aircraft3DView: PlatformViewRepresentable {
             realtimeIsInverted = isInverted
 
             let needsRestart = self.player !== player
+                || realtimeRevision != samplesRevision
                 || realtimeSamples.count != samples.count
                 || realtimeSamples.first?.timestamp != samples.first?.timestamp
                 || realtimeSamples.last?.timestamp != samples.last?.timestamp
             guard needsRestart else { return }
 
             self.player = player
+            realtimeRevision = samplesRevision
             realtimeSamples = samples
             lastTrajectoryTrailIndex = -1
             lastTrailRebuildSeconds = -.infinity

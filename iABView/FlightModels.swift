@@ -2,6 +2,21 @@ import Foundation
 import CoreLocation
 import simd
 
+/// Second jeu de données GPS (colonnes `gps2_*` de merged_data.csv), p. ex. le GPX de la caméra.
+struct SecondaryGPS: Sendable {
+    let latitude: Double
+    let longitude: Double
+    let altitude: Double
+    let speed: Double
+    let heading: Double
+    let verticalSpeed: Double
+    let indicatedAirspeed: Double
+
+    var coordinate: CLLocationCoordinate2D {
+        CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
+    }
+}
+
 struct FlightSample: Identifiable, Sendable {
     let id: Int
     let timestamp: Date
@@ -22,9 +37,19 @@ struct FlightSample: Identifiable, Sendable {
     let quaternionX: Double
     let quaternionY: Double
     let quaternionZ: Double
+    /// Présent seulement si l'ABV contient des colonnes `gps2_*`.
+    var gps2: SecondaryGPS? = nil
 
     var coordinate: CLLocationCoordinate2D {
         CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
+    }
+
+    /// Champs GPS de cet échantillon, sous la forme d'un `SecondaryGPS`.
+    var gps: SecondaryGPS {
+        SecondaryGPS(
+            latitude: latitude, longitude: longitude, altitude: altitude, speed: speed,
+            heading: heading, verticalSpeed: verticalSpeed, indicatedAirspeed: indicatedAirspeed
+        )
     }
 
     var headwind: Double {
@@ -293,6 +318,7 @@ enum FlightBundleLoader {
         var previousMilliseconds: Double?
         var previousElapsed = -Double.infinity
         var isChronological = true
+        var hasGPS2 = false
         var offset = 0
 
         var isCancelled = false
@@ -320,6 +346,7 @@ enum FlightBundleLoader {
                 columns = Dictionary(
                     uniqueKeysWithValues: headers.enumerated().map { ($1, $0) }
                 )
+                hasGPS2 = columns["gps2_lat"] != nil && columns["gps2_lon"] != nil
                 return
             }
 
@@ -380,7 +407,16 @@ enum FlightBundleLoader {
                 quaternionW: number("x4_quat_w"),
                 quaternionX: number("x4_quat_x"),
                 quaternionY: number("x4_quat_y"),
-                quaternionZ: number("x4_quat_z")
+                quaternionZ: number("x4_quat_z"),
+                gps2: hasGPS2 ? SecondaryGPS(
+                    latitude: number("gps2_lat"),
+                    longitude: number("gps2_lon"),
+                    altitude: number("gps2_alt"),
+                    speed: number("gps2_speed"),
+                    heading: number("gps2_heading"),
+                    verticalSpeed: number("gps2_fpm"),
+                    indicatedAirspeed: number("gps2_ias")
+                ) : nil
             ))
             offset += 1
         }

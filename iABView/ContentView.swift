@@ -281,6 +281,24 @@ struct ContentView: View {
                         model.calibrateAtCurrentFrame()
                     }
                     Divider()
+                    Text("Décalage GPS : \(model.gpsOffset, format: .number.precision(.fractionLength(1))) s")
+                    Button("Avancer le GPS de 1 s (GPS en retard)") {
+                        model.adjustGPSOffset(by: 1)
+                    }
+                    Button("Avancer le GPS de 0,1 s") {
+                        model.adjustGPSOffset(by: 0.1)
+                    }
+                    Button("Retarder le GPS de 0,1 s") {
+                        model.adjustGPSOffset(by: -0.1)
+                    }
+                    Button("Retarder le GPS de 1 s (GPS en avance)") {
+                        model.adjustGPSOffset(by: -1)
+                    }
+                    Button("Réinitialiser le décalage GPS") {
+                        model.resetGPSOffset()
+                    }
+                    .disabled(model.gpsOffset == 0)
+                    Divider()
                     Button(model.isTimelineZoomed ? "Désactiver le zoom timeline" : "Zoomer la timeline") {
                         model.toggleTimelineZoom()
                     }
@@ -307,6 +325,31 @@ struct ContentView: View {
                             set: { _ in model.toggleTrajectoryTrail() }
                         )
                     )
+                    if model.hasSecondaryGPS {
+                        Divider()
+                        Toggle(
+                            "Source GPS : principal GNS3000",
+                            isOn: Binding(
+                                get: { model.activeGPSSource == .primary },
+                                set: { _ in model.setGPSSource(.primary) }
+                            )
+                        )
+                        Toggle(
+                            "Source GPS : GPS2 GPX",
+                            isOn: Binding(
+                                get: { model.activeGPSSource == .secondary },
+                                set: { _ in model.setGPSSource(.secondary) }
+                            )
+                        )
+                        Toggle(
+                            "Afficher les 2 GPS en 3D",
+                            isOn: Binding(
+                                get: { model.showsBothGPSTrajectories },
+                                set: { _ in model.toggleBothGPSTrajectories() }
+                            )
+                        )
+                        Divider()
+                    }
 
                     Toggle(
                         "Montage caméra inversé",
@@ -817,6 +860,7 @@ struct FlightWorkspace: View {
             accelerationZ: sample?.accelerationZ ?? 0,
             speed: sample?.speed ?? 0,
             samples: model.samples,
+            samplesRevision: model.samplesRevision,
             player: model.frontPlayer
         )
     }

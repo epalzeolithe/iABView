@@ -186,6 +186,20 @@ enum METARHistoryService {
             rows[0] = header
         }
 
+        // Second jeu GPS (optionnel) : même calcul à partir de gps2_speed / gps2_heading.
+        var secondary: (speed: Int, heading: Int, ias: Int)?
+        if let speed2 = columns["gps2_speed"], let heading2 = columns["gps2_heading"] {
+            let ias2: Int
+            if let existing = columns["gps2_ias"] {
+                ias2 = existing
+            } else {
+                ias2 = header.count
+                header.append("gps2_ias")
+                rows[0] = header
+            }
+            secondary = (speed2, heading2, ias2)
+        }
+
         let timestampFormatters = [
             "yyyy-MM-dd HH:mm:ss.SSSSSS",
             "yyyy-MM-dd HH:mm:ss.SSS",
@@ -211,9 +225,18 @@ enum METARHistoryService {
                 ?? isoFormatterWithoutFractions.date(from: normalized)
         }
 
+        func airspeed(groundSpeed: Double, heading: Double, at timestamp: Date) -> Double {
+            guard groundSpeed >= 50,
+                  let reading = nearestReading(to: timestamp, in: readings),
+                  let wind = METARWind(report: reading.report),
+                  let windDirection = wind.direction else { return groundSpeed }
+            let relativeAngle = (windDirection - heading) * .pi / 180
+            return groundSpeed + wind.speed * 1.852 * cos(relativeAngle)
+        }
+
         for index in rows.indices.dropFirst() {
             var row = rows[index]
-            while row.count <= iasIndex {
+            while row.count <= max(iasIndex, secondary?.ias ?? 0) {
                 row.append("")
             }
             guard row.indices.contains(timestampIndex),
@@ -226,16 +249,11 @@ enum METARHistoryService {
                 continue
             }
 
-            var indicatedAirspeed = groundSpeed
-            if groundSpeed >= 50,
-               let reading = nearestReading(to: timestamp, in: readings),
-               let wind = METARWind(report: reading.report),
-               let windDirection = wind.direction {
-                let relativeAngle = (windDirection - heading) * .pi / 180
-                let headwind = wind.speed * 1.852 * cos(relativeAngle)
-                indicatedAirspeed = groundSpeed + headwind
+            row[iasIndex] = String(airspeed(groundSpeed: groundSpeed, heading: heading, at: timestamp))
+            if let secondary, row.indices.contains(secondary.speed), row.indices.contains(secondary.heading),
+               let groundSpeed2 = Double(row[secondary.speed]), let heading2 = Double(row[secondary.heading]) {
+                row[secondary.ias] = String(airspeed(groundSpeed: groundSpeed2, heading: heading2, at: timestamp))
             }
-            row[iasIndex] = String(indicatedAirspeed)
             rows[index] = row
         }
 
