@@ -113,6 +113,7 @@ struct FlightPath3DView: View {
                         maximumAltitude: max(model.maximumAltitude, model.secondaryMaximumAltitude),
                         maximumSpeed: max(model.maximumSpeed, model.secondaryMaximumSpeed)
                     )
+                    .offset(y: 8)
                 } else {
                     HStack(alignment: .bottom, spacing: 1) {
                         Spacer()
@@ -924,15 +925,15 @@ private struct FlightPathDualGauges: View {
     private let verticalSpeedRange = 2_000.0
 
     var body: some View {
-        HStack(alignment: .bottom, spacing: 4) {
+        HStack(alignment: .bottom, spacing: 0) {
+            gauge(
+                "km/h", primary.speed, secondary.speed,
+                lower: 0, upper: max(1, maximumSpeed), primaryColor: .blue
+            )
             gauge(
                 "ft", primary.altitude, secondary.altitude,
                 lower: 0, upper: max(1, maximumAltitude),
                 primaryColor: .blue
-            )
-            gauge(
-                "km/h", primary.speed, secondary.speed,
-                lower: 0, upper: max(1, maximumSpeed), primaryColor: .blue
             )
             gauge(
                 "ft/min", primary.verticalSpeed, secondary.verticalSpeed,
@@ -945,21 +946,26 @@ private struct FlightPathDualGauges: View {
         _ unit: String, _ first: Double, _ second: Double,
         lower: Double, upper: Double, primaryColor: Color
     ) -> some View {
-        HStack(alignment: .bottom, spacing: 4) {
-            VStack(alignment: .trailing, spacing: 2) {
-                Text("\(first, format: .number.precision(.fractionLength(0))) \(unit)")
-                    .font(.caption.monospacedDigit().bold())
-                    .foregroundStyle(.blue)
-                Text("\(second, format: .number.precision(.fractionLength(0))) \(unit)")
-                    .font(.caption.monospacedDigit().bold())
-                    .foregroundStyle(.pink)
-            }
+        VStack(alignment: .center, spacing: 3) {
+            // Unité au-dessus, valeurs sous la jauge pour réduire la largeur occupée
+            Text(unit)
+                .font(.caption2.bold())
+                .foregroundStyle(.secondary)
             HStack(alignment: .bottom, spacing: 0) {
                 bar(first, lower: lower, upper: upper, color: primaryColor)
                 bar(second, lower: lower, upper: upper, color: .pink)
             }
+            VStack(alignment: .center, spacing: 1) {
+                Text(first, format: .number.precision(.fractionLength(0)))
+                    .font(.caption.monospacedDigit().bold())
+                    .foregroundStyle(.blue)
+                Text(second, format: .number.precision(.fractionLength(0)))
+                    .font(.caption.monospacedDigit().bold())
+                    .foregroundStyle(.pink)
+            }
         }
-        .padding(6)
+        .padding(.horizontal, 1)
+        .padding(.top, 6)
     }
 
     /// Barre de 9 pt : remplie depuis le bas, ou depuis le zéro quand l'échelle est signée.

@@ -76,6 +76,8 @@ struct ContentView: View {
                     preferredCompactColumn = .detail
                 },
                 onShowFlight: { preferredCompactColumn = .detail },
+                onOpenBookmarksFile: model.openBookmarksFile,
+                onReloadBookmarks: model.reloadBookmarks,
                 onSelectBookmark: { bookmark in
                     model.goToBookmark(bookmark)
                     preferredCompactColumn = .detail
@@ -470,6 +472,8 @@ struct FlightSidebar: View {
     let onOpen: () -> Void
     let onSelectRecent: (RecentBundle) -> Void
     let onShowFlight: () -> Void
+    let onOpenBookmarksFile: () -> Void
+    let onReloadBookmarks: () -> Void
     let onSelectBookmark: (FlightBookmark) -> Void
 
     var body: some View {
@@ -510,6 +514,14 @@ struct FlightSidebar: View {
             }
 
             Section("Favoris") {
+                Button(action: onOpenBookmarksFile) {
+                    Label("Éditer bookmark.csv", systemImage: "square.and.pencil")
+                }
+                .disabled(bundleName == nil)
+                Button(action: onReloadBookmarks) {
+                    Label("Recharger bookmark.csv", systemImage: "arrow.clockwise")
+                }
+                .disabled(bundleName == nil)
                 if bookmarks.isEmpty {
                     Text("Aucun favori")
                         .foregroundStyle(.secondary)

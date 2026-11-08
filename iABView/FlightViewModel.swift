@@ -591,7 +591,12 @@ final class FlightViewModel {
             return
         }
         #if os(macOS)
-        NSWorkspace.shared.open(url)
+        // Ouvre dans TextEdit plutôt que dans l'application associée aux .csv (Numbers, Excel…)
+        if let editor = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.TextEdit") {
+            NSWorkspace.shared.open([url], withApplicationAt: editor, configuration: NSWorkspace.OpenConfiguration())
+        } else {
+            NSWorkspace.shared.open(url)
+        }
         #else
         UIApplication.shared.open(url)
         #endif
