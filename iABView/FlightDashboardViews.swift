@@ -627,8 +627,10 @@ struct ArtificialHorizonView: View {
                     )
                 }
                 .frame(width: fillSize, height: fillSize)
-                .rotationEffect(.degrees(-roll))
+                // Le tangage décale la sphère dans son propre repère, avant le roulis : en vol dos,
+                // nez au-dessus de l'horizon, l'horizon doit monter à l'écran (ciel en bas).
                 .offset(y: pitch * 2)
+                .rotationEffect(.degrees(-roll))
                 .frame(width: referenceSize, height: referenceSize)
                 .clipped()
                 .overlay {
