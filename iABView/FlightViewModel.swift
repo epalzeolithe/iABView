@@ -45,7 +45,13 @@ final class FlightViewModel {
     private(set) var routeCoordinates: [CLLocationCoordinate2D] = []
     private(set) var bookmarks: [FlightBookmark] = []
     private(set) var metar: [METARReading] = []
-    private(set) var currentIndex = 0
+    private(set) var currentIndex = 0 {
+        didSet { syncSlowIndex() }
+    }
+    /// Copie de `currentIndex` rafraîchie à 4 Hz au plus pendant la lecture, pour les vues qui n'ont
+    /// pas besoin de suivre chaque tick à 15 Hz (carte, METAR, curseur, bandes de télémétrie).
+    private(set) var slowIndex = 0
+    private let slowIndexInterval: TimeInterval = 0.25
     private(set) var isLoading = false
     private(set) var loadingProgress: Double = 0
     private(set) var isUpdatingMETAR = false
@@ -100,6 +106,40 @@ final class FlightViewModel {
     var currentSample: FlightSample? {
         guard samples.indices.contains(currentIndex) else { return nil }
         return samples[currentIndex]
+    }
+
+    /// À l'arrêt ou après un saut (seek), `slowIndex` suit `currentIndex` immédiatement ; pendant la
+    /// lecture il n'avance que tous les `slowIndexInterval` secondes de vol.
+    private func syncSlowIndex() {
+        guard isPlaying,
+              samples.indices.contains(currentIndex),
+              samples.indices.contains(slowIndex),
+              abs(samples[currentIndex].elapsed - samples[slowIndex].elapsed) < slowIndexInterval
+        else {
+            slowIndex = currentIndex
+            return
+        }
+    }
+
+    var slowSample: FlightSample? {
+        guard samples.indices.contains(slowIndex) else { return nil }
+        return samples[slowIndex]
+    }
+
+    var slowTime: TimeInterval {
+        slowSample?.elapsed ?? 0
+    }
+
+    var slowRouteProgress: Double {
+        guard samples.count > 1 else { return 0 }
+        return Double(slowIndex) / Double(samples.count - 1)
+    }
+
+    var slowMETAR: String {
+        guard let timestamp = slowSample?.timestamp else { return "" }
+        return metar.min(by: {
+            abs($0.date.timeIntervalSince(timestamp)) < abs($1.date.timeIntervalSince(timestamp))
+        })?.report ?? ""
     }
 
     var renderingSample: FlightSample? {
@@ -478,6 +518,7 @@ final class FlightViewModel {
         maximumSpeed = samples.map(\.speed).max() ?? 0
         secondaryMaximumAltitude = samples.compactMap { $0.gps2?.altitude }.max() ?? 0
         secondaryMaximumSpeed = samples.compactMap { $0.gps2?.speed }.max() ?? 0
+        slowIndex = currentIndex
     }
 
     /// Avec le GPS2 actif, ses valeurs prennent la place des champs GPS principaux (le vent reste celui
@@ -646,6 +687,7 @@ final class FlightViewModel {
             frontPlayer.pause()
             backPlayer.pause()
             isPlaying = false
+            slowIndex = currentIndex
         } else {
             guard frontPlayer.currentItem != nil else {
                 errorMessage = "La vidéo front.mp4 n’est pas disponible."
@@ -998,6 +1040,9 @@ extension TimeInterval {
     var clockString: String {
         guard isFinite else { return "00:00" }
         let total = max(0, Int(self))
-        return String(format: "%02d:%02d", total / 60, total % 60)
+        // Formatage manuel : `String(format:)` est coûteux et appelé à chaque rafraîchissement.
+        let minutes = total / 60
+        let seconds = total % 60
+        return (minutes < 10 ? "0" : "") + "\(minutes):" + (seconds < 10 ? "0" : "") + "\(seconds)"
     }
 }

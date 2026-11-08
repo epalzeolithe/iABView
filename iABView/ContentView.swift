@@ -49,6 +49,7 @@ struct ContentView: View {
     @State private var preferredCompactColumn: NavigationSplitViewColumn = .detail
     @State private var bookmarkName = ""
     @State private var isBookmarkDialogPresented = false
+    @State private var bookmarkTimeText = ""
     @State private var isLastBundleDialogPresented = false
     @State private var didAskToRestoreLastBundle = false
     @State private var isBundleImporterPresented = false
@@ -153,7 +154,12 @@ struct ContentView: View {
             }
             Button("Annuler", role: .cancel) {}
         } message: {
-            Text("Le bookmark sera créé à \(model.currentTime.clockString).")
+            Text("Le bookmark sera créé à \(bookmarkTimeText).")
+        }
+        // Heure figée à l'ouverture du dialogue : lire `currentTime` dans le message ferait
+        // réévaluer tout `ContentView` (et donc l'espace de travail) à chaque tick de lecture.
+        .onChange(of: isBookmarkDialogPresented) { _, isPresented in
+            if isPresented { bookmarkTimeText = model.currentTime.clockString }
         }
         .sheet(isPresented: $isChaseCamPresented) {
             #if os(macOS)
@@ -663,44 +669,51 @@ struct FlightWorkspace: View {
     }
 
     private func regularWorkspace(in size: CGSize) -> some View {
+        // Ce corps ne lit aucune valeur du modèle qui change pendant la lecture : chaque bloc
+        // est enveloppé dans un `ObservationScope` pour que seul le bloc concerné soit
+        // réévalué à chaque tick de `currentIndex`, et non tout l'espace de travail.
         VStack(spacing: 6) {
-            videoRow
+            ObservationScope { videoRow }
                 .frame(height: max(320, size.height * 0.48))
 
             instrumentRow
                 .frame(maxHeight: .infinity)
                 .layoutPriority(1)
 
-            CompactTelemetryStrips(
-                samples: model.chartSamples,
-                currentTime: model.currentTime,
-                duration: model.duration,
-                isZoomed: model.isTimelineZoomed,
-                mountingPitch: model.mountingPitch,
-                maximumAltitude: model.maximumAltitude,
-                bookmarks: model.bookmarks,
-                videoFrameRate: model.frontVideoFrameRate
-            )
-            .frame(height: 54)
-
-            ZStack(alignment: .leading) {
-                BookmarkTimelineSlider(
-                    value: Binding(
-                        get: { model.currentTime },
-                        set: model.seek
-                    ),
+            ObservationScope {
+                CompactTelemetryStrips(
+                    samples: model.chartSamples,
+                    currentTime: model.slowTime,
                     duration: model.duration,
+                    isZoomed: model.isTimelineZoomed,
+                    mountingPitch: model.mountingPitch,
+                    maximumAltitude: model.maximumAltitude,
                     bookmarks: model.bookmarks,
                     videoFrameRate: model.frontVideoFrameRate
                 )
+            }
+            .frame(height: 54)
 
-                Text(model.currentTime.clockString)
-                    .font(.caption.monospacedDigit())
-                    .frame(width: 48, alignment: .trailing)
+            ObservationScope {
+                ZStack(alignment: .leading) {
+                    BookmarkTimelineSlider(
+                        value: Binding(
+                            get: { model.slowTime },
+                            set: model.seek
+                        ),
+                        duration: model.duration,
+                        bookmarks: model.bookmarks,
+                        videoFrameRate: model.frontVideoFrameRate
+                    )
+
+                    Text(model.slowTime.clockString)
+                        .font(.caption.monospacedDigit())
+                        .frame(width: 48, alignment: .trailing)
+                }
             }
 
             #if os(macOS)
-            playbackControls
+            ObservationScope { playbackControls }
             #endif
         }
         .padding(6)
@@ -782,15 +795,17 @@ struct FlightWorkspace: View {
     private func instrumentRowContent(in workspaceSize: CGSize) -> some View {
         HStack(spacing: 6) {
                 ZStack(alignment: .topTrailing) {
-                    aircraftView(sample: model.renderingSample)
-                    AircraftReadoutOverlay(
-                        sample: model.currentSample,
-                        loadFactor: model.currentSignedLoadFactor,
-                        minimumLoadFactor: model.minimumLoadFactor,
-                        maximumLoadFactor: model.maximumLoadFactor,
-                        mountingPitch: model.mountingPitch,
-                        isCameraInverted: model.isCameraInverted
-                    )
+                    ObservationScope { aircraftView(sample: model.renderingSample) }
+                    ObservationScope {
+                        AircraftReadoutOverlay(
+                            sample: model.currentSample,
+                            loadFactor: model.currentSignedLoadFactor,
+                            minimumLoadFactor: model.minimumLoadFactor,
+                            maximumLoadFactor: model.maximumLoadFactor,
+                            mountingPitch: model.mountingPitch,
+                            isCameraInverted: model.isCameraInverted
+                        )
+                    }
                     .padding(8)
                     #if os(macOS)
                     detachButton(action: onDetachAircraft)
@@ -813,13 +828,15 @@ struct FlightWorkspace: View {
                 // run taller than the row and get clipped.
                 let horizonSize = max(60, (workspaceSize.height - 8) / 2)
 
-                TelemetryPanel(
-                    sample: model.currentSample,
-                    signedLoadFactor: model.currentSignedLoadFactor,
-                    mountingPitch: model.mountingPitch,
-                    isCameraInverted: model.isCameraInverted,
-                    horizonSize: horizonSize
-                )
+                ObservationScope {
+                    TelemetryPanel(
+                        sample: model.currentSample,
+                        signedLoadFactor: model.currentSignedLoadFactor,
+                        mountingPitch: model.mountingPitch,
+                        isCameraInverted: model.isCameraInverted,
+                        horizonSize: horizonSize
+                    )
+                }
                 .frame(width: horizonSize, height: horizonSize * 2 + 8)
                 .frame(maxHeight: .infinity)
 
@@ -839,12 +856,14 @@ struct FlightWorkspace: View {
                 }
                 #endif
 
-                FlightMapView(
-                    coordinates: model.routeCoordinates,
-                    sample: model.currentSample,
-                    metar: model.currentMETAR,
-                    routeProgress: model.routeProgress
-                )
+                ObservationScope {
+                    FlightMapView(
+                        coordinates: model.routeCoordinates,
+                        sample: model.slowSample,
+                        metar: model.slowMETAR,
+                        routeProgress: model.slowRouteProgress
+                    )
+                }
                 .frame(minWidth: 260)
                 #if !os(macOS)
                 .contentShape(Rectangle())
@@ -906,6 +925,16 @@ struct FlightWorkspace: View {
         .controlSize(.small)
         .padding(6)
         .help("Détacher cette vue")
+    }
+}
+
+/// Évalue son contenu dans son propre corps : les valeurs observées lues par `content`
+/// n'invalident que cette vue, et non la vue parente qui la construit.
+private struct ObservationScope<Content: View>: View {
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        content()
     }
 }
 
