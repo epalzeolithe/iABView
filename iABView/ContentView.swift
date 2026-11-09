@@ -44,6 +44,7 @@ struct ContentView: View {
     @State private var recorder = ScreenRecorder()
     @State private var detachedWindows = DetachedWindowManager()
     @State private var isChaseCamPresented = false
+    @State private var isChaseCam3DPresented = false
     @State private var isKeyboardHelpPresented = false
     @State private var columnVisibility: NavigationSplitViewVisibility = .detailOnly
     @State private var preferredCompactColumn: NavigationSplitViewColumn = .detail
@@ -177,6 +178,14 @@ struct ContentView: View {
             )
             #endif
         }
+        .sheet(isPresented: $isChaseCam3DPresented) {
+            #if os(macOS)
+            ChaseCam3DView(model: model)
+                .frame(minWidth: 900, minHeight: 650)
+            #else
+            ChaseCam3DView(model: model)
+            #endif
+        }
         .sheet(isPresented: $isKeyboardHelpPresented) {
             KeyboardShortcutsView()
         }
@@ -236,6 +245,13 @@ struct ContentView: View {
                         isChaseCamPresented = true
                     } label: {
                         Label("Cam", systemImage: "binoculars.fill")
+                    }
+                    .disabled(model.samples.isEmpty)
+
+                    Button {
+                        isChaseCam3DPresented = true
+                    } label: {
+                        Label("Cam 3D", systemImage: "airplane.circle.fill")
                     }
                     .disabled(model.samples.isEmpty)
 
