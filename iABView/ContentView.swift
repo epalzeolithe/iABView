@@ -796,7 +796,7 @@ struct FlightWorkspace: View {
         .padding(6)
     }
 
-    /// Chase cam 3D en petit format, en haut à gauche de la vidéo de droite ; un clic ouvre la fenêtre.
+    /// Chase cam 3D en petit format, en haut à gauche de la première vidéo (caméra avant) ; un clic ouvre la fenêtre.
     private var chaseCamInset: some View {
         ChaseCamInsetView(model: model, onOpen: onOpenChaseCam3D)
     }
@@ -831,6 +831,12 @@ struct FlightWorkspace: View {
                 fullScreenVideo = .front
             }
             #endif
+            // Posée après les gestes de la vidéo : un clic sur l'incrustation n'ouvre pas la vidéo.
+            .overlay(alignment: .topLeading) {
+                if model.showsChaseCamInset && !model.isChaseCam3DWindowOpen {
+                    chaseCamInset
+                }
+            }
             ZStack(alignment: .topTrailing) {
                 VideoPane(
                     title: "Caméra arrière",
@@ -865,12 +871,6 @@ struct FlightWorkspace: View {
                 fullScreenVideo = .back
             }
             #endif
-            // Posée après les gestes de la vidéo : un clic sur l'incrustation n'ouvre pas la vidéo.
-            .overlay(alignment: .topLeading) {
-                if model.showsChaseCamInset && !model.isChaseCam3DWindowOpen {
-                    chaseCamInset
-                }
-            }
         }
     }
 

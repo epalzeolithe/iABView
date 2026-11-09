@@ -9,11 +9,13 @@ struct ABVCreatorView: View {
     @State private var isImporterPresented = false
     @State private var isDropTargeted = false
     @State private var isTestingGyroflow = false
+    @State private var isGyroflowImporterPresented = false
     @AppStorage("ABVCreator.showConsole") private var showConsole = false
     @AppStorage(ABVAccelerationSource.storageKey) private var accelerationSource = ABVAccelerationSource.gyroflow
     @AppStorage(ABVIntegrationMethod.storageKey) private var integrationMethod = ABVIntegrationMethod.gyroflowDefault
     @AppStorage(ABVHighResolution.storageKey) private var highResolution = false
     @State private var gyroflowTestResult: (succeeded: Bool, message: String)?
+    @AppStorage(ABVGyroflowBinary.storageKey) private var gyroflowCustomPath = ""
 
     var body: some View {
         VStack(spacing: 0) {
@@ -270,6 +272,7 @@ struct ABVCreatorView: View {
     private var footer: some View {
         VStack(alignment: .leading, spacing: 12) {
             toolStatusRow
+            gyroflowBinaryRow
 
             HStack(spacing: 12) {
                 Toggle("Aperçu (1 min de vidéo)", isOn: $model.isPreview)
@@ -383,6 +386,45 @@ struct ABVCreatorView: View {
                     .foregroundStyle(gyroflowTestResult.succeeded ? Color.green : Color.red)
             }
             Spacer()
+        }
+        .onChange(of: gyroflowCustomPath) {
+            gyroflowTestResult = nil
+        }
+    }
+
+    /// Choix du binaire Gyroflow : celui de /Applications par défaut, ou un binaire personnalisé.
+    private var gyroflowBinaryRow: some View {
+        HStack(spacing: 12) {
+            Text("Binaire Gyroflow")
+            if gyroflowCustomPath.isEmpty {
+                Text("Par défaut (/Applications)")
+                    .foregroundStyle(.secondary)
+            } else {
+                Text(gyroflowCustomPath)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(gyroflowCustomPath)
+            }
+            Spacer()
+            Button("Choisir…") {
+                isGyroflowImporterPresented = true
+            }
+            Button("Binaire par défaut") {
+                gyroflowCustomPath = ""
+            }
+            .disabled(gyroflowCustomPath.isEmpty)
+        }
+        .controlSize(.small)
+        .disabled(model.state == .running)
+        .fileImporter(
+            isPresented: $isGyroflowImporterPresented,
+            allowedContentTypes: [.item]
+        ) { result in
+            guard case .success(let url) = result else { return }
+            gyroflowCustomPath = ABVGyroflowBinary.executablePath(for: url)
+            // Test immédiat du binaire choisi.
+            testGyroflow()
         }
     }
 

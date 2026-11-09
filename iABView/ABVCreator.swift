@@ -292,6 +292,23 @@ enum ABVHighResolution {
     }
 }
 
+/// Binaire Gyroflow personnalisé choisi dans le créateur. Vide : binaire de base de /Applications.
+enum ABVGyroflowBinary {
+    static let storageKey = "ABVCreator.gyroflowCustomPath"
+
+    static var customPath: String? {
+        UserDefaults.standard.string(forKey: storageKey).flatMap { $0.isEmpty ? nil : $0 }
+    }
+
+    /// Résout une sélection : un bundle .app désigne son exécutable `Contents/MacOS/gyroflow`.
+    static func executablePath(for url: URL) -> String {
+        if url.pathExtension.lowercased() == "app" {
+            return url.appendingPathComponent("Contents/MacOS/gyroflow").path
+        }
+        return url.path
+    }
+}
+
 enum ABVTool: String, CaseIterable, Identifiable, Sendable {
     case exiftool
     case ffmpeg
@@ -333,7 +350,8 @@ enum ABVTool: String, CaseIterable, Identifiable, Sendable {
                 "/usr/local/bin/gyro2bb"
             ]
         case .gyroflow:
-            [
+            // Un binaire personnalisé remplace entièrement les emplacements par défaut.
+            ABVGyroflowBinary.customPath.map { [$0] } ?? [
                 "/Applications/Gyroflow.app/Contents/MacOS/gyroflow",
                 NSHomeDirectory() + "/Applications/Gyroflow.app/Contents/MacOS/gyroflow",
                 "/opt/homebrew/bin/gyroflow",
