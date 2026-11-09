@@ -49,6 +49,19 @@ final class DetachedWindowManager {
         }
     }
 
+    func showChaseCam3D(model: FlightViewModel) {
+        show(
+            id: "chase-cam-3d",
+            title: "ABView — Cam 3D",
+            size: NSSize(width: 1_100, height: 750),
+            onClose: { model.setChaseCam3DWindowOpen(false) }
+        ) {
+            ChaseCam3DView(model: model)
+        }
+        // L'incrustation est retirée tant que la fenêtre complète tourne (économie de CPU).
+        model.setChaseCam3DWindowOpen(true)
+    }
+
     func closeAll() {
         for controller in controllers.values {
             controller.close()
@@ -61,6 +74,7 @@ final class DetachedWindowManager {
         id: String,
         title: String,
         size: NSSize,
+        onClose: (() -> Void)? = nil,
         @ViewBuilder content: () -> Content
     ) {
         if let window = controllers[id]?.window {
@@ -82,6 +96,7 @@ final class DetachedWindowManager {
         let observer = WindowCloseObserver { [weak self] in
             self?.controllers[id] = nil
             self?.delegates[id] = nil
+            onClose?()
         }
         window.delegate = observer
 
@@ -160,6 +175,7 @@ struct DetachedAircraftView: View {
             showsAxes: model.shows3DAxes,
             showsVerticalGrid: model.showsVerticalGrid,
             showsTrajectoryTrail: model.showsTrajectoryTrail,
+            usesAbsoluteHeading: model.usesAbsoluteHeading,
             accelerationX: sample?.accelerationX ?? 0,
             accelerationY: sample?.accelerationY ?? 0,
             accelerationZ: sample?.accelerationZ ?? 0,
@@ -189,5 +205,6 @@ final class DetachedWindowManager {
     func showBackVideo(model: FlightViewModel) {}
     func showAircraft(model: FlightViewModel) {}
     func showGPS(model: FlightViewModel) {}
+    func showChaseCam3D(model: FlightViewModel) {}
 }
 #endif

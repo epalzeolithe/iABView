@@ -22,6 +22,8 @@ struct Aircraft3DView: PlatformViewRepresentable {
     let showsAxes: Bool
     let showsVerticalGrid: Bool
     let showsTrajectoryTrail: Bool
+    /// Oriente l'avion sur son cap absolu (`heading` GPS) par une rotation autour de la verticale.
+    let usesAbsoluteHeading: Bool
     let accelerationX: Double
     let accelerationY: Double
     let accelerationZ: Double
@@ -83,7 +85,10 @@ struct Aircraft3DView: PlatformViewRepresentable {
         // visual benefit. `isPlaying` alone keeps `updateAtTime` firing every
         // frame, which is all the realtime attitude sync needs.
         view.rendersContinuously = false
-        view.defaultCameraController.target = SCNVector3Zero
+        // Orbite autour du pivot de l'avion ; sans `automaticTarget = false`, SceneKit
+        // recalcule la cible à chaque clic d'après l'objet touché et décentre la vue.
+        view.defaultCameraController.automaticTarget = false
+        view.defaultCameraController.target = SCNVector3(0, 0.8, 0)
         return view
     }
 
@@ -93,11 +98,14 @@ struct Aircraft3DView: PlatformViewRepresentable {
             samplesRevision: samplesRevision,
             player: player,
             mountingPitch: mountingPitch,
-            isInverted: isInverted
+            isInverted: isInverted,
+            usesAbsoluteHeading: usesAbsoluteHeading
         )
         context.coordinator.loadModelIfNeeded(from: modelURL)
         context.coordinator.axes.isHidden = !showsAxes
         context.coordinator.verticalGrid.isHidden = !showsVerticalGrid
+        context.coordinator.northVector.isHidden = !usesAbsoluteHeading
+        context.coordinator.setGeographicAxes(usesAbsoluteHeading)
         context.coordinator.trajectoryTrail.isHidden = !showsTrajectoryTrail
         context.coordinator.leftWingtipTrail.isHidden = !showsTrajectoryTrail
         context.coordinator.rightWingtipTrail.isHidden = !showsTrajectoryTrail
@@ -121,6 +129,12 @@ struct Aircraft3DView: PlatformViewRepresentable {
         private let modelRoot = SCNNode()
         let axes = SCNNode()
         let verticalGrid = SCNNode()
+        /// Vecteur du nord (-Z de la scène), visible uniquement en mode cap absolu.
+        let northVector = SCNNode()
+        /// Axe Z (ligne + libellé) : masqué quand le nord est affiché, car il lui est colinéaire.
+        private let zAxis = SCNNode()
+        private lazy var xAxisLabel = axisLabel("X", color: .systemRed, position: SCNVector3(3.15, 0, 0))
+        private lazy var yAxisLabel = axisLabel("Y", color: .systemGreen, position: SCNVector3(0, 3.15, 0))
         private let groundGrid = SCNNode()
         private var groundGridOffsetX: Float = 0
         private var groundGridOffsetZ: Float = 0
@@ -144,6 +158,9 @@ struct Aircraft3DView: PlatformViewRepresentable {
         private weak var player: AVPlayer?
         private var realtimeMountingPitch = 15.0
         private var realtimeIsInverted = false
+        private var realtimeUsesAbsoluteHeading = false
+        /// Dernière correction de cap valide, conservée quand le nez est trop vertical pour définir un azimut.
+        private var lastHeadingCorrectionAngle: Float = 0
         private let realtimeLock = NSLock()
         private var lastUpdateSeconds: TimeInterval?
         private var lastTrailRebuildSeconds: TimeInterval = -.infinity
@@ -159,12 +176,21 @@ struct Aircraft3DView: PlatformViewRepresentable {
             samplesRevision: Int,
             player: AVPlayer,
             mountingPitch: Double,
-            isInverted: Bool
+            isInverted: Bool,
+            usesAbsoluteHeading: Bool
         ) {
             realtimeLock.lock()
             defer { realtimeLock.unlock() }
             realtimeMountingPitch = mountingPitch
             realtimeIsInverted = isInverted
+            if realtimeUsesAbsoluteHeading != usesAbsoluteHeading {
+                realtimeUsesAbsoluteHeading = usesAbsoluteHeading
+                // Force le recalcul de l'avion, de la traînée et de la grille même en pause.
+                lastUpdateSeconds = nil
+                resetHeadingEstimate()
+                lastTrajectoryTrailIndex = -1
+                lastTrailRebuildSeconds = -.infinity
+            }
 
             let needsRestart = self.player !== player
                 || realtimeRevision != samplesRevision
@@ -248,6 +274,102 @@ struct Aircraft3DView: PlatformViewRepresentable {
             return zUpToYUp * orientation * zUpToYUp.inverse
         }
 
+        // Angle (autour de l'axe Y de la scène) qui amène l'azimut du nez sur le cap absolu.
+        // Cap = sens horaire vu du dessus depuis le nord (-Z de la scène) ; une rotation
+        // positive autour de +Y est anti-horaire, d'où `azimut - cap`. Nil si le nez est
+        // quasi vertical (azimut indéfini).
+        private func headingCorrectionAngle(sceneForward forward: SIMD3<Float>, heading: Double) -> Float? {
+            guard simd_length(SIMD2<Float>(forward.x, forward.z)) > 0.05 else { return nil }
+            let azimuth = atan2(forward.x, -forward.z)
+            return azimuth - Float(heading * .pi / 180)
+        }
+
+        // Le décalage entre le yaw des gyros et le nord est quasi constant : on l'estime
+        // (filtre complémentaire) au lieu de le recalculer à chaque instant. L'azimut du nez
+        // n'est une mesure fiable que quand le nez est assez proche de l'horizontale ; près de
+        // la verticale (Immelmann, boucle) il bascule de 180° alors que le cap GPS ne change
+        // pas. Hors zone fiable le décalage est donc gelé et les gyros portent seuls l'attitude.
+        private let headingOffsetTimeConstant: Float = 3
+        private var lastHeadingEstimateUptime: TimeInterval?
+        private var headingOffsetIsSeeded = false
+        private var hasHeadingEstimate = false
+        private var previousNoseForward: SIMD3<Float>?
+
+        private func smoothstep(_ x: Float, _ low: Float, _ high: Float) -> Float {
+            let t = max(0, min(1, (x - low) / (high - low)))
+            return t * t * (3 - 2 * t)
+        }
+
+        private func resetHeadingEstimate() {
+            lastHeadingEstimateUptime = nil
+            headingOffsetIsSeeded = false
+            previousNoseForward = nil
+        }
+
+        private func updateHeadingOffset(
+            sceneForward forward: SIMD3<Float>,
+            sceneUp up: SIMD3<Float>,
+            heading: Double,
+            speed: Double,
+            loadFactor: Double?
+        ) {
+            let now = ProcessInfo.processInfo.systemUptime
+            let dt = lastHeadingEstimateUptime.map { Float(now - $0) }
+            defer {
+                lastHeadingEstimateUptime = now
+                previousNoseForward = forward
+            }
+
+            // Confiance : nez proche de l'horizontale (tangage < ~35° pleine, < ~50° nulle)…
+            let horizontal = simd_length(SIMD2<Float>(forward.x, forward.z))
+            var weight = smoothstep(horizontal, 0.64, 0.82)
+            // …cap GPS significatif (route sol non définie à l'arrêt)…
+            weight *= smoothstep(Float(speed), 30, 60)
+            // …route sol ≈ cap du nez : le GPS se dégrade en figures (facteur de charge loin de
+            // 1 g, forte inclinaison latérale → dérapage et filtrage GPS en retard). Le vol dos
+            // stabilisé (|up.y| ≈ 1, ~1 g) reste fiable…
+            if let loadFactor {
+                weight *= 1 - smoothstep(Float(abs(loadFactor - 1)), 0.25, 0.7)
+            }
+            weight *= smoothstep(abs(up.y), 0.5, 0.8)
+            // …et attitude stable : un fort taux de rotation du nez amplifie la désynchronisation
+            // entre GPS et gyros.
+            if let dt, dt > 0, dt < 1, let previous = previousNoseForward {
+                let angle = acos(max(-1, min(1, simd_dot(previous, forward))))
+                weight *= 1 - smoothstep(angle / dt, 0.5, 1.5)
+            }
+            guard let target = headingCorrectionAngle(sceneForward: forward, heading: heading) else { return }
+
+            guard headingOffsetIsSeeded else {
+                // Calage (début de lecture ou après un seek) : recalage immédiat dès que la
+                // mesure est fiable, sans glissement. Tant qu'elle ne l'est pas, on garde le
+                // dernier décalage connu (l'avion ne tourne pas à vide) ; seul le tout premier
+                // calage adopte une mesure médiocre plutôt que de partir de 0.
+                if weight > 0.5 {
+                    lastHeadingCorrectionAngle = target
+                    headingOffsetIsSeeded = true
+                    hasHeadingEstimate = true
+                } else if !hasHeadingEstimate {
+                    lastHeadingCorrectionAngle = target
+                }
+                return
+            }
+            guard weight > 0 else { return }
+            guard let dt, dt < 1 else {
+                // Saut dans la vidéo : recalage immédiat seulement si la mesure est bonne.
+                if weight > 0.5 { lastHeadingCorrectionAngle = target }
+                return
+            }
+            var delta = (target - lastHeadingCorrectionAngle).truncatingRemainder(dividingBy: 2 * .pi)
+            if delta > .pi { delta -= 2 * .pi }
+            if delta < -.pi { delta += 2 * .pi }
+            lastHeadingCorrectionAngle += delta * weight * (1 - exp(-dt / headingOffsetTimeConstant))
+        }
+
+        private func yawQuaternion(_ angle: Float) -> simd_quatf {
+            simd_quatf(angle: angle, axis: SIMD3<Float>(0, 1, 0))
+        }
+
         // The aircraft's nose-forward direction (body axis (0, 1, 0)), transformed into
         // SceneKit's Y-up scene space for use in world-space vector math (e.g. the trail).
         private func sceneForward(
@@ -256,7 +378,8 @@ struct Aircraft3DView: PlatformViewRepresentable {
             quaternionY: Double,
             quaternionZ: Double,
             mountingPitch: Double,
-            isInverted: Bool
+            isInverted: Bool,
+            yawOffset: Float? = nil
         ) -> SIMD3<Float> {
             let orientation = bodyOrientation(
                 quaternionW: quaternionW,
@@ -266,7 +389,9 @@ struct Aircraft3DView: PlatformViewRepresentable {
                 mountingPitch: mountingPitch,
                 isInverted: isInverted
             )
-            return zUpToYUp.act(orientation.act(SIMD3<Float>(0, 1, 0)))
+            let forward = zUpToYUp.act(orientation.act(SIMD3<Float>(0, 1, 0)))
+            guard let yawOffset else { return forward }
+            return yawQuaternion(yawOffset).act(forward)
         }
 
         // The aircraft's right-wing direction (body axis (1, 0, 0)), transformed into
@@ -278,7 +403,8 @@ struct Aircraft3DView: PlatformViewRepresentable {
             quaternionY: Double,
             quaternionZ: Double,
             mountingPitch: Double,
-            isInverted: Bool
+            isInverted: Bool,
+            yawOffset: Float? = nil
         ) -> SIMD3<Float> {
             let orientation = bodyOrientation(
                 quaternionW: quaternionW,
@@ -288,7 +414,9 @@ struct Aircraft3DView: PlatformViewRepresentable {
                 mountingPitch: mountingPitch,
                 isInverted: isInverted
             )
-            return zUpToYUp.act(orientation.act(SIMD3<Float>(1, 0, 0)))
+            let right = zUpToYUp.act(orientation.act(SIMD3<Float>(1, 0, 0)))
+            guard let yawOffset else { return right }
+            return yawQuaternion(yawOffset).act(right)
         }
 
         func updateAircraft(
@@ -299,9 +427,11 @@ struct Aircraft3DView: PlatformViewRepresentable {
             speed: Double,
             mountingPitch: Double? = nil,
             isInverted: Bool? = nil,
+            heading: Double? = nil,
+            loadFactor: Double? = nil,
             updatesFlightVector: Bool = true
         ) {
-            let sceneOrientation = sceneOrientation(
+            var sceneOrientation = sceneOrientation(
                 quaternionW: quaternionW,
                 quaternionX: quaternionX,
                 quaternionY: quaternionY,
@@ -309,6 +439,20 @@ struct Aircraft3DView: PlatformViewRepresentable {
                 mountingPitch: mountingPitch ?? realtimeMountingPitch,
                 isInverted: isInverted ?? realtimeIsInverted
             )
+            if let heading {
+                // Le nez, dans l'espace de la scène, est l'image de (0, 0, -1) par sceneOrientation.
+                let forward = sceneOrientation.act(SIMD3<Float>(0, 0, -1))
+                // Dessus de l'avion (axe corps (0, 0, 1)) dans la scène.
+                let up = sceneOrientation.act(zUpToYUp.act(SIMD3<Float>(0, 0, 1)))
+                updateHeadingOffset(
+                    sceneForward: forward,
+                    sceneUp: up,
+                    heading: heading,
+                    speed: speed,
+                    loadFactor: loadFactor
+                )
+                sceneOrientation = yawQuaternion(lastHeadingCorrectionAngle) * sceneOrientation
+            }
             SCNTransaction.begin()
             SCNTransaction.disableActions = true
             if updatesFlightVector {
@@ -324,6 +468,7 @@ struct Aircraft3DView: PlatformViewRepresentable {
             let player = player
             let mountingPitch = realtimeMountingPitch
             let isInverted = realtimeIsInverted
+            let usesAbsoluteHeading = realtimeUsesAbsoluteHeading
             realtimeLock.unlock()
 
             guard let player, !samples.isEmpty else {
@@ -335,6 +480,12 @@ struct Aircraft3DView: PlatformViewRepresentable {
             let seconds = player.currentTime().seconds
             guard seconds.isFinite else { return }
             guard lastUpdateSeconds != seconds else { return }
+            // Un saut du temps de lecture (seek, boucle) invalide le décalage de cap : le yaw
+            // des gyros a dérivé entre les deux endroits du vol. Les images consécutives d'une
+            // lecture normale sont à quelques dizaines de ms, même à vitesse accélérée.
+            if usesAbsoluteHeading, let previous = lastUpdateSeconds, abs(seconds - previous) > 0.5 {
+                resetHeadingEstimate()
+            }
             lastUpdateSeconds = seconds
             let index = sampleIndex(at: seconds, in: samples)
             let sample = samples[index]
@@ -346,6 +497,12 @@ struct Aircraft3DView: PlatformViewRepresentable {
                 speed: sample.speed,
                 mountingPitch: mountingPitch,
                 isInverted: isInverted,
+                heading: usesAbsoluteHeading ? sample.heading : nil,
+                loadFactor: usesAbsoluteHeading
+                    ? simd_length(SIMD3<Double>(
+                        sample.accelerationX, sample.accelerationY, sample.accelerationZ
+                    )) / 9.80665
+                    : nil,
                 updatesFlightVector: false
             )
             updateGroundGridScroll(sample: sample, seconds: seconds)
@@ -411,7 +568,8 @@ struct Aircraft3DView: PlatformViewRepresentable {
                     quaternionY: sample.quaternionY,
                     quaternionZ: sample.quaternionZ,
                     mountingPitch: realtimeMountingPitch,
-                    isInverted: realtimeIsInverted
+                    isInverted: realtimeIsInverted,
+                    yawOffset: realtimeUsesAbsoluteHeading ? lastHeadingCorrectionAngle : nil
                 )
                 let dt = Float(max(0, sample.elapsed - previous.elapsed))
                 accumulated -= forward * Float(sample.speed / 3.6) * dt
@@ -425,7 +583,8 @@ struct Aircraft3DView: PlatformViewRepresentable {
                     quaternionY: sample.quaternionY,
                     quaternionZ: sample.quaternionZ,
                     mountingPitch: realtimeMountingPitch,
-                    isInverted: realtimeIsInverted
+                    isInverted: realtimeIsInverted,
+                    yawOffset: realtimeUsesAbsoluteHeading ? lastHeadingCorrectionAngle : nil
                 )
             }
 
@@ -654,9 +813,13 @@ struct Aircraft3DView: PlatformViewRepresentable {
             fallbackModel.addChildNode(makeNose())
             modelRoot.addChildNode(fallbackModel)
             configureAxes()
+            // Repère centré sur le pivot de l'avion, comme la cible de la caméra.
+            axes.simdPosition = SIMD3<Float>(0, 0.8, 0)
             configureVerticalGrid()
+            configureNorthVector()
             scene.rootNode.addChildNode(axes)
             scene.rootNode.addChildNode(verticalGrid)
+            scene.rootNode.addChildNode(northVector)
             scene.rootNode.addChildNode(trajectoryTrail)
             scene.rootNode.addChildNode(leftWingtipTrail)
             scene.rootNode.addChildNode(rightWingtipTrail)
@@ -821,6 +984,14 @@ struct Aircraft3DView: PlatformViewRepresentable {
             return geometry
         }
 
+        // En mode cap absolu, la scène est lue comme un repère géographique : X = Est,
+        // Y = verticale (libellé « Z »), et l'axe Z de la scène (colinéaire au nord) est masqué.
+        func setGeographicAxes(_ enabled: Bool) {
+            zAxis.isHidden = enabled
+            (xAxisLabel.geometry as? SCNText)?.string = enabled ? "E" : "X"
+            (yAxisLabel.geometry as? SCNText)?.string = enabled ? "Z" : "Y"
+        }
+
         private func configureAxes() {
             axes.addChildNode(
                 coloredLine(
@@ -836,17 +1007,40 @@ struct Aircraft3DView: PlatformViewRepresentable {
                     color: .systemGreen
                 )
             )
-            axes.addChildNode(
+            zAxis.addChildNode(
                 coloredLine(
                     from: SCNVector3Zero,
                     to: SCNVector3(0, 0, 3),
                     color: .systemBlue
                 )
             )
-            axes.addChildNode(axisLabel("X", color: .systemRed, position: SCNVector3(3.15, 0, 0)))
-            axes.addChildNode(axisLabel("Y", color: .systemGreen, position: SCNVector3(0, 3.15, 0)))
-            axes.addChildNode(axisLabel("Z", color: .systemBlue, position: SCNVector3(0, 0, 3.15)))
+            axes.addChildNode(xAxisLabel)
+            axes.addChildNode(yAxisLabel)
+            zAxis.addChildNode(axisLabel("Z", color: .systemBlue, position: SCNVector3(0, 0, 3.15)))
+            axes.addChildNode(zAxis)
             axes.isHidden = true
+        }
+
+        // Flèche du nord à hauteur du pivot de l'avion : le nord est l'axe -Z de la scène,
+        // c'est la référence à partir de laquelle le mode cap absolu mesure le cap.
+        private func configureNorthVector() {
+            let length: Float = 3
+            let color = PlatformColor.systemOrange
+            northVector.simdPosition = SIMD3<Float>(0, 0.8, 0)
+            northVector.addChildNode(
+                coloredLine(from: SCNVector3Zero, to: SCNVector3(0, 0, -length), color: color)
+            )
+            let cone = SCNCone(topRadius: 0, bottomRadius: 0.08, height: 0.28)
+            cone.firstMaterial?.diffuse.contents = color
+            cone.firstMaterial?.lightingModel = .constant
+            let head = SCNNode(geometry: cone)
+            head.simdPosition = SIMD3<Float>(0, 0, -length)
+            head.simdOrientation = simd_quatf(angle: -.pi / 2, axis: SIMD3<Float>(1, 0, 0))
+            northVector.addChildNode(head)
+            northVector.addChildNode(
+                axisLabel("N", color: color, position: SCNVector3(0, 0.2, -length - 0.3))
+            )
+            northVector.isHidden = true
         }
 
         private func axisLabel(_ text: String, color: PlatformColor, position: SCNVector3) -> SCNNode {
@@ -922,7 +1116,8 @@ struct Aircraft3DView: PlatformViewRepresentable {
                 quaternionY: sample.quaternionY,
                 quaternionZ: sample.quaternionZ,
                 mountingPitch: realtimeMountingPitch,
-                isInverted: realtimeIsInverted
+                isInverted: realtimeIsInverted,
+                yawOffset: realtimeUsesAbsoluteHeading ? lastHeadingCorrectionAngle : nil
             )
             // forward.x/z are the horizontal (ground-plane) components of the unit
             // nose vector, i.e. speed already projected onto the ground by cos(pitch
@@ -978,7 +1173,7 @@ struct Aircraft3DView: PlatformViewRepresentable {
             let node = SCNNode()
             node.camera = camera
             node.simdPosition = SIMD3<Float>(7.2, 4.2, 5.4)
-            node.look(at: SCNVector3(0, 0.4, 0))
+            node.look(at: SCNVector3(0, 0.8, 0))
             return node
         }
 

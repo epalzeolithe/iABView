@@ -1,19 +1,25 @@
 import AVFoundation
+import MapKit
 import SceneKit
 import simd
 import SwiftUI
 #if os(macOS)
 import AppKit
 private typealias PlatformColor = NSColor
+private typealias PlatformImage = NSImage
 private typealias PlatformViewRepresentable = NSViewRepresentable
 #else
 import UIKit
 private typealias PlatformColor = UIColor
+private typealias PlatformImage = UIImage
 private typealias PlatformViewRepresentable = UIViewRepresentable
 #endif
 
 /// Cadrages disponibles pour la caméra de poursuite 3D.
 enum ChaseCam3DPreset: String, CaseIterable, Identifiable {
+    /// La caméra réagit au vecteur vitesse : elle s'éloigne et élargit le champ avec la vitesse,
+    /// se déporte à l'extérieur des virages et subit l'inertie des accélérations.
+    case dynamic = "Dynamique"
     case close = "Proche"
     case standard = "Standard"
     case wide = "Large"
@@ -25,6 +31,7 @@ enum ChaseCam3DPreset: String, CaseIterable, Identifiable {
     /// Distance caméra-avion, en mètres.
     var distance: Float {
         switch self {
+        case .dynamic: 32
         case .close: 22
         case .standard: 40
         case .wide: 90
@@ -36,6 +43,7 @@ enum ChaseCam3DPreset: String, CaseIterable, Identifiable {
     /// Élévation de la caméra au-dessus de l'avion, en radians.
     var elevation: Float {
         let degrees: Float = switch self {
+        case .dynamic: 14
         case .close: 12
         case .standard: 18
         case .wide: 25
@@ -51,13 +59,109 @@ enum ChaseCam3DPreset: String, CaseIterable, Identifiable {
     }
 }
 
+private func smoothstep(_ x: Float, _ low: Float, _ high: Float) -> Float {
+    let t = max(0, min(1, (x - low) / (high - low)))
+    return t * t * (3 - 2 * t)
+}
+
+private func wrapAngle(_ angle: Float) -> Float {
+    var wrapped = angle.truncatingRemainder(dividingBy: 2 * .pi)
+    if wrapped > .pi { wrapped -= 2 * .pi }
+    if wrapped < -.pi { wrapped += 2 * .pi }
+    return wrapped
+}
+
+/// Le décalage entre le yaw des gyros et le nord est quasi constant : un filtre complémentaire
+/// l'estime quand l'azimut du nez est une mesure fiable (nez proche de l'horizontale, vol
+/// stabilisé) et le gèle sinon (boucles, figures). `now` est une horloge quelconque en secondes
+/// (uptime en direct, temps du vol pour un calcul hors ligne).
+private struct HeadingEstimator {
+    private let timeConstant: Float = 3
+    private(set) var correction: Float = 0
+    /// Confiance (0…1) de la dernière mesure d'azimut ; au-delà de 0,5 la valeur sert d'ancre.
+    private(set) var lastWeight: Float = 0
+    private var isSeeded = false
+    private var hasEstimate = false
+    private var lastTime: TimeInterval?
+    private var previousForward: SIMD3<Float>?
+
+    mutating func reset() {
+        lastTime = nil
+        isSeeded = false
+        previousForward = nil
+    }
+
+    mutating func update(
+        forward: SIMD3<Float>,
+        up: SIMD3<Float>,
+        heading: Double,
+        speed: Double,
+        loadFactor: Double,
+        now: TimeInterval
+    ) {
+        let dt = lastTime.map { Float(now - $0) }
+        defer {
+            lastTime = now
+            previousForward = forward
+        }
+
+        let horizontal = simd_length(SIMD2<Float>(forward.x, forward.z))
+        var weight = smoothstep(horizontal, 0.64, 0.82)
+        weight *= smoothstep(Float(speed), 30, 60)
+        weight *= 1 - smoothstep(Float(abs(loadFactor - 1)), 0.25, 0.7)
+        weight *= smoothstep(abs(up.y), 0.5, 0.8)
+        if let dt, dt > 0, dt < 1, let previous = previousForward {
+            let angle = acos(max(-1, min(1, simd_dot(previous, forward))))
+            weight *= 1 - smoothstep(angle / dt, 0.5, 1.5)
+        }
+        lastWeight = weight
+        guard horizontal > 0.05 else { return }
+        let target = atan2(forward.x, -forward.z) - Float(heading * .pi / 180)
+
+        guard isSeeded else {
+            if weight > 0.5 {
+                correction = target
+                isSeeded = true
+                hasEstimate = true
+            } else if !hasEstimate {
+                correction = target
+            }
+            return
+        }
+        guard weight > 0 else { return }
+        guard let dt, dt < 1 else {
+            if weight > 0.5 { correction = target }
+            return
+        }
+        correction += wrapAngle(target - correction) * weight * (1 - exp(-dt / timeConstant))
+    }
+}
+
+/// Options de la chase cam 3D incrustée, modifiables par son menu contextuel (clic droit).
+struct ChaseCam3DOptions: Equatable {
+    var preset: ChaseCam3DPreset = .dynamic
+    var showsFullPath = true
+    var showsSatellite = true
+    var smoothsGPS = true
+}
+
 /// Deuxième chase cam : l'avion STL (attitude, cap absolu, traînée) évolue à sa position GPS 3D
 /// réelle, au milieu de la trajectoire complète, filmé par une caméra de poursuite dynamique.
 struct ChaseCam3DView: View {
     let model: FlightViewModel
+    /// Version incrustée (petit format) : sans contrôles ni HUD, rendue à 30 fps avec une mosaïque
+    /// satellite allégée. Ses options viennent de `insetOptions` (menu clic droit de l'incrustation).
+    var isInset = false
+    var insetOptions = ChaseCam3DOptions()
     @Environment(\.dismiss) private var dismiss
     @State private var preset: ChaseCam3DPreset = .standard
     @State private var showsFullPath = true
+    @State private var showsSatellite = true
+    @State private var smoothsGPS = true
+    #if os(macOS)
+    @State private var recorder = ScreenRecorder()
+    @State private var hostWindow: NSWindow?
+    #endif
 
     var body: some View {
         ChaseCam3DScene(
@@ -67,27 +171,57 @@ struct ChaseCam3DView: View {
             modelURL: model.aircraftModelURL,
             mountingPitch: model.mountingPitch,
             isInverted: model.isCameraInverted,
-            preset: preset,
-            showsFullPath: showsFullPath
+            preset: isInset ? insetOptions.preset : preset,
+            showsFullPath: isInset ? insetOptions.showsFullPath : showsFullPath,
+            showsSatellite: isInset ? insetOptions.showsSatellite : showsSatellite,
+            smoothsGPS: isInset ? insetOptions.smoothsGPS : smoothsGPS,
+            isInset: isInset
         )
         .overlay(alignment: .topLeading) {
-            ChaseCam3DHUD(model: model)
-                .padding()
-                .allowsHitTesting(false)
+            if !isInset {
+                ChaseCam3DHUD(model: model)
+                    .padding()
+                    .allowsHitTesting(false)
+            }
         }
         .overlay(alignment: .topTrailing) {
-            controls.padding()
+            if !isInset { controls.padding() }
+        }
+        .overlay(alignment: .bottom) {
+            if !isInset {
+                ChaseCam3DTimeline(model: model)
+                    .padding(.horizontal)
+                    .padding(.vertical, 8)
+                    .background(.black.opacity(0.55))
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        #if os(macOS)
+        .background(WindowReader(window: $hostWindow))
+        .alert(
+            "Erreur d’enregistrement",
+            isPresented: Binding(
+                get: { recorder.errorMessage != nil },
+                set: { if !$0 { recorder.dismissError() } }
+            )
+        ) {
+            Button("OK") { recorder.dismissError() }
+        } message: {
+            Text(recorder.errorMessage ?? "")
+        }
+        #endif
     }
 
     private var controls: some View {
         VStack(alignment: .trailing, spacing: 8) {
+            #if !os(macOS)
+            // Sur macOS la vue vit dans une fenêtre détachée, fermée par ses boutons de fenêtre.
             Button("Fermer", systemImage: "xmark.circle.fill") { dismiss() }
                 .labelStyle(.iconOnly)
                 .font(.title2)
                 .buttonStyle(.plain)
                 .foregroundStyle(.white)
+            #endif
             Picker("Cadrage", selection: $preset) {
                 ForEach(ChaseCam3DPreset.allCases) { Text($0.rawValue).tag($0) }
             }
@@ -96,9 +230,85 @@ struct ChaseCam3DView: View {
             Toggle("Trajectoire complète", isOn: $showsFullPath)
                 .toggleStyle(.switch)
                 .fixedSize()
+            Toggle("Vue satellite", isOn: $showsSatellite)
+                .toggleStyle(.switch)
+                .fixedSize()
+            Toggle("GPS Smoothing", isOn: $smoothsGPS)
+                .toggleStyle(.switch)
+                .fixedSize()
+            #if os(macOS)
+            // Enregistre cette fenêtre (sans le son de l'app) dans `chasecam_NNN.mp4` sur le Bureau.
+            Button {
+                recorder.toggleRecording(window: hostWindow, filePrefix: "chasecam", capturesAudio: false)
+            } label: {
+                Label(
+                    recorder.isRecording ? "Arrêter REC" : "Capture REC",
+                    systemImage: recorder.isRecording ? "stop.fill" : "record.circle"
+                )
+            }
+            .tint(.red)
+            .disabled(hostWindow == nil)
+            #endif
         }
         .padding(10)
         .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 8))
+        .foregroundStyle(.white)
+    }
+}
+
+#if os(macOS)
+/// Donne accès à la `NSWindow` qui héberge la vue SwiftUI (cible de la capture d'écran).
+private struct WindowReader: NSViewRepresentable {
+    @Binding var window: NSWindow?
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        Task { @MainActor in window = view.window }
+        return view
+    }
+
+    func updateNSView(_ view: NSView, context: Context) {
+        Task { @MainActor in
+            if window !== view.window { window = view.window }
+        }
+    }
+}
+#endif
+
+/// Curseur de lecture : lecture/pause, heure et position dans le vol (lit `slowTime`, 4 Hz).
+private struct ChaseCam3DTimeline: View {
+    let model: FlightViewModel
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Button {
+                model.togglePlayback()
+            } label: {
+                Label(
+                    model.isPlaying ? "Pause" : "Lecture",
+                    systemImage: model.isPlaying ? "pause.fill" : "play.fill"
+                )
+                .labelStyle(.iconOnly)
+                .frame(width: 22)
+            }
+            .keyboardShortcut(.space, modifiers: [])
+
+            Text(model.slowTime.clockString)
+                .font(.caption.monospacedDigit())
+                .frame(width: 48, alignment: .trailing)
+
+            BookmarkTimelineSlider(
+                value: Binding(
+                    get: { model.slowTime },
+                    set: model.seek
+                ),
+                duration: model.duration,
+                bookmarks: model.bookmarks,
+                videoFrameRate: model.frontVideoFrameRate
+            )
+            // Le slider réserve 54 pt à gauche pour l'heure des autres vues ; ici elle est à côté.
+            .padding(.leading, -54)
+        }
         .foregroundStyle(.white)
     }
 }
@@ -135,6 +345,9 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
     let isInverted: Bool
     let preset: ChaseCam3DPreset
     let showsFullPath: Bool
+    let showsSatellite: Bool
+    let smoothsGPS: Bool
+    let isInset: Bool
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
@@ -163,13 +376,13 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
         view.scene = context.coordinator.scene
         view.pointOfView = context.coordinator.cameraNode
         view.backgroundColor = Coordinator.skyColor
-        view.antialiasingMode = .multisampling2X
+        view.antialiasingMode = isInset ? .none : .multisampling2X
         // La caméra est pilotée par le coordinator (poursuite dynamique).
         view.allowsCameraControl = false
         view.autoenablesDefaultLighting = false
         view.delegate = context.coordinator
-        // La caméra se lisse image par image : 60 fps pour un mouvement fluide.
-        view.preferredFramesPerSecond = 60
+        // La caméra se lisse image par image : 60 fps pour un mouvement fluide (30 en incrustation).
+        view.preferredFramesPerSecond = isInset ? 30 : 60
         view.isPlaying = true
         view.rendersContinuously = false
         updateView(view, context: context)
@@ -185,12 +398,55 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
             mountingPitch: mountingPitch,
             isInverted: isInverted,
             preset: preset,
-            showsFullPath: showsFullPath
+            showsFullPath: showsFullPath,
+            showsSatellite: showsSatellite,
+            smoothsGPS: smoothsGPS,
+            isInset: isInset
         )
     }
 
     final class Coordinator: NSObject, SCNSceneRendererDelegate {
         static let skyColor = PlatformColor(red: 0.35, green: 0.48, blue: 0.60, alpha: 1)
+        /// Teinte de l'horizon : celle du brouillard, pour que le lointain se fonde dans le ciel.
+        static let horizonColor = PlatformColor(red: 0.74, green: 0.87, blue: 0.97, alpha: 1)
+
+        /// Dégradé de ciel 2:1 (zénith en haut, horizon au milieu, brume sous l'horizon).
+        private static func skyImage() -> CGImage? {
+            let width = 1_024
+            let height = 512
+            guard let context = CGContext(
+                data: nil,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: 0,
+                space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            ) else { return nil }
+            let stops: [(location: CGFloat, red: CGFloat, green: CGFloat, blue: CGFloat)] = [
+                (0.00, 0.08, 0.28, 0.72), // zénith
+                (0.28, 0.22, 0.52, 0.90),
+                (0.46, 0.60, 0.80, 0.96),
+                (0.50, 0.74, 0.87, 0.97), // horizon
+                (0.56, 0.62, 0.74, 0.80), // brume sous l'horizon
+                (1.00, 0.40, 0.48, 0.50),
+            ]
+            let components: [CGFloat] = stops.flatMap { [$0.red, $0.green, $0.blue, CGFloat(1)] }
+            guard let gradient = CGGradient(
+                colorSpace: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+                colorComponents: components,
+                locations: stops.map(\.location),
+                count: stops.count
+            ) else { return nil }
+            // L'origine du contexte est en bas : le zénith (location 0) est donc en haut.
+            context.drawLinearGradient(
+                gradient,
+                start: CGPoint(x: 0, y: CGFloat(height)),
+                end: .zero,
+                options: []
+            )
+            return context.makeImage()
+        }
 
         let scene = SCNScene()
         let cameraNode = SCNNode()
@@ -199,11 +455,13 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
         private let fullPathNode = SCNNode()
         private let groundGrid = SCNNode()
         private let groundShadow = SCNNode()
+        /// Plan texturé par une image satellite MapKit, posé au sol sous la trajectoire.
+        private let satelliteNode = SCNNode()
         private let dropLine = SCNNode()
         private let centerTrail = SCNNode()
         private let leftTrail = SCNNode()
         private let rightTrail = SCNNode()
-        private let trailRibbon = SCNNode()
+        private let trailRungs = SCNNode()
 
         /// 1 unité de scène = 1 m. Le modèle STL (≈ 4,2 u d'envergure) est agrandi à l'échelle réelle.
         private let modelScale: Float = 2
@@ -221,6 +479,22 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
         private var preset = ChaseCam3DPreset.standard
         private var currentModelURL: URL?
 
+        // Emprise de l'image satellite : carré centré sur le vol, en mètres.
+        private var satelliteCenter: CLLocationCoordinate2D?
+        private var satelliteSide: Double = 0
+        private var satelliteRevision = -1
+        private var satelliteTask: Task<Void, Never>?
+        private var hasSatelliteImage = false
+        private var showsSatellite = true
+        private var isInset = false
+
+        // Repère local de la trajectoire (origine = premier échantillon) et option de lissage.
+        private var referenceLatitude = 0.0
+        private var referenceLongitude = 0.0
+        private var referenceCosineLatitude = 1.0
+        private var groundAltitudeMeters = 0.0
+        private var smoothsGPS = true
+
         // Trajectoire GPS en mètres (X = est, Y = altitude au-dessus du point le plus bas, -Z = nord).
         // Un nœud par position GPS distincte : l'interpolation lisse les paliers des fixes GPS.
         private var knotTimes: [Double] = []
@@ -235,6 +509,9 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
         private var chaseClimb: Float = 0
         private var hasChaseDirection = false
         private var cameraOffset = SIMD3<Float>(0, 5, 30)
+        private var turnRate: Float = 0
+        private var lastTargetHeading: Float = 0
+        private var currentFieldOfView: Float = 60
 
         override init() {
             super.init()
@@ -251,10 +528,17 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
             mountingPitch: Double,
             isInverted: Bool,
             preset: ChaseCam3DPreset,
-            showsFullPath: Bool
+            showsFullPath: Bool,
+            showsSatellite: Bool,
+            smoothsGPS: Bool,
+            isInset: Bool
         ) {
             lock.lock()
             defer { lock.unlock() }
+            self.isInset = isInset
+            self.showsSatellite = showsSatellite
+            let smoothingChanged = self.smoothsGPS != smoothsGPS
+            self.smoothsGPS = smoothsGPS
             self.mountingPitch = mountingPitch
             self.isInverted = isInverted
             if self.preset != preset {
@@ -269,10 +553,114 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
                 || self.samples.count != samples.count
                 || self.samples.first?.timestamp != samples.first?.timestamp
                 || self.samples.last?.timestamp != samples.last?.timestamp
-            guard needsRebuild else { return }
-            revision = samplesRevision
-            self.samples = samples
-            rebuildWorld()
+            if needsRebuild {
+                revision = samplesRevision
+                self.samples = samples
+                rebuildWorld()
+            } else if smoothingChanged {
+                rebuildTrajectory()
+            }
+            updateSatelliteIfNeeded()
+        }
+
+        // MARK: - Vue satellite
+
+        /// Télécharge (une fois par vol) une mosaïque de tuiles satellite autour de la trajectoire.
+        ///
+        /// Un instantané unique très étendu n'est pas fiable : MapKit ne charge de façon complète
+        /// que les zones proches de la trajectoire. On demande donc une grille de petits instantanés,
+        /// chacun à une échelle où l'imagerie est entièrement chargée, du centre vers l'extérieur,
+        /// pour que le sol soit texturé jusqu'au loin dans toutes les directions.
+        private func updateSatelliteIfNeeded() {
+            let visible = showsSatellite && hasSatelliteImage
+            satelliteNode.isHidden = !visible
+            groundGrid.isHidden = visible
+            guard showsSatellite, satelliteRevision != revision, let center = satelliteCenter else { return }
+            satelliteRevision = revision
+            satelliteTask?.cancel()
+
+            // L'incrustation, petite à l'écran, se contente d'une mosaïque allégée (≈ 9 Mo de textures).
+            #if os(macOS)
+            let gridSize = isInset ? 3 : 5
+            #else
+            let gridSize = 3
+            #endif
+            let pixels: CGFloat = isInset ? 512 : 1_024
+            let tileSide = satelliteSide / Double(gridSize)
+            let metersPerDegree = 111_320.0
+            let cosineLatitude = cos(center.latitude * .pi / 180)
+            let requestedRevision = revision
+
+            // Centres des tuiles (décalages est/nord en mètres), triés du plus proche au plus lointain.
+            var offsets: [(east: Double, north: Double)] = []
+            for column in 0..<gridSize {
+                for row in 0..<gridSize {
+                    offsets.append((
+                        east: (Double(column) - Double(gridSize - 1) / 2) * tileSide,
+                        north: (Double(row) - Double(gridSize - 1) / 2) * tileSide
+                    ))
+                }
+            }
+            offsets.sort { hypot($0.east, $0.north) < hypot($1.east, $1.north) }
+
+            satelliteTask = Task { [weak self] in
+                for offset in offsets {
+                    if Task.isCancelled { return }
+                    let tileCenter = CLLocationCoordinate2D(
+                        latitude: center.latitude + offset.north / metersPerDegree,
+                        longitude: center.longitude + offset.east / (metersPerDegree * cosineLatitude)
+                    )
+                    let options = MKMapSnapshotter.Options()
+                    options.region = MKCoordinateRegion(
+                        center: tileCenter, latitudinalMeters: tileSide, longitudinalMeters: tileSide
+                    )
+                    options.mapType = .satellite
+                    options.size = CGSize(width: pixels, height: pixels)
+                    // Une tuile qui échoue laisse un trou, sans bloquer les suivantes.
+                    guard let snapshot = try? await MKMapSnapshotter(options: options).start(),
+                          !Task.isCancelled else { continue }
+                    self?.addSatelliteTile(
+                        snapshot.image,
+                        east: offset.east,
+                        north: offset.north,
+                        side: tileSide,
+                        forRevision: requestedRevision
+                    )
+                }
+            }
+        }
+
+        private func addSatelliteTile(
+            _ image: PlatformImage,
+            east: Double,
+            north: Double,
+            side: Double,
+            forRevision requestedRevision: Int
+        ) {
+            lock.lock()
+            defer { lock.unlock() }
+            // Le vol a changé pendant le téléchargement : l'image ne correspond plus.
+            guard requestedRevision == revision else { return }
+            let plane = SCNPlane(width: CGFloat(side), height: CGFloat(side))
+            let material = SCNMaterial()
+            material.lightingModel = .constant
+            material.isDoubleSided = true
+            material.diffuse.contents = image
+            material.diffuse.mipFilter = .linear
+            material.diffuse.minificationFilter = .linear
+            material.diffuse.magnificationFilter = .linear
+            material.diffuse.maxAnisotropy = 8
+            material.diffuse.wrapS = .clamp
+            material.diffuse.wrapT = .clamp
+            plane.materials = [material]
+            // `satelliteNode` est couché à plat (x = est, y local = nord) : la tuile se place par
+            // ses décalages est/nord par rapport au centre de la mosaïque.
+            let tile = SCNNode(geometry: plane)
+            tile.simdPosition = SIMD3<Float>(Float(east), Float(north), 0)
+            satelliteNode.addChildNode(tile)
+            hasSatelliteImage = true
+            satelliteNode.isHidden = !showsSatellite
+            groundGrid.isHidden = showsSatellite
         }
 
         private func rebuildWorld() {
@@ -281,35 +669,95 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
             centerTrail.geometry = nil
             leftTrail.geometry = nil
             rightTrail.geometry = nil
-            trailRibbon.geometry = nil
+            trailRungs.geometry = nil
             fullPathNode.geometry = nil
             lastTrailSeconds = -.infinity
             resetHeadingEstimate()
             needsCameraSnap = true
             hasChaseDirection = false
+            satelliteTask?.cancel()
+            satelliteNode.childNodes.forEach { $0.removeFromParentNode() }
+            hasSatelliteImage = false
+            satelliteRevision = -1
+            satelliteCenter = nil
             guard let first = samples.first else { return }
 
             let metersPerDegree = 111_320.0
             let cosineLatitude = cos(first.latitude * .pi / 180)
-            let groundAltitude = (samples.map(\.altitude).min() ?? 0) * 0.3048
 
-            var speeds: [Double] = []
+            // Emprise satellite : carré centré sur la boîte englobante du vol, large marge pour que
+            // la tuile se prolonge jusqu'à l'horizon (≈ 1,5 à 5 m/pixel selon la taille).
+            let latitudes = samples.map(\.latitude)
+            let longitudes = samples.map(\.longitude)
+            if let minLatitude = latitudes.min(), let maxLatitude = latitudes.max(),
+               let minLongitude = longitudes.min(), let maxLongitude = longitudes.max() {
+                let centerLatitude = (minLatitude + maxLatitude) / 2
+                let centerLongitude = (minLongitude + maxLongitude) / 2
+                let eastExtent = (maxLongitude - minLongitude) * metersPerDegree * cosineLatitude
+                let northExtent = (maxLatitude - minLatitude) * metersPerDegree
+                // Carré couvert par la mosaïque : assez large pour garnir l'horizon (le brouillard
+                // commence à 5 km), borné pour garder une résolution exploitable (≈ 2 à 6 m/pixel).
+                satelliteSide = min(30_000, max(10_000, max(eastExtent, northExtent) * 3))
+                satelliteCenter = CLLocationCoordinate2D(latitude: centerLatitude, longitude: centerLongitude)
+                // L'image est orientée nord en haut : X = est, -Z = nord dans la scène.
+                let centerEast = (centerLongitude - first.longitude) * metersPerDegree * cosineLatitude
+                let centerNorth = (centerLatitude - first.latitude) * metersPerDegree
+                satelliteNode.simdPosition = SIMD3<Float>(Float(centerEast), 0, Float(-centerNorth))
+            }
+            referenceLatitude = first.latitude
+            referenceLongitude = first.longitude
+            referenceCosineLatitude = cosineLatitude
+            groundAltitudeMeters = (samples.map(\.altitude).min() ?? 0) * 0.3048
+            rebuildTrajectory()
+        }
+
+        /// Construit la trajectoire en mètres (brute, ou lissée par fusion GPS/attitude) et son tube.
+        private func rebuildTrajectory() {
+            knotTimes = []
+            knotPositions = []
+            centerTrail.geometry = nil
+            leftTrail.geometry = nil
+            rightTrail.geometry = nil
+            trailRungs.geometry = nil
+            fullPathNode.geometry = nil
+            lastTrailSeconds = -.infinity
+            // Force le recalcul de la traînée à la prochaine image, même en pause.
+            lastPlayerSeconds = nil
+            guard !samples.isEmpty else { return }
+
+            let metersPerDegree = 111_320.0
+            var rawTimes: [Double] = []
+            var rawPositions: [SIMD3<Float>] = []
             var last: FlightSample?
             for sample in samples {
                 if let last, last.latitude == sample.latitude,
                    last.longitude == sample.longitude, last.altitude == sample.altitude {
                     continue
                 }
-                let east = (sample.longitude - first.longitude) * metersPerDegree * cosineLatitude
-                let north = (sample.latitude - first.latitude) * metersPerDegree
-                knotTimes.append(sample.elapsed)
-                knotPositions.append(
-                    SIMD3<Float>(Float(east), Float(sample.altitude * 0.3048 - groundAltitude), Float(-north))
+                let east = (sample.longitude - referenceLongitude) * metersPerDegree * referenceCosineLatitude
+                let north = (sample.latitude - referenceLatitude) * metersPerDegree
+                rawTimes.append(sample.elapsed)
+                rawPositions.append(
+                    SIMD3<Float>(
+                        Float(east),
+                        Float(sample.altitude * 0.3048 - groundAltitudeMeters),
+                        Float(-north)
+                    )
                 )
-                speeds.append(sample.speed)
                 last = sample
             }
-            guard knotPositions.count > 1 else { return }
+            guard rawPositions.count > 1 else { return }
+
+            buildHeadingSeries(rawTimes: rawTimes, rawPositions: rawPositions)
+
+            if smoothsGPS {
+                let smoothed = smoothedTrajectory(rawTimes: rawTimes, rawPositions: rawPositions)
+                knotTimes = smoothed.times
+                knotPositions = smoothed.positions
+            } else {
+                knotTimes = rawTimes
+                knotPositions = rawPositions
+            }
 
             // Trajectoire complète, sous-échantillonnée, en tube coloré par la vitesse.
             let strideValue = max(1, knotPositions.count / 3_000)
@@ -317,17 +765,188 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
             var colors: [SIMD4<Float>] = []
             for index in Swift.stride(from: 0, to: knotPositions.count, by: strideValue) {
                 points.append(knotPositions[index])
-                var color = Self.speedColor(speeds[index])
+                var color = Self.speedColor(samples[sampleIndex(at: knotTimes[index], in: samples)].speed)
                 color.w = 0.6
                 colors.append(color)
             }
-            fullPathNode.geometry = Self.tubeGeometry(points: points, colors: colors, radius: 1.2, sides: 5)
+            fullPathNode.geometry = Self.tubeGeometry(points: points, colors: colors, radius: 0.1, sides: 4)
+        }
+
+        /// Calcule, hors ligne, le décalage de cap (gyros → nord) à chaque instant du vol.
+        ///
+        /// L'estimateur en direct est causal et se fige pendant les figures : l'avion peut alors
+        /// sembler « de travers » par rapport à la trajectoire. Ici l'azimut de référence est celui
+        /// de la trajectoire affichée (vitesse sol issue des positions), et les zones sans mesure
+        /// fiable sont interpolées entre l'ancre fiable qui les précède et celle qui les suit.
+        private func buildHeadingSeries(rawTimes: [Double], rawPositions: [SIMD3<Float>]) {
+            headingSeries = []
+            let step = 0.1
+            let start = rawTimes[0]
+            let count = Int((rawTimes[rawTimes.count - 1] - start) / step) + 1
+            guard count > 20 else { return }
+
+            var grid: [SIMD3<Float>] = []
+            grid.reserveCapacity(count)
+            for index in 0..<count {
+                grid.append(Self.interpolate(
+                    times: rawTimes, positions: rawPositions, at: start + Double(index) * step
+                ))
+            }
+
+            var estimator = HeadingEstimator()
+            var corrections = [Float](repeating: 0, count: count)
+            var anchors: [Int] = []
+            for index in 0..<count {
+                let time = start + Double(index) * step
+                let sample = samples[sampleIndex(at: time, in: samples)]
+                let orientation = sceneOrientation(of: sample, mountingPitch: mountingPitch, isInverted: isInverted)
+                let lower = max(index - 1, 0)
+                let upper = min(index + 1, count - 1)
+                let velocity = grid[upper] - grid[lower]
+                // Azimut de la trajectoire quand elle est définie, sinon cap GPS fourni.
+                let referenceHeading = simd_length(SIMD2<Float>(velocity.x, velocity.z)) / (Float(upper - lower) * 0.1) > 5
+                    ? Double(atan2(velocity.x, -velocity.z)) * 180 / .pi
+                    : sample.heading
+                estimator.update(
+                    forward: orientation.act(SIMD3<Float>(0, 0, -1)),
+                    up: orientation.act(SIMD3<Float>(0, 1, 0)),
+                    heading: referenceHeading,
+                    speed: sample.speed,
+                    loadFactor: sample.loadFactor,
+                    now: time
+                )
+                corrections[index] = estimator.correction
+                if estimator.lastWeight > 0.5 { anchors.append(index) }
+            }
+
+            guard let firstAnchor = anchors.first, let lastAnchor = anchors.last else {
+                headingSeries = corrections
+                headingSeriesStart = start
+                return
+            }
+            // Avant la première ancre et après la dernière : valeur tenue ; entre deux ancres
+            // éloignées : interpolation linéaire de l'angle (par le plus court chemin).
+            var series = corrections
+            for index in 0..<firstAnchor { series[index] = corrections[firstAnchor] }
+            if lastAnchor + 1 < count {
+                for index in (lastAnchor + 1)..<count { series[index] = corrections[lastAnchor] }
+            }
+            for pair in zip(anchors, anchors.dropFirst()) where pair.1 - pair.0 > 1 {
+                let from = corrections[pair.0]
+                let delta = wrapAngle(corrections[pair.1] - from)
+                for index in (pair.0 + 1)..<pair.1 {
+                    series[index] = from + delta * Float(index - pair.0) / Float(pair.1 - pair.0)
+                }
+            }
+            headingSeries = series
+            headingSeriesStart = start
+        }
+
+        /// Décalage de cap à l'instant `time` : série hors ligne si elle existe, sinon estimateur en direct.
+        private func headingCorrection(at time: TimeInterval) -> Float {
+            guard headingSeries.count > 1 else { return headingEstimator.correction }
+            let position = max(0, min(Double(headingSeries.count - 1), (time - headingSeriesStart) / 0.1))
+            let lower = Int(position)
+            let upper = min(lower + 1, headingSeries.count - 1)
+            let fraction = Float(position - Double(lower))
+            return headingSeries[lower] + wrapAngle(headingSeries[upper] - headingSeries[lower]) * fraction
+        }
+
+        /// Fusionne la trajectoire GPS avec une navigation à l'estime (attitude × vitesse).
+        ///
+        /// En manœuvre verticale (hammerhead, immelmann) le GPS décroche plusieurs secondes alors
+        /// que l'attitude reste très bonne. Un indice de fiabilité du GPS est calculé tous les
+        /// 0,1 s : cohérence entre la direction du vecteur vitesse GPS et celle du nez, accélération
+        /// plausible, cohérence avec la vitesse sol mesurée. Là où il chute, la position suit
+        /// l'estime ; là où il est bon, elle suit le GPS, et l'estime est recalée vers lui avec une
+        /// constante de temps de 8 s au plus, pour que l'erreur n'ait pas le temps de s'accumuler.
+        private func smoothedTrajectory(
+            rawTimes: [Double],
+            rawPositions: [SIMD3<Float>]
+        ) -> (times: [Double], positions: [SIMD3<Float>]) {
+            let step = 0.1
+            let start = rawTimes[0]
+            let count = Int((rawTimes[rawTimes.count - 1] - start) / step) + 1
+            guard count > 20 else { return (rawTimes, rawPositions) }
+            let dt = Float(step)
+
+            // 1. Grille régulière : position GPS, cap du nez corrigé (cap absolu) et vitesse sol.
+            var times: [Double] = []
+            var grid: [SIMD3<Float>] = []
+            var noses: [SIMD3<Float>] = []
+            var groundSpeeds: [Float] = []
+            for index in 0..<count {
+                let time = start + Double(index) * step
+                times.append(time)
+                grid.append(Self.interpolate(times: rawTimes, positions: rawPositions, at: time))
+                let sample = samples[sampleIndex(at: time, in: samples)]
+                let orientation = sceneOrientation(of: sample, mountingPitch: mountingPitch, isInverted: isInverted)
+                let nose = orientation.act(SIMD3<Float>(0, 0, -1))
+                noses.append(yawQuaternion(headingCorrection(at: time)).act(nose))
+                groundSpeeds.append(Float(sample.speed / 3.6))
+            }
+
+            // 2. Fiabilité du GPS à chaque instant.
+            var gpsVelocities = [SIMD3<Float>](repeating: .zero, count: count)
+            var reliability = [Float](repeating: 1, count: count)
+            for index in 0..<count {
+                let lower = max(index - 1, 0)
+                let upper = min(index + 1, count - 1)
+                let velocity = (grid[upper] - grid[lower]) / (Float(upper - lower) * dt)
+                gpsVelocities[index] = velocity
+                guard index >= 2, index < count - 2 else { continue }
+
+                var score: Float = 1
+                let gpsSpeed = simd_length(velocity)
+                if gpsSpeed > 8 {
+                    // Le vecteur vitesse GPS doit rester à peu près dans l'axe du nez.
+                    let cosine = max(-1, min(1, simd_dot(velocity / gpsSpeed, noses[index])))
+                    score = min(score, 1 - smoothstep(acos(cosine), 0.6, 1.2))
+                }
+                // Accélération irréaliste pour un avion de voltige : GPS en décrochage.
+                let acceleration = (grid[index + 2] - 2 * grid[index] + grid[index - 2]) / (4 * dt * dt)
+                score = min(score, 1 - smoothstep(simd_length(acceleration) / 9.80665, 5, 10))
+                if groundSpeeds[index] > 10 {
+                    let ratio = gpsSpeed / groundSpeeds[index]
+                    score = min(score, 1 - smoothstep(abs(ratio - 1), 0.35, 0.8))
+                }
+                reliability[index] = score
+            }
+            // Élargit les zones douteuses de ±0,8 s (le GPS dérive avant et après), puis adoucit.
+            var widened = reliability
+            for index in 0..<count {
+                var minimum: Float = 1
+                for neighbor in max(0, index - 8)...min(count - 1, index + 8) {
+                    minimum = min(minimum, reliability[neighbor])
+                }
+                widened[index] = minimum
+            }
+            var blurred = widened
+            for index in 0..<count {
+                let range = max(0, index - 5)...min(count - 1, index + 5)
+                blurred[index] = range.reduce(0) { $0 + widened[$1] } / Float(range.count)
+            }
+
+            // 3. Intégration : vitesse mêlant GPS et estime, puis recalage vers le GPS d'autant plus
+            // fort que celui-ci est fiable (de ≈ 0,15 s à 8 s).
+            var smoothed = grid
+            for index in 1..<count {
+                let trust = blurred[index]
+                let velocity = gpsVelocities[index] * trust + noses[index] * groundSpeeds[index] * (1 - trust)
+                let predicted = smoothed[index - 1] + velocity * dt
+                let timeConstant = 0.15 * pow(8 / 0.15, 1 - trust)
+                smoothed[index] = predicted + (grid[index] - predicted) * (1 - exp(-dt / timeConstant))
+            }
+            return (times, smoothed)
         }
 
         // MARK: - Boucle de rendu
 
         func renderer(_ renderer: any SCNSceneRenderer, updateAtTime time: TimeInterval) {
+            // Verrou tenu pendant toute l'image : la trajectoire (knots) peut être remplacée par le
+            // thread principal (changement de vol ou de lissage GPS) et doit rester cohérente.
             lock.lock()
+            defer { lock.unlock() }
             let samples = samples
             let player = player
             let mountingPitch = mountingPitch
@@ -335,7 +954,6 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
             let preset = preset
             let snapRequested = needsCameraSnap
             needsCameraSnap = false
-            lock.unlock()
 
             guard let player, !samples.isEmpty, knotTimes.count > 1 else { return }
             let seconds = player.currentTime().seconds
@@ -356,7 +974,11 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
             let index = sampleIndex(at: seconds, in: samples)
             let sample = samples[index]
             let position = worldPosition(at: seconds)
-            let velocity = worldPosition(at: seconds + 0.5) - worldPosition(at: seconds - 0.5)
+            let before = worldPosition(at: seconds - 0.5)
+            let after = worldPosition(at: seconds + 0.5)
+            let velocity = after - before
+            // Dérivée seconde de la trajectoire (m/s²) : l'accélération ressentie par l'avion.
+            let acceleration = (after - 2 * position + before) / 0.25
 
             var orientation = sceneOrientation(of: sample, mountingPitch: mountingPitch, isInverted: isInverted)
             if timeChanged {
@@ -370,7 +992,7 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
                     loadFactor: sample.loadFactor
                 )
             }
-            orientation = yawQuaternion(headingCorrection) * orientation
+            orientation = yawQuaternion(headingCorrection(at: seconds)) * orientation
 
             SCNTransaction.begin()
             SCNTransaction.disableActions = true
@@ -380,6 +1002,7 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
             updateCamera(
                 position: position,
                 velocity: velocity,
+                acceleration: acceleration,
                 noseForward: orientation.act(SIMD3<Float>(0, 0, -1)),
                 preset: preset,
                 deltaTime: wallDelta,
@@ -402,6 +1025,7 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
         private func updateCamera(
             position: SIMD3<Float>,
             velocity: SIMD3<Float>,
+            acceleration: SIMD3<Float>,
             noseForward: SIMD3<Float>,
             preset: ChaseCam3DPreset,
             deltaTime: Float,
@@ -415,6 +1039,14 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
             if sourceHorizontal > 0.001 {
                 let targetHeading = atan2(source.x, -source.z)
                 let targetClimb = max(-0.6, min(0.6, source.y / max(0.001, simd_length(source))))
+                // Taux de virage de la trajectoire (rad/s), lissé : sert au déport de la caméra.
+                if snap || !hasChaseDirection || deltaTime <= 0 {
+                    turnRate = 0
+                } else {
+                    let rate = max(-1.5, min(1.5, wrappedAngle(targetHeading - lastTargetHeading) / deltaTime))
+                    turnRate += (rate - turnRate) * (1 - exp(-deltaTime / 0.5))
+                }
+                lastTargetHeading = targetHeading
                 if snap || !hasChaseDirection {
                     chaseHeading = targetHeading
                     chaseClimb = targetClimb
@@ -426,13 +1058,37 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
                 }
             }
 
-            let backHeading = chaseHeading + .pi + preset.azimuth
-            let distance = preset.distance
+            var azimuth = preset.azimuth
+            var distance = preset.distance
+            var inertia = SIMD3<Float>.zero
+            var fieldOfView: Float = 60
+            if preset == .dynamic {
+                let speedRatio = min(1, simd_length(velocity) / 90)
+                // Plus vite : la caméra recule et le champ s'élargit, la vitesse se « sent ».
+                distance *= 1 + 0.4 * speedRatio
+                fieldOfView = 58 + 10 * speedRatio
+                // Virage à droite (cap qui augmente) : la caméra glisse vers l'extérieur, à gauche,
+                // et montre l'inclinaison de l'avion ; inversement à gauche.
+                azimuth += max(-0.5, min(0.5, turnRate * 0.6))
+                // Inertie : la caméra est « tirée » à l'opposé de l'accélération (g en ressource,
+                // freinage, début de virage), bornée pour rester cadrée.
+                inertia = -acceleration * 0.15
+                let limit = distance * 0.25
+                let magnitude = simd_length(inertia)
+                if magnitude > limit { inertia *= limit / magnitude }
+            }
+            let backHeading = chaseHeading + .pi + azimuth
             let targetOffset = SIMD3<Float>(
                 sin(backHeading) * distance * cos(preset.elevation),
                 distance * sin(preset.elevation) - chaseClimb * distance * 0.35,
                 -cos(backHeading) * distance * cos(preset.elevation)
-            )
+            ) + inertia
+            if snap {
+                currentFieldOfView = fieldOfView
+            } else {
+                currentFieldOfView += (fieldOfView - currentFieldOfView) * (1 - exp(-deltaTime / 0.6))
+            }
+            cameraNode.camera?.fieldOfView = CGFloat(currentFieldOfView)
             if snap {
                 cameraOffset = targetOffset
             } else {
@@ -464,7 +1120,7 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
                 0,
                 (position.z / gridSpacing).rounded() * gridSpacing
             )
-            groundShadow.simdPosition = SIMD3<Float>(position.x, 0.1, position.z)
+            groundShadow.simdPosition = SIMD3<Float>(position.x, 0.4, position.z)
             let height = max(0, position.y)
             dropLine.isHidden = height < 1
             dropLine.simdScale = SIMD3<Float>(1, max(height, 0.01), 1)
@@ -486,12 +1142,12 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
             var rights: [SIMD3<Float>] = []
             var speeds: [Double] = []
             var fades: [Float] = []
-            let yaw = yawQuaternion(headingCorrection)
             for pointIndex in 0..<trailPointCount {
                 let time = seconds - trailDuration + Double(pointIndex) * step
                 guard time >= firstTime else { continue }
                 let sample = samples[sampleIndex(at: time, in: samples)]
-                let orientation = yaw * sceneOrientation(of: sample, mountingPitch: mountingPitch, isInverted: isInverted)
+                let orientation = yawQuaternion(headingCorrection(at: time))
+                    * sceneOrientation(of: sample, mountingPitch: mountingPitch, isInverted: isInverted)
                 let right = orientation.act(SIMD3<Float>(1, 0, 0)) * wingHalfSpan
                 let center = worldPosition(at: time)
                 centers.append(center)
@@ -504,7 +1160,7 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
                 centerTrail.geometry = nil
                 leftTrail.geometry = nil
                 rightTrail.geometry = nil
-                trailRibbon.geometry = nil
+                trailRungs.geometry = nil
                 return
             }
 
@@ -530,41 +1186,60 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
                 vertices: rights, colors: rightColors, indices: segmentIndices, primitive: .line
             )
 
-            // Ruban entre les saumons d'aile : il se vrille avec le roulis et rend la figure lisible.
-            var ribbonVertices: [SIMD3<Float>] = []
-            var ribbonColors: [SIMD4<Float>] = []
-            var ribbonIndices: [Int32] = []
-            for index in centers.indices {
-                ribbonVertices.append(lefts[index])
-                ribbonVertices.append(rights[index])
-                let color = SIMD4<Float>(1, 1, 1, 0.22 * fades[index])
-                ribbonColors.append(color)
-                ribbonColors.append(color)
+            // Un barreau toutes les 0,25 s relie les saumons d'aile du même instant : il se vrille avec
+            // le roulis. Calés sur des multiples de 0,25 s absolus, les barreaux défilent avec la traînée
+            // au lieu de glisser dessus.
+            let rungInterval = 0.25
+            var rungVertices: [SIMD3<Float>] = []
+            var rungColors: [SIMD4<Float>] = []
+            let firstRung = Int(((seconds - trailDuration) / rungInterval).rounded(.up))
+            let lastRung = Int((seconds / rungInterval).rounded(.down))
+            if firstRung <= lastRung {
+                for rung in firstRung...lastRung {
+                    let time = Double(rung) * rungInterval
+                    guard time >= firstTime else { continue }
+                    let sample = samples[sampleIndex(at: time, in: samples)]
+                    let orientation = yawQuaternion(headingCorrection(at: time))
+                        * sceneOrientation(of: sample, mountingPitch: mountingPitch, isInverted: isInverted)
+                    let right = orientation.act(SIMD3<Float>(1, 0, 0)) * wingHalfSpan
+                    let center = worldPosition(at: time)
+                    let fade = Float(max(0, min(1, 1 - (seconds - time) / trailDuration)))
+                    let color = SIMD4<Float>(1, 1, 1, 0.8 * fade)
+                    rungVertices += [center - right, center + right]
+                    rungColors += [color, color]
+                }
             }
-            for index in 0..<(centers.count - 1) {
-                let base = Int32(index * 2)
-                ribbonIndices.append(contentsOf: [base, base + 1, base + 2, base + 1, base + 3, base + 2])
-            }
-            trailRibbon.geometry = Self.geometry(
-                vertices: ribbonVertices, colors: ribbonColors, indices: ribbonIndices, primitive: .triangles
+            trailRungs.geometry = Self.geometry(
+                vertices: rungVertices,
+                colors: rungColors,
+                indices: rungVertices.indices.map(Int32.init),
+                primitive: .line
             )
         }
 
         // MARK: - Trajectoire et échantillons
 
         private func worldPosition(at time: TimeInterval) -> SIMD3<Float> {
-            let count = knotTimes.count
+            Self.interpolate(times: knotTimes, positions: knotPositions, at: time)
+        }
+
+        private static func interpolate(
+            times: [Double],
+            positions: [SIMD3<Float>],
+            at time: TimeInterval
+        ) -> SIMD3<Float> {
+            let count = times.count
             guard count > 0 else { return .zero }
-            if time <= knotTimes[0] { return knotPositions[0] }
-            if time >= knotTimes[count - 1] { return knotPositions[count - 1] }
+            if time <= times[0] { return positions[0] }
+            if time >= times[count - 1] { return positions[count - 1] }
             var lower = 0
             var upper = count - 1
             while upper - lower > 1 {
                 let middle = (lower + upper) / 2
-                if knotTimes[middle] <= time { lower = middle } else { upper = middle }
+                if times[middle] <= time { lower = middle } else { upper = middle }
             }
-            let fraction = Float((time - knotTimes[lower]) / (knotTimes[upper] - knotTimes[lower]))
-            return knotPositions[lower] + (knotPositions[upper] - knotPositions[lower]) * fraction
+            let fraction = Float((time - times[lower]) / (times[upper] - times[lower]))
+            return positions[lower] + (positions[upper] - positions[lower]) * fraction
         }
 
         private func sampleIndex(at time: TimeInterval, in samples: [FlightSample]) -> Int {
@@ -613,25 +1288,14 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
             simd_quatf(angle: angle, axis: SIMD3<Float>(0, 1, 0))
         }
 
-        // Le décalage entre le yaw des gyros et le nord est quasi constant : un filtre
-        // complémentaire l'estime quand l'azimut du nez est une mesure fiable (nez proche de
-        // l'horizontale, vol stabilisé) et le gèle sinon (boucles, figures).
-        private let headingTimeConstant: Float = 3
-        private var headingCorrection: Float = 0
-        private var headingIsSeeded = false
-        private var hasHeadingEstimate = false
-        private var lastHeadingUptime: TimeInterval?
-        private var previousNoseForward: SIMD3<Float>?
+        // Estimation du décalage entre le yaw des gyros et le nord (voir `HeadingEstimator`).
+        private var headingEstimator = HeadingEstimator()
+        // Série hors ligne du décalage de cap, une valeur tous les 0,1 s (voir `buildHeadingSeries`).
+        private var headingSeries: [Float] = []
+        private var headingSeriesStart: TimeInterval = 0
 
         private func resetHeadingEstimate() {
-            lastHeadingUptime = nil
-            headingIsSeeded = false
-            previousNoseForward = nil
-        }
-
-        private func smoothstep(_ x: Float, _ low: Float, _ high: Float) -> Float {
-            let t = max(0, min(1, (x - low) / (high - low)))
-            return t * t * (3 - 2 * t)
+            headingEstimator.reset()
         }
 
         private func updateHeadingOffset(
@@ -641,42 +1305,14 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
             speed: Double,
             loadFactor: Double
         ) {
-            let now = ProcessInfo.processInfo.systemUptime
-            let dt = lastHeadingUptime.map { Float(now - $0) }
-            defer {
-                lastHeadingUptime = now
-                previousNoseForward = forward
-            }
-
-            let horizontal = simd_length(SIMD2<Float>(forward.x, forward.z))
-            var weight = smoothstep(horizontal, 0.64, 0.82)
-            weight *= smoothstep(Float(speed), 30, 60)
-            weight *= 1 - smoothstep(Float(abs(loadFactor - 1)), 0.25, 0.7)
-            weight *= smoothstep(abs(up.y), 0.5, 0.8)
-            if let dt, dt > 0, dt < 1, let previous = previousNoseForward {
-                let angle = acos(max(-1, min(1, simd_dot(previous, forward))))
-                weight *= 1 - smoothstep(angle / dt, 0.5, 1.5)
-            }
-            guard simd_length(SIMD2<Float>(forward.x, forward.z)) > 0.05 else { return }
-            let target = atan2(forward.x, -forward.z) - Float(heading * .pi / 180)
-
-            guard headingIsSeeded else {
-                if weight > 0.5 {
-                    headingCorrection = target
-                    headingIsSeeded = true
-                    hasHeadingEstimate = true
-                } else if !hasHeadingEstimate {
-                    headingCorrection = target
-                }
-                return
-            }
-            guard weight > 0 else { return }
-            guard let dt, dt < 1 else {
-                if weight > 0.5 { headingCorrection = target }
-                return
-            }
-            headingCorrection += wrappedAngle(target - headingCorrection)
-                * weight * (1 - exp(-dt / headingTimeConstant))
+            headingEstimator.update(
+                forward: forward,
+                up: up,
+                heading: heading,
+                speed: speed,
+                loadFactor: loadFactor,
+                now: ProcessInfo.processInfo.systemUptime
+            )
         }
 
         // MARK: - Géométrie
@@ -787,10 +1423,13 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
         }
 
         private func configureScene() {
-            scene.background.contents = Self.skyColor
-            scene.fogColor = Self.skyColor
-            scene.fogStartDistance = 1_500
-            scene.fogEndDistance = 7_000
+            // Ciel en projection équirectangulaire : SceneKit la rend comme une skybox, l'horizon
+            // reste donc fixe quel que soit l'angle de la caméra.
+            scene.background.contents = Self.skyImage() ?? Self.skyColor
+            // Brouillard léger, de la teinte de l'horizon : il fond seulement le lointain dans le ciel.
+            scene.fogColor = Self.horizonColor
+            scene.fogStartDistance = 5_000
+            scene.fogEndDistance = 14_000
             scene.fogDensityExponent = 1
 
             modelRoot.simdOrientation = simd_quatf(angle: -.pi / 2, axis: SIMD3<Float>(1, 0, 0))
@@ -800,6 +1439,10 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
             scene.rootNode.addChildNode(aircraft)
 
             scene.rootNode.addChildNode(makeGround())
+            // SCNPlane est vertical : couché à plat, le haut de l'image pointe vers -Z (le nord).
+            satelliteNode.simdEulerAngles = SIMD3<Float>(-.pi / 2, 0, 0)
+            satelliteNode.isHidden = true
+            scene.rootNode.addChildNode(satelliteNode)
             configureGroundGrid()
             scene.rootNode.addChildNode(groundGrid)
 
@@ -815,13 +1458,13 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
             dropLine.geometry = drop
             scene.rootNode.addChildNode(dropLine)
 
-            for node in [fullPathNode, centerTrail, leftTrail, rightTrail, trailRibbon] {
+            for node in [fullPathNode, centerTrail, leftTrail, rightTrail, trailRungs] {
                 scene.rootNode.addChildNode(node)
             }
 
             let camera = SCNCamera()
             camera.fieldOfView = 60
-            camera.zNear = 1
+            camera.zNear = 2
             camera.zFar = 12_000
             cameraNode.camera = camera
             cameraNode.simdPosition = cameraOffset
@@ -853,7 +1496,10 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
             floor.reflectivity = 0
             floor.firstMaterial?.lightingModel = .constant
             floor.firstMaterial?.diffuse.contents = PlatformColor(red: 0.16, green: 0.24, blue: 0.17, alpha: 1)
-            return SCNNode(geometry: floor)
+            let node = SCNNode(geometry: floor)
+            // Sous le plan satellite (y = 0) pour éviter le z-fighting.
+            node.position.y = -1
+            return node
         }
 
         /// Grille de repère au sol (pas de 100 m) recalée sur la position de l'avion par multiples du pas.
@@ -867,8 +1513,8 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
                 let alpha: Float = line.isMultiple(of: 5) ? 0.35 : 0.14
                 let color = SIMD4<Float>(0.75, 0.95, 0.85, alpha)
                 vertices += [
-                    SIMD3<Float>(-extent, 0.05, coordinate), SIMD3<Float>(extent, 0.05, coordinate),
-                    SIMD3<Float>(coordinate, 0.05, -extent), SIMD3<Float>(coordinate, 0.05, extent),
+                    SIMD3<Float>(-extent, 0.3, coordinate), SIMD3<Float>(extent, 0.3, coordinate),
+                    SIMD3<Float>(coordinate, 0.3, -extent), SIMD3<Float>(coordinate, 0.3, extent),
                 ]
                 colors += [color, color, color, color]
             }

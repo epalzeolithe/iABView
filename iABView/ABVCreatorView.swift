@@ -11,6 +11,7 @@ struct ABVCreatorView: View {
     @State private var isTestingGyroflow = false
     @AppStorage("ABVCreator.showConsole") private var showConsole = false
     @AppStorage(ABVAccelerationSource.storageKey) private var accelerationSource = ABVAccelerationSource.gyroflow
+    @AppStorage(ABVIntegrationMethod.storageKey) private var integrationMethod = ABVIntegrationMethod.gyroflowDefault
     @AppStorage(ABVHighResolution.storageKey) private var highResolution = false
     @State private var gyroflowTestResult: (succeeded: Bool, message: String)?
 
@@ -300,6 +301,31 @@ struct ABVCreatorView: View {
                 .fixedSize()
                 .help("Outil qui extrait les accélérations : gyro2bb (accSmooth) ou Gyroflow (export de tous les échantillons IMU, en m/s²).")
                 Spacer()
+            }
+            .disabled(model.state == .running)
+
+            HStack(spacing: 12) {
+                Text("Intégration gyro")
+                Picker("Intégration gyro", selection: $integrationMethod) {
+                    ForEach(ABVIntegrationMethod.allCases) { method in
+                        Text(method.displayName).tag(method)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .fixedSize()
+                .help("Méthode d'intégration du gyroscope utilisée par Gyroflow pour calculer l'attitude. « Défaut » laisse le réglage de l'application Gyroflow ; 1, 2 et 3 correspondent à l'index de la méthode dans Gyroflow (2 équivaut au défaut actuel). À changer en cas de dérive de l'horizon.")
+                // Descriptions d'après des essais sur un vol X6 de 30 min ; les noms exacts des méthodes
+                // n'ont pas été vérifiés dans Gyroflow.
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Défaut : réglage de l'application Gyroflow (équivaut aujourd'hui à 2).")
+                    Text("1 : fusion gyro + accéléromètre, autre algorithme que 2 (probablement Complementary) ; peut s'écarter de 2 de 20 à 45° en vol acrobatique.")
+                    Text("2 : fusion gyro + accéléromètre par défaut de Gyroflow (probablement VQF).")
+                    Text("3 : gyro seul, sans recalage de la gravité ; l'attitude dérive (~20° en 400 s), réservé aux tests.")
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
             .disabled(model.state == .running)
 

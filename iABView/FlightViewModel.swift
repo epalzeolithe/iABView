@@ -76,6 +76,12 @@ final class FlightViewModel {
     private(set) var shows3DAxes = true
     private(set) var showsVerticalGrid = false
     private(set) var showsTrajectoryTrail = true
+    /// Chase cam 3D incrustée en haut à gauche de la vidéo de droite.
+    private(set) var showsChaseCamInset = true
+    /// Vrai tant que la fenêtre Cam 3D est ouverte : l'incrustation est alors retirée pour économiser du CPU.
+    private(set) var isChaseCam3DWindowOpen = false
+    /// Option expérimentale : l'avion 3D pivote autour de la verticale pour afficher son cap absolu.
+    private(set) var usesAbsoluteHeading = true
     /// Jeu GPS affiché (le GPS2 n'existe que si l'ABV contient des colonnes `gps2_*`).
     private(set) var activeGPSSource: GPSSourceChoice = .primary
     /// Affiche aussi l'autre jeu GPS dans la vue trajectoire 3D.
@@ -615,6 +621,18 @@ final class FlightViewModel {
 
     func toggleTrajectoryTrail() {
         showsTrajectoryTrail.toggle()
+    }
+
+    func toggleChaseCamInset() {
+        showsChaseCamInset.toggle()
+    }
+
+    func setChaseCam3DWindowOpen(_ isOpen: Bool) {
+        isChaseCam3DWindowOpen = isOpen
+    }
+
+    func toggleAbsoluteHeading() {
+        usesAbsoluteHeading.toggle()
     }
 
     func reloadBookmarks() {

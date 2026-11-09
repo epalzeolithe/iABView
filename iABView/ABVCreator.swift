@@ -246,6 +246,43 @@ enum ABVAccelerationSource: String, CaseIterable, Identifiable, Sendable {
     }
 }
 
+/// Méthode d'intégration du gyroscope utilisée par Gyroflow pour calculer l'attitude (quaternion).
+/// « Défaut » n'envoie aucun preset : Gyroflow applique alors le réglage de son application, qui peut
+/// varier d'une machine ou d'une version à l'autre. Les autres choix l'imposent via `--preset`.
+enum ABVIntegrationMethod: String, CaseIterable, Identifiable, Sendable {
+    case gyroflowDefault
+    case method1
+    case method2
+    case method3
+
+    static let storageKey = "ABVCreator.integrationMethod"
+
+    var id: String { rawValue }
+
+    nonisolated var displayName: String {
+        switch self {
+        case .gyroflowDefault: "Défaut"
+        case .method1: "1"
+        case .method2: "2"
+        case .method3: "3"
+        }
+    }
+
+    /// Valeur de `gyro_source.integration_method` du preset Gyroflow (nil : pas de preset).
+    nonisolated var presetIndex: Int? {
+        switch self {
+        case .gyroflowDefault: nil
+        case .method1: 1
+        case .method2: 2
+        case .method3: 3
+        }
+    }
+
+    static var stored: ABVIntegrationMethod {
+        UserDefaults.standard.string(forKey: storageKey).flatMap(ABVIntegrationMethod.init(rawValue:)) ?? .gyroflowDefault
+    }
+}
+
 /// Option « Haute résolution » de la conversion vidéo (proposée uniquement pour les vidéos X6).
 enum ABVHighResolution {
     static let storageKey = "ABVCreator.highResolution"
@@ -551,6 +588,7 @@ final class ABVCreatorModel {
         lastDuration = nil
         let selectedSources = sources
         let accelerationSource = ABVAccelerationSource.stored
+        let integrationMethod = ABVIntegrationMethod.stored
         let highResolution = ABVHighResolution.stored && hasX6Camera
         let previewOffset: TimeInterval? = isPreview ? Double(max(0, previewOffsetMinutes)) * 60 : nil
         saveLastSession()
@@ -579,7 +617,8 @@ final class ABVCreatorModel {
                     try ABVCreatorPipeline.create(
                         sources: selectedSources, destination: destination,
                         overwrite: overwrite, keepVideo: keepVideo, previewOffset: previewOffset,
-                        accelerationSource: accelerationSource, highResolution: highResolution, cancellation: token
+                        accelerationSource: accelerationSource, integrationMethod: integrationMethod,
+                        highResolution: highResolution, cancellation: token
                     ) { update in
                         continuation.yield(update)
                     }
@@ -682,6 +721,7 @@ private enum ABVCreatorPipeline {
         keepVideo: Bool = false,
         previewOffset: TimeInterval? = nil,
         accelerationSource: ABVAccelerationSource = .gyroflow,
+        integrationMethod: ABVIntegrationMethod = .gyroflowDefault,
         highResolution: Bool = false,
         cancellation: ABVCreatorCancellationToken,
         progress: @escaping @Sendable (ABVCreatorProgress) -> Void
@@ -753,17 +793,19 @@ private enum ABVCreatorPipeline {
             var usesX6 = false
             for camera in stagedCameras {
                 try cancellation.checkCancelled()
-                announce("Extraction de la télémétrie caméra : \(camera.lastPathComponent) (accélérations : \(accelerationSource.displayName))…")
+                announce("Extraction de la télémétrie caméra : \(camera.lastPathComponent) (accélérations : \(accelerationSource.displayName), intégration : \(integrationMethod.displayName))…")
                 var segment: [CameraSample]
                 switch CameraModel(detected: detectCameraModel(of: camera)) {
                 case .x6:
                     usesX6 = true
                     segment = try cameraDataX6(
-                        from: camera, work: work, accelerationSource: accelerationSource, cancellation: cancellation
+                        from: camera, work: work, accelerationSource: accelerationSource,
+                        integrationMethod: integrationMethod, cancellation: cancellation
                     )
                 case .x4:
                     segment = try cameraData(
-                        from: camera, work: work, accelerationSource: accelerationSource, cancellation: cancellation
+                        from: camera, work: work, accelerationSource: accelerationSource,
+                        integrationMethod: integrationMethod, cancellation: cancellation
                     )
                 }
                 if let first = segment.first?.date, let last = segment.last?.date {
@@ -1154,6 +1196,7 @@ private enum ABVCreatorPipeline {
 
     nonisolated static func cameraData(
         from camera: URL, work: URL, accelerationSource: ABVAccelerationSource = .gyroflow,
+        integrationMethod: ABVIntegrationMethod = .gyroflowDefault,
         cancellation: ABVCreatorCancellationToken
     ) throws -> [CameraSample] {
         let gyroflow = try executable("Gyroflow", candidates: ABVTool.gyroflow.candidates)
@@ -1161,7 +1204,10 @@ private enum ABVCreatorPipeline {
         try? FileManager.default.removeItem(at: quaternionURL)
         do {
             try run(
-                gyroflow, gyroflowExportArguments(camera: camera, output: quaternionURL, source: accelerationSource),
+                gyroflow,
+                gyroflowExportArguments(
+                    camera: camera, output: quaternionURL, source: accelerationSource, integrationMethod: integrationMethod
+                ),
                 work: work, cancellation: cancellation
             )
         } catch ABVCreatorError.commandFailed(let name, let output) {
@@ -1258,6 +1304,7 @@ private enum ABVCreatorPipeline {
     /// (format du CSV gyro2bb, échelle de l'accéléromètre, axes…).
     nonisolated static func cameraDataX6(
         from camera: URL, work: URL, accelerationSource: ABVAccelerationSource = .gyroflow,
+        integrationMethod: ABVIntegrationMethod = .gyroflowDefault,
         cancellation: ABVCreatorCancellationToken
     ) throws -> [CameraSample] {
         let gyroflow = try executable("Gyroflow", candidates: ABVTool.gyroflow.candidates)
@@ -1265,7 +1312,10 @@ private enum ABVCreatorPipeline {
         try? FileManager.default.removeItem(at: quaternionURL)
         do {
             try run(
-                gyroflow, gyroflowExportArguments(camera: camera, output: quaternionURL, source: accelerationSource),
+                gyroflow,
+                gyroflowExportArguments(
+                    camera: camera, output: quaternionURL, source: accelerationSource, integrationMethod: integrationMethod
+                ),
                 work: work, cancellation: cancellation
             )
         } catch ABVCreatorError.commandFailed(let name, let output) {
@@ -1371,9 +1421,13 @@ private enum ABVCreatorPipeline {
         """
 
     nonisolated static func gyroflowExportArguments(
-        camera: URL, output: URL, source: ABVAccelerationSource
+        camera: URL, output: URL, source: ABVAccelerationSource,
+        integrationMethod: ABVIntegrationMethod = .gyroflowDefault
     ) -> [String] {
         var arguments = [camera.path, "--export-metadata", "3:\(output.path)"]
+        if let index = integrationMethod.presetIndex {
+            arguments += ["--preset", "{ 'version': 2, 'gyro_source': { 'integration_method': \(index) } }"]
+        }
         if source == .gyroflow {
             arguments += ["--export-metadata-fields", gyroflowAllSamplesFields]
         }

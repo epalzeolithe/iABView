@@ -14,12 +14,18 @@ final class ScreenRecorder: NSObject {
     private var stream: SCStream?
     private var recordingOutput: SCRecordingOutput?
 
-    func toggleRecording(destinationDirectory: URL?) {
+    /// `window` : fenêtre à filmer (par défaut la fenêtre active). `filePrefix` nomme le fichier
+    /// du Bureau (`record_001.mp4`, `chasecam_001.mp4`…).
+    func toggleRecording(
+        window: NSWindow? = nil,
+        filePrefix: String = "record",
+        capturesAudio: Bool = true
+    ) {
         Task {
             if isRecording {
                 await stopRecording()
             } else {
-                await startRecording(destinationDirectory: destinationDirectory)
+                await startRecording(window: window, filePrefix: filePrefix, capturesAudio: capturesAudio)
             }
         }
     }
@@ -28,11 +34,11 @@ final class ScreenRecorder: NSObject {
         errorMessage = nil
     }
 
-    private func startRecording(destinationDirectory: URL?) async {
+    private func startRecording(window: NSWindow?, filePrefix: String, capturesAudio: Bool) async {
         do {
             try ensureScreenCapturePermission()
 
-            guard let appWindow = NSApp.keyWindow ?? NSApp.mainWindow else {
+            guard let appWindow = window ?? NSApp.keyWindow ?? NSApp.mainWindow else {
                 throw RecorderError.windowUnavailable
             }
 
@@ -46,9 +52,9 @@ final class ScreenRecorder: NSObject {
                 throw RecorderError.windowUnavailable
             }
 
-            let directory = destinationDirectory
-                ?? FileManager.default.urls(for: .moviesDirectory, in: .userDomainMask)[0]
-            let outputURL = nextRecordingURL(in: directory)
+            // Les enregistrements vont sur le Bureau, quel que soit le vol ouvert.
+            let directory = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask)[0]
+            let outputURL = nextRecordingURL(in: directory, prefix: filePrefix)
             let filter = SCContentFilter(desktopIndependentWindow: captureWindow)
 
             let configuration = SCStreamConfiguration()
@@ -56,7 +62,7 @@ final class ScreenRecorder: NSObject {
             configuration.height = max(2, Int(captureWindow.frame.height) * 2)
             configuration.minimumFrameInterval = CMTime(value: 1, timescale: 60)
             configuration.queueDepth = 5
-            configuration.capturesAudio = true
+            configuration.capturesAudio = capturesAudio
             configuration.excludesCurrentProcessAudio = false
             configuration.showsCursor = true
 
@@ -113,16 +119,16 @@ final class ScreenRecorder: NSObject {
         }
     }
 
-    private func nextRecordingURL(in directory: URL) -> URL {
+    private func nextRecordingURL(in directory: URL, prefix: String) -> URL {
         for index in 1...9_999 {
             let url = directory.appendingPathComponent(
-                String(format: "record_%03d.mp4", index)
+                "\(prefix)_\(String(format: "%03d", index)).mp4"
             )
             if !FileManager.default.fileExists(atPath: url.path) {
                 return url
             }
         }
-        return directory.appendingPathComponent("record_\(UUID().uuidString).mp4")
+        return directory.appendingPathComponent("\(prefix)_\(UUID().uuidString).mp4")
     }
 }
 
@@ -182,7 +188,7 @@ final class ScreenRecorder {
     private(set) var lastRecordingURL: URL?
     private(set) var errorMessage: String?
 
-    func toggleRecording(destinationDirectory: URL?) {
+    func toggleRecording(filePrefix: String = "record") {
         errorMessage = "L’enregistrement de la fenêtre n’est disponible que sur Mac."
     }
 

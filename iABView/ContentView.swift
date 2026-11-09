@@ -63,6 +63,15 @@ struct ContentView: View {
         #endif
     }
 
+    #if os(macOS)
+    /// « ABView — <vol>.abv — CPU xx % » : le nom du bundle ouvert et la charge CPU, quand ils sont connus.
+    private var windowTitle: String {
+        ["ABView", model.bundleURL?.lastPathComponent, cpuUsageText.isEmpty ? nil : cpuUsageText]
+            .compactMap { $0 }
+            .joined(separator: " — ")
+    }
+    #endif
+
     var body: some View {
         NavigationSplitView(
             columnVisibility: $columnVisibility,
@@ -92,22 +101,36 @@ struct ContentView: View {
                 isRecording: recorder.isRecording,
                 onOpen: openBundlePanel,
                 onToggleRecording: {
-                    recorder.toggleRecording(destinationDirectory: model.bundleURL)
+                    recorder.toggleRecording()
                 },
                 onOpenChaseCam: { isChaseCamPresented = true },
                 onAddBookmark: { isBookmarkDialogPresented = true },
                 onDetachFront: { detachedWindows.showFrontVideo(model: model) },
                 onDetachBack: { detachedWindows.showBackVideo(model: model) },
                 onDetachAircraft: { detachedWindows.showAircraft(model: model) },
-                onDetachFlightPath: { detachedWindows.showGPS(model: model) }
+                onDetachFlightPath: { detachedWindows.showGPS(model: model) },
+                onOpenChaseCam3D: {
+                    #if os(macOS)
+                    detachedWindows.showChaseCam3D(model: model)
+                    #else
+                    isChaseCam3DPresented = true
+                    #endif
+                }
             )
         }
         #if os(macOS)
         .frame(minWidth: 1_100, minHeight: 720)
         .background(
-            WindowTitleSetter(
-                title: cpuUsageText.isEmpty ? "ABView" : "ABView — \(cpuUsageText)"
-            )
+            WindowTitleSetter(title: windowTitle)
+        )
+        // Le raccourci Z vit hors du Menu de la toolbar : les raccourcis d'un Menu ne sont pas
+        // fiables tant que le menu n'a pas été ouvert.
+        .background(
+            Button("Zoom timeline") { model.toggleTimelineZoom() }
+                .keyboardShortcut("z", modifiers: [])
+                .opacity(0)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
         )
         .task {
             cpuMonitor.start()
@@ -178,14 +201,14 @@ struct ContentView: View {
             )
             #endif
         }
+        #if !os(macOS)
         .sheet(isPresented: $isChaseCam3DPresented) {
-            #if os(macOS)
             ChaseCam3DView(model: model)
-                .frame(minWidth: 900, minHeight: 650)
-            #else
-            ChaseCam3DView(model: model)
-            #endif
         }
+        .onChange(of: isChaseCam3DPresented) { _, isPresented in
+            model.setChaseCam3DWindowOpen(isPresented)
+        }
+        #endif
         .sheet(isPresented: $isKeyboardHelpPresented) {
             KeyboardShortcutsView()
         }
@@ -199,39 +222,7 @@ struct ContentView: View {
             model.openBundle(url)
             preferredCompactColumn = .detail
         }
-        .alert(
-            "Erreur d’enregistrement",
-            isPresented: Binding(
-                get: { recorder.errorMessage != nil },
-                set: { if !$0 { recorder.dismissError() } }
-            )
-        ) {
-            Button("OK") { recorder.dismissError() }
-        } message: {
-            Text(recorder.errorMessage ?? "")
-        }
-        .alert(
-            "Impossible d’ouvrir le vol",
-            isPresented: Binding(
-                get: { model.errorMessage != nil },
-                set: { if !$0 { model.dismissError() } }
-            )
-        ) {
-            Button("OK") { model.dismissError() }
-        } message: {
-            Text(model.errorMessage ?? "")
-        }
-        .alert(
-            "Mise à jour METAR",
-            isPresented: Binding(
-                get: { model.metarUpdateMessage != nil },
-                set: { if !$0 { model.dismissMETARUpdateMessage() } }
-            )
-        ) {
-            Button("OK") { model.dismissMETARUpdateMessage() }
-        } message: {
-            Text(model.metarUpdateMessage ?? "")
-        }
+        .modifier(FlightErrorAlerts(model: model, recorder: recorder))
         .toolbar {
             ToolbarItemGroup {
                 Button {
@@ -249,9 +240,13 @@ struct ContentView: View {
                     .disabled(model.samples.isEmpty)
 
                     Button {
+                        #if os(macOS)
+                        detachedWindows.showChaseCam3D(model: model)
+                        #else
                         isChaseCam3DPresented = true
+                        #endif
                     } label: {
-                        Label("Cam 3D", systemImage: "airplane.circle.fill")
+                        Label("Cam 3D", systemImage: "cube.transparent")
                     }
                     .disabled(model.samples.isEmpty)
 
@@ -326,7 +321,6 @@ struct ContentView: View {
                     Button(model.isTimelineZoomed ? "Désactiver le zoom timeline" : "Zoomer la timeline") {
                         model.toggleTimelineZoom()
                     }
-                    .keyboardShortcut("z", modifiers: [])
 
                     Toggle(
                         "Afficher les axes 3D",
@@ -347,6 +341,20 @@ struct ContentView: View {
                         isOn: Binding(
                             get: { model.showsTrajectoryTrail },
                             set: { _ in model.toggleTrajectoryTrail() }
+                        )
+                    )
+                    Toggle(
+                        "Incruster la Cam 3D sur la vidéo de droite",
+                        isOn: Binding(
+                            get: { model.showsChaseCamInset },
+                            set: { _ in model.toggleChaseCamInset() }
+                        )
+                    )
+                    Toggle(
+                        "Orienter l'avion sur le cap absolu",
+                        isOn: Binding(
+                            get: { model.usesAbsoluteHeading },
+                            set: { _ in model.toggleAbsoluteHeading() }
                         )
                     )
                     if model.hasSecondaryGPS {
@@ -393,7 +401,7 @@ struct ContentView: View {
 
                 #if os(macOS)
                 Button {
-                    recorder.toggleRecording(destinationDirectory: model.bundleURL)
+                    recorder.toggleRecording()
                 } label: {
                     Label(
                         recorder.isRecording ? "Arrêter l’enregistrement" : "Enregistrer",
@@ -484,6 +492,50 @@ struct ContentView: View {
         #else
         isBundleImporterPresented = true
         #endif
+    }
+}
+
+/// Alertes d'erreur du vol, de l'enregistrement et de la mise à jour METAR. Extraites du `body` de
+/// `ContentView`, dont la chaîne de modificateurs devenait trop longue pour le compilateur.
+private struct FlightErrorAlerts: ViewModifier {
+    let model: FlightViewModel
+    let recorder: ScreenRecorder
+
+    func body(content: Content) -> some View {
+        content
+            .alert(
+                "Erreur d’enregistrement",
+                isPresented: Binding(
+                    get: { recorder.errorMessage != nil },
+                    set: { if !$0 { recorder.dismissError() } }
+                )
+            ) {
+                Button("OK") { recorder.dismissError() }
+            } message: {
+                Text(recorder.errorMessage ?? "")
+            }
+            .alert(
+                "Impossible d’ouvrir le vol",
+                isPresented: Binding(
+                    get: { model.errorMessage != nil },
+                    set: { if !$0 { model.dismissError() } }
+                )
+            ) {
+                Button("OK") { model.dismissError() }
+            } message: {
+                Text(model.errorMessage ?? "")
+            }
+            .alert(
+                "Mise à jour METAR",
+                isPresented: Binding(
+                    get: { model.metarUpdateMessage != nil },
+                    set: { if !$0 { model.dismissMETARUpdateMessage() } }
+                )
+            ) {
+                Button("OK") { model.dismissMETARUpdateMessage() }
+            } message: {
+                Text(model.metarUpdateMessage ?? "")
+            }
     }
 }
 
@@ -590,8 +642,10 @@ struct FlightWorkspace: View {
     let onDetachBack: () -> Void
     let onDetachAircraft: () -> Void
     let onDetachFlightPath: () -> Void
+    let onOpenChaseCam3D: () -> Void
     @State private var fullScreenVideo: FlightVideoSelection?
     @State private var fullScreenInstrument: FlightInstrumentSelection?
+    @State private var chaseCamInsetOptions = ChaseCam3DOptions()
 
     var body: some View {
         if model.isLoading {
@@ -735,6 +789,35 @@ struct FlightWorkspace: View {
         .padding(6)
     }
 
+    /// Chase cam 3D en petit format, en haut à gauche de la vidéo de droite ; un clic ouvre la fenêtre.
+    private var chaseCamInset: some View {
+        ChaseCam3DView(model: model, isInset: true, insetOptions: chaseCamInsetOptions)
+            .frame(width: 240, height: 150)
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(.white.opacity(0.5), lineWidth: 1))
+            // La vue SceneKit capte les clics : un calque transparent les reçoit à sa place.
+            .overlay {
+                Color.clear
+                    .contentShape(Rectangle())
+                    .onTapGesture(perform: onOpenChaseCam3D)
+                    .contextMenu {
+                        Picker("Cadrage", selection: $chaseCamInsetOptions.preset) {
+                            ForEach(ChaseCam3DPreset.allCases) { Text($0.rawValue).tag($0) }
+                        }
+                        Toggle("Trajectoire complète", isOn: $chaseCamInsetOptions.showsFullPath)
+                        Toggle("Vue satellite", isOn: $chaseCamInsetOptions.showsSatellite)
+                        Toggle("GPS Smoothing", isOn: $chaseCamInsetOptions.smoothsGPS)
+                        Divider()
+                        Button("Ouvrir la fenêtre Cam 3D", action: onOpenChaseCam3D)
+                        Button("Masquer l'incrustation") { model.toggleChaseCamInset() }
+                    }
+            }
+            .padding(8)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .accessibilityLabel("Chase cam 3D")
+            .accessibilityAddTraits(.isButton)
+    }
+
     private var videoRow: some View {
         HStack(spacing: 6) {
             ZStack(alignment: .topTrailing) {
@@ -799,6 +882,12 @@ struct FlightWorkspace: View {
                 fullScreenVideo = .back
             }
             #endif
+            // Posée après les gestes de la vidéo : un clic sur l'incrustation n'ouvre pas la vidéo.
+            .overlay(alignment: .topLeading) {
+                if model.showsChaseCamInset && !model.isChaseCam3DWindowOpen {
+                    chaseCamInset
+                }
+            }
         }
     }
 
@@ -823,11 +912,16 @@ struct FlightWorkspace: View {
                         )
                     }
                     .padding(8)
-                    #if os(macOS)
-                    detachButton(action: onDetachAircraft)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
-                    #endif
                 }
+                #if os(macOS)
+                // En overlay du conteneur plutôt qu'en frère plein cadre dans le ZStack : un
+                // frère `.frame(maxWidth: .infinity, maxHeight: .infinity)` au-dessus d'une
+                // SCNView NSViewRepresentable n'est pas fiable pour recevoir le clic.
+                // En bas à gauche : le coin bas droit porte déjà les lectures Pitch/Bank.
+                .overlay(alignment: .bottomLeading) {
+                    detachButton(action: onDetachAircraft)
+                }
+                #endif
                 .clipShape(RoundedRectangle(cornerRadius: 7))
                 .frame(minWidth: 280)
                 .layoutPriority(1)
@@ -902,6 +996,7 @@ struct FlightWorkspace: View {
             showsAxes: model.shows3DAxes,
             showsVerticalGrid: model.showsVerticalGrid,
             showsTrajectoryTrail: model.showsTrajectoryTrail,
+            usesAbsoluteHeading: model.usesAbsoluteHeading,
             accelerationX: sample?.accelerationX ?? 0,
             accelerationY: sample?.accelerationY ?? 0,
             accelerationZ: sample?.accelerationZ ?? 0,
@@ -937,8 +1032,12 @@ struct FlightWorkspace: View {
             Label("Détacher", systemImage: "arrow.up.forward.app")
         }
         .labelStyle(.titleAndIcon)
-        .buttonStyle(.bordered)
-        .controlSize(.small)
+        .buttonStyle(.plain)
+        .font(.caption)
+        .foregroundStyle(.white)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(.black.opacity(0.65), in: Capsule())
         .padding(6)
         .help("Détacher cette vue")
     }
