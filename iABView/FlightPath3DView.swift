@@ -135,6 +135,21 @@ struct FlightPath3DView: View {
     }
 }
 
+#if os(macOS)
+/// SCNView dont la molette (ou le défilement trackpad) zoome au lieu de translater la caméra.
+private final class ScrollZoomSCNView: SCNView {
+    var onScrollZoom: ((CGFloat) -> Void)?
+
+    override func scrollWheel(with event: NSEvent) {
+        let delta = event.scrollingDeltaY
+        guard delta != 0 else { return }
+        let sensitivity: CGFloat = event.hasPreciseScrollingDeltas ? 0.01 : 0.05
+        // Défilement vers le haut : on se rapproche.
+        onScrollZoom?(exp(-delta * sensitivity))
+    }
+}
+#endif
+
 private struct FlightPathScene: PlatformViewRepresentable {
     let model: FlightViewModel
     let cameraZoomCommand: Int
@@ -167,7 +182,16 @@ private struct FlightPathScene: PlatformViewRepresentable {
     #endif
 
     private func makeView(context: Context) -> SCNView {
+        #if os(macOS)
+        // La molette du contrôleur par défaut déplace la caméra en hauteur : on la détourne en zoom.
+        let view = ScrollZoomSCNView()
+        view.onScrollZoom = { [weak coordinator = context.coordinator, weak view] factor in
+            guard let view else { return }
+            coordinator?.zoom(by: factor, view: view)
+        }
+        #else
         let view = SCNView()
+        #endif
         view.backgroundColor = platformBackgroundColor
         // Same tradeoff as Aircraft3DView: this renders on demand but still
         // frequently during playback, and 2x MSAA is plenty for this panel's
@@ -393,17 +417,27 @@ private struct FlightPathScene: PlatformViewRepresentable {
         }
 
         func applyZoomCommand(_ command: Int, view: SCNView) {
-            guard command != appliedZoomCommand, let target = cameraTarget else { return }
+            guard command != appliedZoomCommand, cameraTarget != nil else { return }
+            zoom(by: command > appliedZoomCommand ? 0.8 : 1.25, view: view)
+            appliedZoomCommand = command
+        }
+
+        /// Rapproche (facteur < 1) ou éloigne (> 1) la caméra de sa cible, sans changer son axe de visée.
+        func zoom(by factor: CGFloat, view: SCNView) {
+            guard let target = cameraTarget else { return }
             let camera = view.pointOfView ?? cameraNode
-            let factor: SCNFloat = command > appliedZoomCommand ? 0.8 : 1.25
-            camera.position = SCNVector3(
-                target.x + (camera.position.x - target.x) * factor,
-                target.y + (camera.position.y - target.y) * factor,
-                target.z + (camera.position.z - target.z) * factor
+            let scale = SCNFloat(factor)
+            let offset = SCNVector3(
+                (camera.position.x - target.x) * scale,
+                (camera.position.y - target.y) * scale,
+                (camera.position.z - target.z) * scale
             )
+            let distance = (offset.x * offset.x + offset.y * offset.y + offset.z * offset.z).squareRoot()
+            // Garde-fou : on ne traverse pas la cible en zoomant.
+            guard distance > 0.2 || factor > 1 else { return }
+            camera.position = SCNVector3(target.x + offset.x, target.y + offset.y, target.z + offset.z)
             camera.look(at: target)
             view.defaultCameraController.target = target
-            appliedZoomCommand = command
         }
 
         private func addTrajectory(samples: [FlightSample]) {

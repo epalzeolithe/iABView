@@ -890,7 +890,9 @@ private enum ABVCreatorPipeline {
             } else {
                 announce("Conversion vidéo en cours…" + estimateText)
             try convertVideo(
-                cameras: videoCameras, window: videoWindow, front: front, back: back, work: work,
+                // X6 : les vues avant et arrière sont inversées par rapport à l'X4, on permute les sorties.
+                cameras: videoCameras, window: videoWindow,
+                front: usesX6 ? back : front, back: usesX6 ? front : back, work: work,
                 highResolution: highResolution,
                 status: ffmpegStatus, cancellation: cancellation
             ) { cpu in

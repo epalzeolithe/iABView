@@ -146,6 +146,14 @@ struct ContentView: View {
                 isLastBundleDialogPresented = model.lastBundleName != nil
             }
         }
+        #if os(macOS)
+        // Fermer la fenêtre ne quitte pas l'app : sans cela la vidéo (et son son) continuerait, y compris
+        // dans les fenêtres détachées qui partagent les mêmes lecteurs.
+        .onDisappear {
+            model.pausePlayback()
+            detachedWindows.closeAll()
+        }
+        #endif
         .onOpenURL { url in
             model.openBundle(url)
             preferredCompactColumn = .detail
@@ -645,7 +653,6 @@ struct FlightWorkspace: View {
     let onOpenChaseCam3D: () -> Void
     @State private var fullScreenVideo: FlightVideoSelection?
     @State private var fullScreenInstrument: FlightInstrumentSelection?
-    @State private var chaseCamInsetOptions = ChaseCam3DOptions()
 
     var body: some View {
         if model.isLoading {
@@ -791,31 +798,7 @@ struct FlightWorkspace: View {
 
     /// Chase cam 3D en petit format, en haut à gauche de la vidéo de droite ; un clic ouvre la fenêtre.
     private var chaseCamInset: some View {
-        ChaseCam3DView(model: model, isInset: true, insetOptions: chaseCamInsetOptions)
-            .frame(width: 240, height: 150)
-            .clipShape(RoundedRectangle(cornerRadius: 8))
-            .overlay(RoundedRectangle(cornerRadius: 8).stroke(.white.opacity(0.5), lineWidth: 1))
-            // La vue SceneKit capte les clics : un calque transparent les reçoit à sa place.
-            .overlay {
-                Color.clear
-                    .contentShape(Rectangle())
-                    .onTapGesture(perform: onOpenChaseCam3D)
-                    .contextMenu {
-                        Picker("Cadrage", selection: $chaseCamInsetOptions.preset) {
-                            ForEach(ChaseCam3DPreset.allCases) { Text($0.rawValue).tag($0) }
-                        }
-                        Toggle("Trajectoire complète", isOn: $chaseCamInsetOptions.showsFullPath)
-                        Toggle("Vue satellite", isOn: $chaseCamInsetOptions.showsSatellite)
-                        Toggle("GPS Smoothing", isOn: $chaseCamInsetOptions.smoothsGPS)
-                        Divider()
-                        Button("Ouvrir la fenêtre Cam 3D", action: onOpenChaseCam3D)
-                        Button("Masquer l'incrustation") { model.toggleChaseCamInset() }
-                    }
-            }
-            .padding(8)
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-            .accessibilityLabel("Chase cam 3D")
-            .accessibilityAddTraits(.isButton)
+        ChaseCamInsetView(model: model, onOpen: onOpenChaseCam3D)
     }
 
     private var videoRow: some View {
@@ -1045,6 +1028,52 @@ struct FlightWorkspace: View {
 
 /// Évalue son contenu dans son propre corps : les valeurs observées lues par `content`
 /// n'invalident que cette vue, et non la vue parente qui la construit.
+/// Incrustation de la chase cam 3D (en haut à gauche de la vidéo de droite) ; un clic ouvre la fenêtre.
+/// Vue isolée avec ses propres options : le menu contextuel n'est pas reconstruit (clignotement)
+/// quand `FlightWorkspace` se réévalue.
+private struct ChaseCamInsetView: View {
+    let model: FlightViewModel
+    let onOpen: () -> Void
+    @State private var options = ChaseCam3DOptions()
+
+    var body: some View {
+        ChaseCam3DView(model: model, isInset: true, insetOptions: options)
+            .frame(width: 240, height: 150)
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(.white.opacity(0.5), lineWidth: 1))
+            // La vue SceneKit capte les clics : un calque transparent les reçoit à sa place.
+            .overlay {
+                Color.clear
+                    .contentShape(Rectangle())
+                    .onTapGesture(perform: onOpen)
+                    .contextMenu {
+                        ForEach(ChaseCam3DPreset.allCases) { preset in
+                            Button {
+                                options.preset = preset
+                            } label: {
+                                if options.preset == preset {
+                                    Label(preset.rawValue, systemImage: "checkmark")
+                                } else {
+                                    Text(preset.rawValue)
+                                }
+                            }
+                        }
+                        Divider()
+                        Toggle("Trajectoire complète", isOn: $options.showsFullPath)
+                        Toggle("Vue satellite", isOn: $options.showsSatellite)
+                        Toggle("GPS Smoothing", isOn: $options.smoothsGPS)
+                        Divider()
+                        Button("Ouvrir la fenêtre Cam 3D", action: onOpen)
+                        Button("Masquer l'incrustation") { model.toggleChaseCamInset() }
+                    }
+            }
+            .padding(8)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .accessibilityLabel("Chase cam 3D")
+            .accessibilityAddTraits(.isButton)
+    }
+}
+
 private struct ObservationScope<Content: View>: View {
     @ViewBuilder let content: () -> Content
 

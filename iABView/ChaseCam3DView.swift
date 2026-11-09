@@ -8,11 +8,27 @@ import AppKit
 private typealias PlatformColor = NSColor
 private typealias PlatformImage = NSImage
 private typealias PlatformViewRepresentable = NSViewRepresentable
+private typealias PlatformPanRecognizer = NSPanGestureRecognizer
+private typealias PlatformGestureDelegate = NSGestureRecognizerDelegate
+
+/// SCNView qui transmet la molette au coordinator quand il la veut (zoom pendant le glisser).
+private final class ChaseSCNView: SCNView {
+    var onScroll: ((Float) -> Bool)?
+
+    override func scrollWheel(with event: NSEvent) {
+        let scale: CGFloat = event.hasPreciseScrollingDeltas ? 0.004 : 0.04
+        if onScroll?(Float(event.scrollingDeltaY * scale)) != true {
+            super.scrollWheel(with: event)
+        }
+    }
+}
 #else
 import UIKit
 private typealias PlatformColor = UIColor
 private typealias PlatformImage = UIImage
 private typealias PlatformViewRepresentable = UIViewRepresentable
+private typealias PlatformPanRecognizer = UIPanGestureRecognizer
+private typealias PlatformGestureDelegate = UIGestureRecognizerDelegate
 #endif
 
 /// Cadrages disponibles pour la caméra de poursuite 3D.
@@ -139,8 +155,8 @@ private struct HeadingEstimator {
 
 /// Options de la chase cam 3D incrustée, modifiables par son menu contextuel (clic droit).
 struct ChaseCam3DOptions: Equatable {
-    var preset: ChaseCam3DPreset = .dynamic
-    var showsFullPath = true
+    var preset: ChaseCam3DPreset = .close
+    var showsFullPath = false
     var showsSatellite = true
     var smoothsGPS = true
 }
@@ -175,7 +191,10 @@ struct ChaseCam3DView: View {
             showsFullPath: isInset ? insetOptions.showsFullPath : showsFullPath,
             showsSatellite: isInset ? insetOptions.showsSatellite : showsSatellite,
             smoothsGPS: isInset ? insetOptions.smoothsGPS : smoothsGPS,
-            isInset: isInset
+            isInset: isInset,
+            isPlaying: model.isPlaying,
+            // Lu seulement en pause : un déplacement du curseur réveille alors le rendu.
+            pausedTime: model.isPlaying ? 0 : model.slowTime
         )
         .overlay(alignment: .topLeading) {
             if !isInset {
@@ -348,6 +367,8 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
     let showsSatellite: Bool
     let smoothsGPS: Bool
     let isInset: Bool
+    let isPlaying: Bool
+    let pausedTime: TimeInterval
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
@@ -372,7 +393,14 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
     #endif
 
     private func makeView(context: Context) -> SCNView {
+        #if os(macOS)
+        let view = ChaseSCNView()
+        view.onScroll = { [weak coordinator = context.coordinator] delta in
+            coordinator?.handleScroll(delta) ?? false
+        }
+        #else
         let view = SCNView()
+        #endif
         view.scene = context.coordinator.scene
         view.pointOfView = context.coordinator.cameraNode
         view.backgroundColor = Coordinator.skyColor
@@ -381,6 +409,22 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
         view.allowsCameraControl = false
         view.autoenablesDefaultLighting = false
         view.delegate = context.coordinator
+        context.coordinator.sceneView = view
+        if !isInset {
+            // Maintenir le bouton (ou le doigt) enfoncé fait pivoter la caméra autour de l'avion.
+            #if os(macOS)
+            let pan = NSPanGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handlePan(_:)))
+            #else
+            let pan = UIPanGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handlePan(_:)))
+            #endif
+            view.addGestureRecognizer(pan)
+            #if !os(macOS)
+            let pinch = UIPinchGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handlePinch(_:)))
+            pinch.delegate = context.coordinator
+            pan.delegate = context.coordinator
+            view.addGestureRecognizer(pinch)
+            #endif
+        }
         // La caméra se lisse image par image : 60 fps pour un mouvement fluide (30 en incrustation).
         view.preferredFramesPerSecond = isInset ? 30 : 60
         view.isPlaying = true
@@ -390,6 +434,8 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
     }
 
     private func updateView(_ view: SCNView, context: Context) {
+        // Réveille le rendu (arrêté après une pause) ; le coordinator le rendort une fois la caméra posée.
+        if !view.isPlaying { view.isPlaying = true }
         context.coordinator.configure(
             samples: samples,
             samplesRevision: samplesRevision,
@@ -401,11 +447,12 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
             showsFullPath: showsFullPath,
             showsSatellite: showsSatellite,
             smoothsGPS: smoothsGPS,
-            isInset: isInset
+            isInset: isInset,
+            isPlaying: isPlaying
         )
     }
 
-    final class Coordinator: NSObject, SCNSceneRendererDelegate {
+    final class Coordinator: NSObject, SCNSceneRendererDelegate, PlatformGestureDelegate {
         static let skyColor = PlatformColor(red: 0.35, green: 0.48, blue: 0.60, alpha: 1)
         /// Teinte de l'horizon : celle du brouillard, pour que le lointain se fonde dans le ciel.
         static let horizonColor = PlatformColor(red: 0.74, green: 0.87, blue: 0.97, alpha: 1)
@@ -487,6 +534,77 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
         private var hasSatelliteImage = false
         private var showsSatellite = true
         private var isInset = false
+        weak var sceneView: SCNView?
+
+        // Déviation manuelle de la caméra (glisser) : azimut et élévation ajoutés au cadrage,
+        // résorbés progressivement au relâchement.
+        private var orbitYaw: Float = 0
+        private var orbitPitch: Float = 0
+        private var isDragging = false
+        /// Zoom manuel (logarithme du facteur de distance), résorbé comme la déviation.
+        private var orbitZoom: Float = 0
+        private var isPinching = false
+
+        /// Molette : zoome seulement pendant que le bouton est enfoncé. Renvoie `true` si l'événement est consommé.
+        func handleScroll(_ delta: Float) -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            guard isDragging else { return false }
+            orbitZoom = max(-1.2, min(1.5, orbitZoom - delta))
+            idleFrames = 0
+            DispatchQueue.main.async { [weak self] in self?.sceneView?.isPlaying = true }
+            return true
+        }
+
+        #if !os(macOS)
+        @objc func handlePinch(_ recognizer: UIPinchGestureRecognizer) {
+            lock.lock()
+            defer { lock.unlock() }
+            switch recognizer.state {
+            case .began, .changed:
+                isPinching = true
+                // Écarter les doigts rapproche la caméra.
+                orbitZoom = max(-1.2, min(1.5, orbitZoom - log(Float(recognizer.scale))))
+                recognizer.scale = 1
+            default:
+                isPinching = false
+            }
+            idleFrames = 0
+            DispatchQueue.main.async { [weak self] in self?.sceneView?.isPlaying = true }
+        }
+
+        func gestureRecognizer(
+            _ gestureRecognizer: UIGestureRecognizer,
+            shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer
+        ) -> Bool { true }
+        #endif
+
+        @objc func handlePan(_ recognizer: PlatformPanRecognizer) {
+            let translation = recognizer.translation(in: recognizer.view)
+            #if os(macOS)
+            let delta = SIMD2<Float>(Float(translation.x), Float(translation.y))
+            recognizer.setTranslation(.zero, in: recognizer.view)
+            #else
+            let delta = SIMD2<Float>(Float(translation.x), -Float(translation.y))
+            recognizer.setTranslation(.zero, in: recognizer.view)
+            #endif
+            lock.lock()
+            defer { lock.unlock() }
+            switch recognizer.state {
+            case .began, .changed:
+                isDragging = true
+                // La caméra suit la souris : vers la droite → côté droit de l'avion, vers le haut → plus haut.
+                orbitYaw = wrapAngle(orbitYaw - delta.x * 0.008)
+                orbitPitch = max(-0.5, min(1.2, orbitPitch + delta.y * 0.006))
+            default:
+                isDragging = false
+            }
+            idleFrames = 0
+            DispatchQueue.main.async { [weak self] in self?.sceneView?.isPlaying = true }
+        }
+        private var isPlaybackActive = true
+        /// Images consécutives sans changement de temps vidéo : au-delà d'un seuil, en pause, le rendu s'arrête.
+        private var idleFrames = 0
 
         // Repère local de la trajectoire (origine = premier échantillon) et option de lissage.
         private var referenceLatitude = 0.0
@@ -531,11 +649,14 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
             showsFullPath: Bool,
             showsSatellite: Bool,
             smoothsGPS: Bool,
-            isInset: Bool
+            isInset: Bool,
+            isPlaying: Bool
         ) {
             lock.lock()
             defer { lock.unlock() }
             self.isInset = isInset
+            self.isPlaybackActive = isPlaying
+            idleFrames = 0
             self.showsSatellite = showsSatellite
             let smoothingChanged = self.smoothsGPS != smoothsGPS
             self.smoothsGPS = smoothsGPS
@@ -970,6 +1091,15 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
             }
             let timeChanged = lastPlayerSeconds != seconds
             lastPlayerSeconds = seconds
+            if timeChanged || snap || isPlaybackActive {
+                idleFrames = 0
+            } else {
+                idleFrames += 1
+                // En pause, la caméra converge en ≈ 2 s puis plus rien ne bouge : on arrête le rendu.
+                if idleFrames == 150, let view = sceneView {
+                    DispatchQueue.main.async { view.isPlaying = false }
+                }
+            }
 
             let index = sampleIndex(at: seconds, in: samples)
             let sample = samples[index]
@@ -1008,7 +1138,7 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
                 deltaTime: wallDelta,
                 snap: snap
             )
-            if timeChanged, abs(seconds - lastTrailSeconds) >= 0.1 {
+            if timeChanged, abs(seconds - lastTrailSeconds) >= (isInset ? 0.2 : 0.1) {
                 lastTrailSeconds = seconds
                 updateTrail(
                     seconds: seconds,
@@ -1077,18 +1207,33 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
                 let magnitude = simd_length(inertia)
                 if magnitude > limit { inertia *= limit / magnitude }
             }
-            let backHeading = chaseHeading + .pi + azimuth
+            if !isDragging && !isPinching {
+                let decay = exp(-deltaTime / 0.7)
+                orbitYaw *= decay
+                orbitPitch *= decay
+                orbitZoom *= decay
+                if abs(orbitYaw) < 0.001 && abs(orbitPitch) < 0.001 && abs(orbitZoom) < 0.001 {
+                    orbitYaw = 0
+                    orbitPitch = 0
+                    orbitZoom = 0
+                }
+            }
+            distance *= exp(orbitZoom)
+            let backHeading = chaseHeading + .pi + azimuth + orbitYaw
+            let elevation = max(-0.35, min(1.5, preset.elevation + orbitPitch))
             let targetOffset = SIMD3<Float>(
-                sin(backHeading) * distance * cos(preset.elevation),
-                distance * sin(preset.elevation) - chaseClimb * distance * 0.35,
-                -cos(backHeading) * distance * cos(preset.elevation)
+                sin(backHeading) * distance * cos(elevation),
+                distance * sin(elevation) - chaseClimb * distance * 0.35,
+                -cos(backHeading) * distance * cos(elevation)
             ) + inertia
             if snap {
                 currentFieldOfView = fieldOfView
             } else {
                 currentFieldOfView += (fieldOfView - currentFieldOfView) * (1 - exp(-deltaTime / 0.6))
             }
-            cameraNode.camera?.fieldOfView = CGFloat(currentFieldOfView)
+            if let camera = cameraNode.camera, abs(Float(camera.fieldOfView) - currentFieldOfView) > 0.01 {
+                camera.fieldOfView = CGFloat(currentFieldOfView)
+            }
             if snap {
                 cameraOffset = targetOffset
             } else {
@@ -1136,13 +1281,15 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
             isInverted: Bool
         ) {
             let firstTime = knotTimes[0]
-            let step = trailDuration / Double(trailPointCount - 1)
+            // Incrustation : moins de points, et pas de barreaux (illisibles à cette taille).
+            let pointCount = isInset ? trailPointCount / 3 : trailPointCount
+            let step = trailDuration / Double(pointCount - 1)
             var centers: [SIMD3<Float>] = []
             var lefts: [SIMD3<Float>] = []
             var rights: [SIMD3<Float>] = []
             var speeds: [Double] = []
             var fades: [Float] = []
-            for pointIndex in 0..<trailPointCount {
+            for pointIndex in 0..<pointCount {
                 let time = seconds - trailDuration + Double(pointIndex) * step
                 guard time >= firstTime else { continue }
                 let sample = samples[sampleIndex(at: time, in: samples)]
@@ -1189,6 +1336,10 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
             // Un barreau toutes les 0,25 s relie les saumons d'aile du même instant : il se vrille avec
             // le roulis. Calés sur des multiples de 0,25 s absolus, les barreaux défilent avec la traînée
             // au lieu de glisser dessus.
+            guard !isInset else {
+                trailRungs.geometry = nil
+                return
+            }
             let rungInterval = 0.25
             var rungVertices: [SIMD3<Float>] = []
             var rungColors: [SIMD4<Float>] = []
@@ -1412,11 +1563,7 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
 
         private func loadModelIfNeeded(from url: URL?) {
             guard let url, url != currentModelURL else { return }
-            guard let geometry = try? STLGeometryLoader.load(from: url) else { return }
-            let model = SCNNode(geometry: geometry)
-            let zCorrection = simd_quatf(angle: .pi, axis: SIMD3<Float>(0, 0, 1))
-            let tiltCorrection = simd_quatf(angle: Float(5 * Double.pi / 180), axis: SIMD3<Float>(1, 0, 0))
-            model.simdOrientation = zCorrection * tiltCorrection
+            guard let model = try? AircraftModelLoader.makeNode(from: url) else { return }
             modelRoot.childNodes.forEach { $0.removeFromParentNode() }
             modelRoot.addChildNode(model)
             currentModelURL = url

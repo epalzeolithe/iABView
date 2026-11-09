@@ -5,6 +5,18 @@ import SwiftUI
 import AppKit
 private typealias PlatformColor = NSColor
 private typealias PlatformViewRepresentable = NSViewRepresentable
+
+/// SceneKit traduit la molette en déplacement vertical de la caméra ; ici elle doit zoomer.
+private final class ZoomingSCNView: SCNView {
+    override func scrollWheel(with event: NSEvent) {
+        let scale: CGFloat = event.hasPreciseScrollingDeltas ? 0.01 : 0.1
+        defaultCameraController.dolly(
+            by: Float(event.scrollingDeltaY * scale),
+            onScreenPoint: convert(event.locationInWindow, from: nil),
+            viewport: bounds.size
+        )
+    }
+}
 #else
 import UIKit
 private typealias PlatformColor = UIColor
@@ -57,7 +69,11 @@ struct Aircraft3DView: PlatformViewRepresentable {
     #endif
 
     private func makeView(context: Context) -> SCNView {
+        #if os(macOS)
+        let view = ZoomingSCNView()
+        #else
         let view = SCNView()
+        #endif
         view.scene = context.coordinator.scene
         view.backgroundColor = PlatformColor(
             red: 0.35,
@@ -133,6 +149,8 @@ struct Aircraft3DView: PlatformViewRepresentable {
         let northVector = SCNNode()
         /// Axe Z (ligne + libellé) : masqué quand le nord est affiché, car il lui est colinéaire.
         private let zAxis = SCNNode()
+        private lazy var xAxisLine = coloredLine(from: SCNVector3Zero, to: SCNVector3(3, 0, 0), color: .systemRed)
+        private lazy var yAxisLine = coloredLine(from: SCNVector3Zero, to: SCNVector3(0, 3, 0), color: .systemGreen)
         private lazy var xAxisLabel = axisLabel("X", color: .systemRed, position: SCNVector3(3.15, 0, 0))
         private lazy var yAxisLabel = axisLabel("Y", color: .systemGreen, position: SCNVector3(0, 3.15, 0))
         private let groundGrid = SCNNode()
@@ -758,17 +776,7 @@ struct Aircraft3DView: PlatformViewRepresentable {
         func loadModelIfNeeded(from url: URL?) {
             guard let url, url != currentModelURL else { return }
             do {
-                let geometry = try STLGeometryLoader.load(from: url)
-                let model = SCNNode(geometry: geometry)
-                let stlZCorrection = simd_quatf(
-                    angle: .pi,
-                    axis: SIMD3<Float>(0, 0, 1)
-                )
-                let stlTiltCorrection = simd_quatf(
-                    angle: Float(5 * Double.pi / 180),
-                    axis: SIMD3<Float>(1, 0, 0)
-                )
-                model.simdOrientation = stlZCorrection * stlTiltCorrection
+                let model = try AircraftModelLoader.makeNode(from: url)
                 modelRoot.childNodes.forEach { $0.removeFromParentNode() }
                 modelRoot.addChildNode(model)
                 currentModelURL = url
@@ -990,23 +998,18 @@ struct Aircraft3DView: PlatformViewRepresentable {
             zAxis.isHidden = enabled
             (xAxisLabel.geometry as? SCNText)?.string = enabled ? "E" : "X"
             (yAxisLabel.geometry as? SCNText)?.string = enabled ? "Z" : "Y"
+            // L'axe Est est en bleu, comme la flèche du nord est en vert ; l'axe Z (vertical) est rouge.
+            let xColor: PlatformColor = enabled ? .systemBlue : .systemRed
+            xAxisLine.geometry?.firstMaterial?.diffuse.contents = xColor
+            xAxisLabel.geometry?.firstMaterial?.diffuse.contents = xColor
+            let yColor: PlatformColor = enabled ? .systemRed : .systemGreen
+            yAxisLine.geometry?.firstMaterial?.diffuse.contents = yColor
+            yAxisLabel.geometry?.firstMaterial?.diffuse.contents = yColor
         }
 
         private func configureAxes() {
-            axes.addChildNode(
-                coloredLine(
-                    from: SCNVector3Zero,
-                    to: SCNVector3(3, 0, 0),
-                    color: .systemRed
-                )
-            )
-            axes.addChildNode(
-                coloredLine(
-                    from: SCNVector3Zero,
-                    to: SCNVector3(0, 3, 0),
-                    color: .systemGreen
-                )
-            )
+            axes.addChildNode(xAxisLine)
+            axes.addChildNode(yAxisLine)
             zAxis.addChildNode(
                 coloredLine(
                     from: SCNVector3Zero,
@@ -1025,7 +1028,7 @@ struct Aircraft3DView: PlatformViewRepresentable {
         // c'est la référence à partir de laquelle le mode cap absolu mesure le cap.
         private func configureNorthVector() {
             let length: Float = 3
-            let color = PlatformColor.systemOrange
+            let color = PlatformColor.systemGreen
             northVector.simdPosition = SIMD3<Float>(0, 0.8, 0)
             northVector.addChildNode(
                 coloredLine(from: SCNVector3Zero, to: SCNVector3(0, 0, -length), color: color)

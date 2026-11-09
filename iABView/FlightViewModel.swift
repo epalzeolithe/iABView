@@ -59,10 +59,9 @@ final class FlightViewModel {
     private(set) var metarUpdateMessage: String?
     private(set) var errorMessage: String?
     private(set) var isPlaying = false
-    private(set) var aircraftModelURL = Bundle.main.url(
-        forResource: "CAP10",
-        withExtension: "stl"
-    )
+    /// Modèle texturé s'il est dans le bundle, sinon le STL gris d'origine.
+    private(set) var aircraftModelURL = Bundle.main.url(forResource: "CAP10", withExtension: "usdz")
+        ?? Bundle.main.url(forResource: "CAP10", withExtension: "stl")
     private(set) var mountingPitch = 15.0
     private(set) var isCameraInverted = false
     private(set) var isTimelineZoomed = false
@@ -697,6 +696,15 @@ final class FlightViewModel {
         mountingPitch = acos(max(-1, min(1, averageY / magnitude))) * 180 / .pi - 2
         updateLoadFactorExtrema()
         saveCalibration()
+    }
+
+    /// Arrête la lecture (vidéo et son) sans la relancer : utilisé quand la fenêtre se ferme.
+    func pausePlayback() {
+        frontPlayer.pause()
+        backPlayer.pause()
+        guard isPlaying else { return }
+        isPlaying = false
+        slowIndex = currentIndex
     }
 
     func togglePlayback() {
