@@ -43,7 +43,6 @@ struct ContentView: View {
     @State private var model = FlightViewModel()
     @State private var recorder = ScreenRecorder()
     @State private var detachedWindows = DetachedWindowManager()
-    @State private var isChaseCamPresented = false
     @State private var isChaseCam3DPresented = false
     @State private var isKeyboardHelpPresented = false
     @State private var columnVisibility: NavigationSplitViewVisibility = .detailOnly
@@ -103,7 +102,6 @@ struct ContentView: View {
                 onToggleRecording: {
                     recorder.toggleRecording()
                 },
-                onOpenChaseCam: { isChaseCamPresented = true },
                 onAddBookmark: { isBookmarkDialogPresented = true },
                 onDetachFront: { detachedWindows.showFrontVideo(model: model) },
                 onDetachBack: { detachedWindows.showBackVideo(model: model) },
@@ -132,6 +130,22 @@ struct ContentView: View {
                 .allowsHitTesting(false)
                 .accessibilityHidden(true)
         )
+        // Idem pour I (inversion du montage) et ⌃R (recharger bookmark.csv).
+        .background(
+            Group {
+                Button("Inverser le montage caméra") {
+                    if !model.samples.isEmpty { model.toggleCameraInversion() }
+                }
+                .keyboardShortcut("i", modifiers: [])
+                Button("Recharger bookmark.csv") {
+                    if !model.samples.isEmpty { model.reloadBookmarks() }
+                }
+                .keyboardShortcut("r", modifiers: .control)
+            }
+            .opacity(0)
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+        )
         .task {
             cpuMonitor.start()
         }
@@ -142,6 +156,8 @@ struct ContentView: View {
             if let initialBundleURL {
                 model.openBundle(initialBundleURL)
                 preferredCompactColumn = .detail
+            } else if true { // DEBUG-TEMP
+                model.openLastBundle()
             } else {
                 isLastBundleDialogPresented = model.lastBundleName != nil
             }
@@ -193,22 +209,6 @@ struct ContentView: View {
         .onChange(of: isBookmarkDialogPresented) { _, isPresented in
             if isPresented { bookmarkTimeText = model.currentTime.clockString }
         }
-        .sheet(isPresented: $isChaseCamPresented) {
-            #if os(macOS)
-            ChaseCamView(
-                samples: model.samples,
-                sample: model.currentSample,
-                maximumSpeed: model.maximumSpeed
-            )
-                .frame(minWidth: 900, minHeight: 650)
-            #else
-            ChaseCamView(
-                samples: model.samples,
-                sample: model.currentSample,
-                maximumSpeed: model.maximumSpeed
-            )
-            #endif
-        }
         #if !os(macOS)
         .sheet(isPresented: $isChaseCam3DPresented) {
             ChaseCam3DView(model: model)
@@ -240,13 +240,6 @@ struct ContentView: View {
                 }
 
                 if !isRunningOnIPhone {
-                    Button {
-                        isChaseCamPresented = true
-                    } label: {
-                        Label("Cam", systemImage: "binoculars.fill")
-                    }
-                    .disabled(model.samples.isEmpty)
-
                     Button {
                         #if os(macOS)
                         detachedWindows.showChaseCam3D(model: model)
@@ -290,6 +283,9 @@ struct ContentView: View {
                     }
                     Button("Trajectoire GPS") {
                         detachedWindows.showGPS(model: model)
+                    }
+                    Button("Chase cam 3D") {
+                        detachedWindows.showChaseCam3D(model: model)
                     }
                 } label: {
                     Label("Détacher une vue", systemImage: "macwindow.on.rectangle")
@@ -352,13 +348,6 @@ struct ContentView: View {
                         )
                     )
                     Toggle(
-                        "Incruster la Cam 3D sur la vidéo de droite",
-                        isOn: Binding(
-                            get: { model.showsChaseCamInset },
-                            set: { _ in model.toggleChaseCamInset() }
-                        )
-                    )
-                    Toggle(
                         "Orienter l'avion sur le cap absolu",
                         isOn: Binding(
                             get: { model.usesAbsoluteHeading },
@@ -398,7 +387,6 @@ struct ContentView: View {
                             set: { _ in model.toggleCameraInversion() }
                         )
                     )
-                    .keyboardShortcut("i", modifiers: [])
                 } label: {
                     Label(
                         "Calibration \(model.mountingPitch, format: .number.precision(.fractionLength(1)))°",
@@ -438,7 +426,6 @@ struct ContentView: View {
                     Button("Recharger bookmark.csv") {
                         model.reloadBookmarks()
                     }
-                    .keyboardShortcut("r", modifiers: .control)
 
                     Button("Ouvrir bookmark.csv") {
                         model.openBookmarksFile()
@@ -644,7 +631,6 @@ struct FlightWorkspace: View {
     let isRecording: Bool
     let onOpen: () -> Void
     let onToggleRecording: () -> Void
-    let onOpenChaseCam: () -> Void
     let onAddBookmark: () -> Void
     let onDetachFront: () -> Void
     let onDetachBack: () -> Void
@@ -796,11 +782,6 @@ struct FlightWorkspace: View {
         .padding(6)
     }
 
-    /// Chase cam 3D en petit format, en haut à gauche de la première vidéo (caméra avant) ; un clic ouvre la fenêtre.
-    private var chaseCamInset: some View {
-        ChaseCamInsetView(model: model, onOpen: onOpenChaseCam3D)
-    }
-
     private var videoRow: some View {
         HStack(spacing: 6) {
             ZStack(alignment: .topTrailing) {
@@ -818,25 +799,13 @@ struct FlightWorkspace: View {
                     isCameraInverted: model.isCameraInverted,
                     overlayStyle: isRunningOnIPhone ? .headingOnly : .standard
                 )
-                #if os(macOS)
-                detachButton(action: onDetachFront)
-                #endif
             }
-            #if os(macOS)
-            .contentShape(Rectangle())
-            .onTapGesture(count: 2, perform: onDetachFront)
-            #else
+            #if !os(macOS)
             .contentShape(Rectangle())
             .onTapGesture {
                 fullScreenVideo = .front
             }
             #endif
-            // Posée après les gestes de la vidéo : un clic sur l'incrustation n'ouvre pas la vidéo.
-            .overlay(alignment: .topLeading) {
-                if model.showsChaseCamInset && !model.isChaseCam3DWindowOpen {
-                    chaseCamInset
-                }
-            }
             ZStack(alignment: .topTrailing) {
                 VideoPane(
                     title: "Caméra arrière",
@@ -850,9 +819,6 @@ struct FlightWorkspace: View {
                     overlayStyle: isRunningOnIPhone ? .headingOnly : .standard
                 )
                 VStack(alignment: .trailing, spacing: 4) {
-                    #if os(macOS)
-                    detachButton(action: onDetachBack)
-                    #endif
                     PlaybackDiagnosticsOverlay(
                         currentFrame: model.currentVideoFrame,
                         playbackCorrectionCount: model.playbackCorrectionCount,
@@ -862,10 +828,7 @@ struct FlightWorkspace: View {
                 }
                 .padding(8)
             }
-            #if os(macOS)
-            .contentShape(Rectangle())
-            .onTapGesture(count: 2, perform: onDetachBack)
-            #else
+            #if !os(macOS)
             .contentShape(Rectangle())
             .onTapGesture {
                 fullScreenVideo = .back
@@ -882,89 +845,92 @@ struct FlightWorkspace: View {
 
     private func instrumentRowContent(in workspaceSize: CGSize) -> some View {
         HStack(spacing: 6) {
-                ZStack(alignment: .topTrailing) {
-                    ObservationScope { aircraftView(sample: model.renderingSample) }
-                    ObservationScope {
-                        AircraftReadoutOverlay(
-                            sample: model.currentSample,
-                            loadFactor: model.currentSignedLoadFactor,
-                            minimumLoadFactor: model.minimumLoadFactor,
-                            maximumLoadFactor: model.maximumLoadFactor,
-                            mountingPitch: model.mountingPitch,
-                            isCameraInverted: model.isCameraInverted
-                        )
-                    }
-                    .padding(8)
-                }
-                #if os(macOS)
-                // En overlay du conteneur plutôt qu'en frère plein cadre dans le ZStack : un
-                // frère `.frame(maxWidth: .infinity, maxHeight: .infinity)` au-dessus d'une
-                // SCNView NSViewRepresentable n'est pas fiable pour recevoir le clic.
-                // En bas à gauche : le coin bas droit porte déjà les lectures Pitch/Bank.
-                .overlay(alignment: .bottomLeading) {
-                    detachButton(action: onDetachAircraft)
-                }
-                #endif
-                .clipShape(RoundedRectangle(cornerRadius: 7))
-                .frame(minWidth: 280)
+            ChaseCamPane(model: model, onOpen: onOpenChaseCam3D)
                 .layoutPriority(1)
-                #if !os(macOS)
-                .contentShape(Rectangle())
-                .onTapGesture {
-                    fullScreenInstrument = .aircraft
-                }
-                #endif
 
-                // The two horizon gauges stack vertically with 8pt between them;
-                // sizing from that so their combined height matches the STL pane
-                // next to them, instead of a width-driven proportion that could
-                // run taller than the row and get clipped.
-                let horizonSize = max(60, (workspaceSize.height - 8) / 2)
-
-                ObservationScope {
-                    TelemetryPanel(
-                        sample: model.currentSample,
-                        signedLoadFactor: model.currentSignedLoadFactor,
-                        mountingPitch: model.mountingPitch,
-                        isCameraInverted: model.isCameraInverted,
-                        horizonSize: horizonSize
-                    )
-                }
-                .frame(width: horizonSize, height: horizonSize * 2 + 8)
-                .frame(maxHeight: .infinity)
-
-                ZStack(alignment: .bottom) {
-                    FlightPath3DView(model: model)
-                    #if os(macOS)
-                    detachButton(action: onDetachFlightPath)
-                    #endif
-                }
-                .clipShape(RoundedRectangle(cornerRadius: 7))
-                .frame(minWidth: 280)
+            aircraftPane
+                .frame(minWidth: 220, maxWidth: .infinity, maxHeight: .infinity)
+                .clipped()
                 .layoutPriority(1)
-                #if !os(macOS)
-                .contentShape(Rectangle())
-                .onTapGesture {
-                    fullScreenInstrument = .flightPath
-                }
-                #endif
 
-                ObservationScope {
-                    FlightMapView(
-                        coordinates: model.routeCoordinates,
-                        sample: model.slowSample,
-                        metar: model.slowMETAR,
-                        routeProgress: model.slowRouteProgress
-                    )
-                }
-                .frame(minWidth: 260)
-                #if !os(macOS)
-                .contentShape(Rectangle())
-                .onTapGesture(count: 2) {
-                    fullScreenInstrument = .map
-                }
-                #endif
+            // The two horizon gauges stack vertically with 8pt between them;
+            // sizing from that so their combined height matches the STL pane
+            // next to them, instead of a width-driven proportion that could
+            // run taller than the row and get clipped.
+            let horizonSize = max(60, (workspaceSize.height - 8) / 2)
+
+            ObservationScope {
+                TelemetryPanel(
+                    sample: model.currentSample,
+                    signedLoadFactor: model.currentSignedLoadFactor,
+                    mountingPitch: model.mountingPitch,
+                    isCameraInverted: model.isCameraInverted,
+                    horizonSize: horizonSize
+                )
+            }
+            .frame(width: horizonSize, height: horizonSize * 2 + 8)
+            .frame(maxHeight: .infinity)
+
+            flightPathPane
+                .frame(minWidth: 220, maxWidth: .infinity, maxHeight: .infinity)
+                .clipped()
+                .layoutPriority(1)
+
+            ObservationScope {
+                FlightMapView(
+                    coordinates: model.routeCoordinates,
+                    sample: model.slowSample,
+                    metar: model.slowMETAR,
+                    routeProgress: model.slowRouteProgress
+                )
+            }
+            .frame(minWidth: 260)
+            #if !os(macOS)
+            .contentShape(Rectangle())
+            .onTapGesture(count: 2) {
+                fullScreenInstrument = .map
+            }
+            #endif
         }
+    }
+
+    private var aircraftPane: some View {
+        ZStack(alignment: .topTrailing) {
+            ObservationScope { aircraftView(sample: model.renderingSample) }
+            ObservationScope {
+                AircraftReadoutOverlay(
+                    sample: model.currentSample,
+                    loadFactor: model.currentSignedLoadFactor,
+                    minimumLoadFactor: model.minimumLoadFactor,
+                    maximumLoadFactor: model.maximumLoadFactor,
+                    mountingPitch: model.mountingPitch,
+                    isCameraInverted: model.isCameraInverted
+                )
+            }
+            .padding(8)
+            // Purement informatif : ne doit pas capter la souris destinée à l'orbite de la SCNView.
+            .allowsHitTesting(false)
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 7))
+        #if !os(macOS)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            fullScreenInstrument = .aircraft
+        }
+        #endif
+    }
+
+    private var flightPathPane: some View {
+        ZStack(alignment: .bottom) {
+            FlightPath3DView(model: model)
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 7))
+        #if !os(macOS)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            fullScreenInstrument = .flightPath
+        }
+        #endif
     }
 
     private func aircraftView(sample: FlightSample?) -> some View {
@@ -1001,7 +967,6 @@ struct FlightWorkspace: View {
             onFineJumpBackward: { model.jump(by: -2) },
             onFineJumpForward: { model.jump(by: 2) },
             onToggleRecording: onToggleRecording,
-            onOpenChaseCam: onOpenChaseCam,
             onAddBookmark: onAddBookmark,
             onPreviousBookmark: model.previousBookmark,
             onNextBookmark: model.nextBookmark,
@@ -1009,68 +974,57 @@ struct FlightWorkspace: View {
             onLevelFlight: model.seekNextLevelFlight
         )
     }
-
-    private func detachButton(action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Label("Détacher", systemImage: "arrow.up.forward.app")
-        }
-        .labelStyle(.titleAndIcon)
-        .buttonStyle(.plain)
-        .font(.caption)
-        .foregroundStyle(.white)
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
-        .background(.black.opacity(0.65), in: Capsule())
-        .padding(6)
-        .help("Détacher cette vue")
-    }
 }
 
 /// Évalue son contenu dans son propre corps : les valeurs observées lues par `content`
 /// n'invalident que cette vue, et non la vue parente qui la construit.
-/// Incrustation de la chase cam 3D (en haut à gauche de la vidéo de droite) ; un clic ouvre la fenêtre.
-/// Vue isolée avec ses propres options : le menu contextuel n'est pas reconstruit (clignotement)
-/// quand `FlightWorkspace` se réévalue.
-private struct ChaseCamInsetView: View {
+/// Chase cam 3D intégrée à la seconde ligne de l'espace de travail, avec ses options dans un menu en coin.
+private struct ChaseCamPane: View {
     let model: FlightViewModel
     let onOpen: () -> Void
     @State private var options = ChaseCam3DOptions()
 
     var body: some View {
-        ChaseCam3DView(model: model, isInset: true, insetOptions: options)
-            .frame(width: 240, height: 150)
-            .clipShape(RoundedRectangle(cornerRadius: 8))
-            .overlay(RoundedRectangle(cornerRadius: 8).stroke(.white.opacity(0.5), lineWidth: 1))
-            // La vue SceneKit capte les clics : un calque transparent les reçoit à sa place.
-            .overlay {
-                Color.clear
-                    .contentShape(Rectangle())
-                    .onTapGesture(perform: onOpen)
-                    .contextMenu {
-                        ForEach(ChaseCam3DPreset.allCases) { preset in
-                            Button {
-                                options.preset = preset
-                            } label: {
-                                if options.preset == preset {
-                                    Label(preset.rawValue, systemImage: "checkmark")
-                                } else {
-                                    Text(preset.rawValue)
-                                }
-                            }
+        ChaseCam3DView(
+            model: model, isInset: true, insetOptions: options,
+            loadsDetailTiles: true, isInteractive: true
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 7))
+        .frame(minWidth: 340, maxWidth: 520)
+        // Pas de calque par-dessus la vue SceneKit : elle doit recevoir la souris (orbite, zoom).
+        // Les options et l'ouverture de la fenêtre passent par un petit menu en coin.
+        .overlay(alignment: .topTrailing) {
+            Menu {
+                ForEach(ChaseCam3DPreset.allCases) { preset in
+                    Button {
+                        options.preset = preset
+                    } label: {
+                        if options.preset == preset {
+                            Label(preset.rawValue, systemImage: "checkmark")
+                        } else {
+                            Text(preset.rawValue)
                         }
-                        Divider()
-                        Toggle("Trajectoire complète", isOn: $options.showsFullPath)
-                        Toggle("Vue satellite", isOn: $options.showsSatellite)
-                        Toggle("GPS Smoothing", isOn: $options.smoothsGPS)
-                        Divider()
-                        Button("Ouvrir la fenêtre Cam 3D", action: onOpen)
-                        Button("Masquer l'incrustation") { model.toggleChaseCamInset() }
                     }
+                }
+                Divider()
+                Toggle("Trajectoire complète", isOn: $options.showsFullPath)
+                Toggle("Vue satellite", isOn: $options.showsSatellite)
+                Toggle("GPS Smoothing", isOn: $options.smoothsGPS)
+                Divider()
+                Button("Ouvrir la fenêtre Cam 3D", action: onOpen)
+            } label: {
+                Image(systemName: "ellipsis.circle.fill")
+                    .font(.title3)
+                    .foregroundStyle(.white, .black.opacity(0.55))
             }
-            .padding(8)
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-            .accessibilityLabel("Chase cam 3D")
-            .accessibilityAddTraits(.isButton)
+            .menuStyle(.button)
+            .buttonStyle(.plain)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .padding(6)
+            .accessibilityLabel("Options de la chase cam")
+        }
+        .accessibilityLabel("Chase cam 3D")
     }
 }
 

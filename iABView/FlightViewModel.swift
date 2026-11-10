@@ -75,8 +75,6 @@ final class FlightViewModel {
     private(set) var shows3DAxes = true
     private(set) var showsVerticalGrid = false
     private(set) var showsTrajectoryTrail = true
-    /// Chase cam 3D incrustée en haut à gauche de la vidéo de droite.
-    private(set) var showsChaseCamInset = true
     /// Vrai tant que la fenêtre Cam 3D est ouverte : l'incrustation est alors retirée pour économiser du CPU.
     private(set) var isChaseCam3DWindowOpen = false
     /// Option expérimentale : l'avion 3D pivote autour de la verticale pour afficher son cap absolu.
@@ -620,10 +618,6 @@ final class FlightViewModel {
 
     func toggleTrajectoryTrail() {
         showsTrajectoryTrail.toggle()
-    }
-
-    func toggleChaseCamInset() {
-        showsChaseCamInset.toggle()
     }
 
     func setChaseCam3DWindowOpen(_ isOpen: Bool) {

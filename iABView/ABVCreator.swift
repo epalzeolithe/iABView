@@ -292,6 +292,16 @@ enum ABVHighResolution {
     }
 }
 
+/// Option « Export vidéo 360° » : produit en plus `video360.mp4` (équirectangulaire), pour une future
+/// incrustation orientable dans l'app.
+enum ABVExport360 {
+    static let storageKey = "ABVCreator.export360"
+
+    static var stored: Bool {
+        UserDefaults.standard.bool(forKey: storageKey)
+    }
+}
+
 /// Binaire Gyroflow personnalisé choisi dans le créateur. Vide : binaire de base de /Applications.
 enum ABVGyroflowBinary {
     static let storageKey = "ABVCreator.gyroflowCustomPath"
@@ -606,8 +616,9 @@ final class ABVCreatorModel {
         lastDuration = nil
         let selectedSources = sources
         let accelerationSource = ABVAccelerationSource.stored
-        let integrationMethod = ABVIntegrationMethod.stored
+        let integrationMethod = ABVIntegrationMethod.gyroflowDefault
         let highResolution = ABVHighResolution.stored && hasX6Camera
+        let export360 = ABVExport360.stored
         let previewOffset: TimeInterval? = isPreview ? Double(max(0, previewOffsetMinutes)) * 60 : nil
         saveLastSession()
         let token = ABVCreatorCancellationToken()
@@ -636,7 +647,7 @@ final class ABVCreatorModel {
                         sources: selectedSources, destination: destination,
                         overwrite: overwrite, keepVideo: keepVideo, previewOffset: previewOffset,
                         accelerationSource: accelerationSource, integrationMethod: integrationMethod,
-                        highResolution: highResolution, cancellation: token
+                        highResolution: highResolution, export360: export360, cancellation: token
                     ) { update in
                         continuation.yield(update)
                     }
@@ -741,6 +752,7 @@ private enum ABVCreatorPipeline {
         accelerationSource: ABVAccelerationSource = .gyroflow,
         integrationMethod: ABVIntegrationMethod = .gyroflowDefault,
         highResolution: Bool = false,
+        export360: Bool = false,
         cancellation: ABVCreatorCancellationToken,
         progress: @escaping @Sendable (ABVCreatorProgress) -> Void
     ) throws -> CreationResult {
@@ -912,6 +924,7 @@ private enum ABVCreatorPipeline {
                 cameras: videoCameras, window: videoWindow,
                 front: usesX6 ? back : front, back: usesX6 ? front : back, work: work,
                 highResolution: highResolution,
+                video360: export360 ? output.appendingPathComponent("video360.mp4") : nil,
                 status: ffmpegStatus, cancellation: cancellation
             ) { cpu in
                 let snapshot = ffmpegStatus.snapshot
@@ -980,7 +993,7 @@ private enum ABVCreatorPipeline {
 
     /// Supprime tout le contenu du paquet sauf les vidéos déjà converties.
     nonisolated static func removeAllExceptVideos(in package: URL) {
-        let keep: Set<String> = ["front.mp4", "back.mp4"]
+        let keep: Set<String> = ["front.mp4", "back.mp4", "video360.mp4"]
         let items = (try? FileManager.default.contentsOfDirectory(atPath: package.path)) ?? []
         for name in items where !keep.contains(name) {
             try? FileManager.default.removeItem(at: package.appendingPathComponent(name))
@@ -1160,6 +1173,7 @@ private enum ABVCreatorPipeline {
         cameras: [URL], window: (offset: TimeInterval, duration: TimeInterval)? = nil,
         front: URL, back: URL, work: URL,
         highResolution: Bool = false,
+        video360: URL? = nil,
         status: ABVFFmpegStatus? = nil,
         cancellation: ABVCreatorCancellationToken,
         onCPUSample: @escaping @Sendable (Double) -> Void
@@ -1184,19 +1198,22 @@ private enum ABVCreatorPipeline {
             [vb]v360=input=hammer:output=hammer:yaw=180:w=1920:h=1080,crop=960:540,scale=1920:1080:flags=lanczos[back]
             """
         }
+        // Branche 360° optionnelle : le fisheye double est aussi projeté en équirectangulaire.
+        let sphere = video360 == nil ? "" : "[v]split=2[vsrc][v360src];[v360src]v360=input=dfisheye:output=equirect:ih_fov=193:iv_fov=193:w=3840:h=1920[eq];"
+        let source = video360 == nil ? "[v]" : "[vsrc]"
         let filter: String
         if cameras.count == 2 {
             filter = """
             [0:v:0][0:v:1]hstack[v0];[1:v:0][1:v:1]hstack[v1];
             [v0][v1]concat=n=2:v=1:a=0[v];
             [0:a][1:a]concat=n=2:v=0:a=1[a];[a]asplit=2[a1][a2];
-            [v]v360=input=dfisheye:output=hammer:ih_fov=193:iv_fov=193[vh];[vh]split=2[vf][vb];
+            \(sphere)\(source)v360=input=dfisheye:output=hammer:ih_fov=193:iv_fov=193[vh];[vh]split=2[vf][vb];
             \(views)
             """
         } else {
             filter = """
             [0:v:0][0:v:1]hstack[v];[0:a]asplit=2[a1][a2];
-            [v]v360=input=dfisheye:output=hammer:ih_fov=193:iv_fov=193[vh];[vh]split=2[vf][vb];
+            \(sphere)\(source)v360=input=dfisheye:output=hammer:ih_fov=193:iv_fov=193[vh];[vh]split=2[vf][vb];
             \(views)
             """
         }
@@ -1208,6 +1225,13 @@ private enum ABVCreatorPipeline {
         }
         arguments += outputArguments(map: "[front]", audio: "[a1]", url: front)
         arguments += outputArguments(map: "[back]", audio: "[a2]", url: back)
+        if let video360 {
+            arguments += ["-map", "[eq]", "-an", "-c:v", "h264_videotoolbox", "-b:v", "20M",
+                          "-maxrate", "20M", "-bufsize", "60M", "-profile:v", "high", "-g", "60",
+                          "-allow_sw", "1", "-pix_fmt", "yuv420p"]
+            if let window { arguments += ["-t", String(format: "%.3f", window.duration)] }
+            arguments.append(video360.path)
+        }
         try run(
             ffmpeg, arguments, work: work, cancellation: cancellation, onCPUSample: onCPUSample,
             onOutput: status.map { status in { @Sendable text in status.ingest(text) } }

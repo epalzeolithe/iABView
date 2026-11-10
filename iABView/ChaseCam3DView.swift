@@ -41,8 +41,15 @@ enum ChaseCam3DPreset: String, CaseIterable, Identifiable {
     case wide = "Large"
     case side = "Côté"
     case top = "Dessus"
+    /// Caméra solidaire de l'avion, au bout de l'aile gauche, tournée vers le cockpit.
+    case wingtip = "Bout d'aile"
+    /// Caméra solidaire de l'avion, en haut de la dérive, tournée vers l'avant.
+    case tail = "Empennage"
 
     var id: String { rawValue }
+
+    /// Cadrage rigidement lié à l'avion (il en suit tous les mouvements, sans lissage).
+    var isFixedToAircraft: Bool { self == .wingtip || self == .tail }
 
     /// Distance caméra-avion, en mètres.
     var distance: Float {
@@ -53,6 +60,7 @@ enum ChaseCam3DPreset: String, CaseIterable, Identifiable {
         case .wide: 90
         case .side: 45
         case .top: 70
+        case .wingtip, .tail: 0
         }
     }
 
@@ -65,6 +73,7 @@ enum ChaseCam3DPreset: String, CaseIterable, Identifiable {
         case .wide: 25
         case .side: 8
         case .top: 70
+        case .wingtip, .tail: 0
         }
         return degrees * .pi / 180
     }
@@ -169,9 +178,13 @@ struct ChaseCam3DView: View {
     /// satellite allégée. Ses options viennent de `insetOptions` (menu clic droit de l'incrustation).
     var isInset = false
     var insetOptions = ChaseCam3DOptions()
+    /// Charge aussi les tuiles satellite haute résolution à basse altitude (sinon réservées à la version fenêtrée).
+    var loadsDetailTiles = false
+    /// Active la souris (orbite au glisser, zoom à la molette) sur une version incrustée.
+    var isInteractive = false
     @Environment(\.dismiss) private var dismiss
     @State private var preset: ChaseCam3DPreset = .standard
-    @State private var showsFullPath = true
+    @State private var showsFullPath = false
     @State private var showsSatellite = true
     @State private var smoothsGPS = true
     #if os(macOS)
@@ -192,6 +205,8 @@ struct ChaseCam3DView: View {
             showsSatellite: isInset ? insetOptions.showsSatellite : showsSatellite,
             smoothsGPS: isInset ? insetOptions.smoothsGPS : smoothsGPS,
             isInset: isInset,
+            loadsDetailTiles: !isInset || loadsDetailTiles,
+            isInteractive: !isInset || isInteractive,
             isPlaying: model.isPlaying,
             // Lu seulement en pause : un déplacement du curseur réveille alors le rendu.
             pausedTime: model.isPlaying ? 0 : model.slowTime
@@ -367,6 +382,8 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
     let showsSatellite: Bool
     let smoothsGPS: Bool
     let isInset: Bool
+    let loadsDetailTiles: Bool
+    let isInteractive: Bool
     let isPlaying: Bool
     let pausedTime: TimeInterval
 
@@ -410,7 +427,7 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
         view.autoenablesDefaultLighting = false
         view.delegate = context.coordinator
         context.coordinator.sceneView = view
-        if !isInset {
+        if isInteractive {
             // Maintenir le bouton (ou le doigt) enfoncé fait pivoter la caméra autour de l'avion.
             #if os(macOS)
             let pan = NSPanGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handlePan(_:)))
@@ -448,6 +465,7 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
             showsSatellite: showsSatellite,
             smoothsGPS: smoothsGPS,
             isInset: isInset,
+            loadsDetailTiles: loadsDetailTiles,
             isPlaying: isPlaying
         )
     }
@@ -504,6 +522,8 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
         private let groundShadow = SCNNode()
         /// Plan texturé par une image satellite MapKit, posé au sol sous la trajectoire.
         private let satelliteNode = SCNNode()
+        /// Tuiles satellite haute résolution (≈ 0,8 m/pixel) chargées autour de l'avion à basse altitude.
+        private let detailNode = SCNNode()
         private let dropLine = SCNNode()
         private let centerTrail = SCNNode()
         private let leftTrail = SCNNode()
@@ -516,6 +536,10 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
         private let trailDuration: TimeInterval = 15
         private let trailPointCount = 150
         private let gridSpacing: Float = 100
+        /// Côté d'une tuile de détail (m), altitude sous laquelle on les charge (m), et nombre maximal conservé.
+        private let detailCellSide: Double = 800
+        private let detailMaxAltitude: Float = 600
+        private let detailMaxTiles = 16
 
         private let lock = NSLock()
         private var samples: [FlightSample] = []
@@ -532,8 +556,15 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
         private var satelliteRevision = -1
         private var satelliteTask: Task<Void, Never>?
         private var hasSatelliteImage = false
+        private var detailTiles: [SIMD2<Int>: SCNNode] = [:]
+        private var detailFailures: [SIMD2<Int>: TimeInterval] = [:]
+        private var detailTask: Task<Void, Never>?
+        private var isFetchingDetail = false
+        private var detailGeneration = 0
+        private var lastDetailCell = SIMD2<Int>(0, 0)
         private var showsSatellite = true
         private var isInset = false
+        private var loadsDetailTiles = true
         weak var sceneView: SCNView?
 
         // Déviation manuelle de la caméra (glisser) : azimut et élévation ajoutés au cadrage,
@@ -650,11 +681,13 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
             showsSatellite: Bool,
             smoothsGPS: Bool,
             isInset: Bool,
+            loadsDetailTiles: Bool,
             isPlaying: Bool
         ) {
             lock.lock()
             defer { lock.unlock() }
             self.isInset = isInset
+            self.loadsDetailTiles = loadsDetailTiles
             self.isPlaybackActive = isPlaying
             idleFrames = 0
             self.showsSatellite = showsSatellite
@@ -695,6 +728,7 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
         private func updateSatelliteIfNeeded() {
             let visible = showsSatellite && hasSatelliteImage
             satelliteNode.isHidden = !visible
+            detailNode.isHidden = !showsSatellite
             groundGrid.isHidden = visible
             guard showsSatellite, satelliteRevision != revision, let center = satelliteCenter else { return }
             satelliteRevision = revision
@@ -777,11 +811,129 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
             // `satelliteNode` est couché à plat (x = est, y local = nord) : la tuile se place par
             // ses décalages est/nord par rapport au centre de la mosaïque.
             let tile = SCNNode(geometry: plane)
+            tile.renderingOrder = -2
             tile.simdPosition = SIMD3<Float>(Float(east), Float(north), 0)
             satelliteNode.addChildNode(tile)
             hasSatelliteImage = true
             satelliteNode.isHidden = !showsSatellite
             groundGrid.isHidden = showsSatellite
+        }
+
+        // MARK: - Tuiles satellite de détail
+
+        private func resetDetailTiles() {
+            detailGeneration += 1
+            detailTask?.cancel()
+            isFetchingDetail = false
+            detailTiles.removeAll()
+            detailFailures.removeAll()
+            detailNode.childNodes.forEach { $0.removeFromParentNode() }
+        }
+
+        /// Charge, à basse altitude, les tuiles 3×3 autour de l'avion sur une grille fixe de 800 m ;
+        /// elles recouvrent la mosaïque générale (≈ 2 à 6 m/pixel) avec une image environ 4× plus fine.
+        private func updateDetailTiles(around position: SIMD3<Float>) {
+            guard loadsDetailTiles, showsSatellite, !isFetchingDetail, position.y < detailMaxAltitude,
+                  abs(referenceLatitude) > 0 || abs(referenceLongitude) > 0 else { return }
+            let center = SIMD2<Int>(
+                Int((Double(position.x) / detailCellSide).rounded()),
+                Int((Double(-position.z) / detailCellSide).rounded())
+            )
+            lastDetailCell = center
+            let now = ProcessInfo.processInfo.systemUptime
+            var cells: [SIMD2<Int>] = []
+            for dx in -1...1 {
+                for dy in -1...1 {
+                    let cell = SIMD2<Int>(center.x + dx, center.y + dy)
+                    if detailTiles[cell] != nil { continue }
+                    if let failedAt = detailFailures[cell], now - failedAt < 30 { continue }
+                    cells.append(cell)
+                }
+            }
+            guard !cells.isEmpty else { return }
+            cells.sort { abs($0.x - center.x) + abs($0.y - center.y) < abs($1.x - center.x) + abs($1.y - center.y) }
+
+            isFetchingDetail = true
+            let generation = detailGeneration
+            let side = detailCellSide
+            let metersPerDegree = 111_320.0
+            let latitude = referenceLatitude
+            let longitude = referenceLongitude
+            let cosineLatitude = referenceCosineLatitude
+            #if os(macOS)
+            let pixels: CGFloat = 1_024
+            #else
+            let pixels: CGFloat = 768
+            #endif
+            detailTask = Task { [weak self] in
+                for cell in cells {
+                    if Task.isCancelled { return }
+                    let tileCenter = CLLocationCoordinate2D(
+                        latitude: latitude + Double(cell.y) * side / metersPerDegree,
+                        longitude: longitude + Double(cell.x) * side / (metersPerDegree * cosineLatitude)
+                    )
+                    let options = MKMapSnapshotter.Options()
+                    options.region = MKCoordinateRegion(
+                        center: tileCenter, latitudinalMeters: side, longitudinalMeters: side
+                    )
+                    options.mapType = .satellite
+                    options.size = CGSize(width: pixels, height: pixels)
+                    let snapshot = try? await MKMapSnapshotter(options: options).start()
+                    if Task.isCancelled { return }
+                    self?.finishDetailTile(snapshot?.image, cell: cell, generation: generation)
+                }
+                self?.finishDetailFetch(generation: generation)
+            }
+        }
+
+        private func finishDetailFetch(generation: Int) {
+            lock.lock()
+            defer { lock.unlock() }
+            guard generation == detailGeneration else { return }
+            isFetchingDetail = false
+        }
+
+        private func finishDetailTile(_ image: PlatformImage?, cell: SIMD2<Int>, generation: Int) {
+            lock.lock()
+            defer { lock.unlock() }
+            guard generation == detailGeneration else { return }
+            guard let image else {
+                detailFailures[cell] = ProcessInfo.processInfo.systemUptime
+                return
+            }
+            let side = CGFloat(detailCellSide)
+            let plane = SCNPlane(width: side, height: side)
+            let material = SCNMaterial()
+            material.lightingModel = .constant
+            material.isDoubleSided = true
+            material.diffuse.contents = image
+            material.diffuse.mipFilter = .linear
+            material.diffuse.minificationFilter = .linear
+            material.diffuse.magnificationFilter = .linear
+            material.diffuse.maxAnisotropy = 8
+            material.diffuse.wrapS = .clamp
+            material.diffuse.wrapT = .clamp
+            // Dessinées après la mosaïque générale et par-dessus, sans test de profondeur :
+            // pas de scintillement à grande distance, l'avion (ordre 0) reste devant.
+            material.readsFromDepthBuffer = false
+            material.writesToDepthBuffer = false
+            plane.materials = [material]
+            let tile = SCNNode(geometry: plane)
+            tile.renderingOrder = -1
+            // `detailNode` est couché à plat comme `satelliteNode` : x = est, y local = nord.
+            tile.simdPosition = SIMD3<Float>(Float(Double(cell.x) * detailCellSide), Float(Double(cell.y) * detailCellSide), 0)
+            detailNode.addChildNode(tile)
+            detailTiles[cell] = tile
+            detailFailures[cell] = nil
+            // Garde les tuiles les plus proches de l'avion pour borner la mémoire.
+            while detailTiles.count > detailMaxTiles {
+                guard let farthest = detailTiles.keys.max(by: {
+                    abs($0.x - lastDetailCell.x) + abs($0.y - lastDetailCell.y)
+                        < abs($1.x - lastDetailCell.x) + abs($1.y - lastDetailCell.y)
+                }) else { break }
+                detailTiles[farthest]?.removeFromParentNode()
+                detailTiles[farthest] = nil
+            }
         }
 
         private func rebuildWorld() {
@@ -798,6 +950,7 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
             hasChaseDirection = false
             satelliteTask?.cancel()
             satelliteNode.childNodes.forEach { $0.removeFromParentNode() }
+            resetDetailTiles()
             hasSatelliteImage = false
             satelliteRevision = -1
             satelliteCenter = nil
@@ -1104,6 +1257,7 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
             let index = sampleIndex(at: seconds, in: samples)
             let sample = samples[index]
             let position = worldPosition(at: seconds)
+            updateDetailTiles(around: position)
             let before = worldPosition(at: seconds - 0.5)
             let after = worldPosition(at: seconds + 0.5)
             let velocity = after - before
@@ -1134,6 +1288,7 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
                 velocity: velocity,
                 acceleration: acceleration,
                 noseForward: orientation.act(SIMD3<Float>(0, 0, -1)),
+                orientation: orientation,
                 preset: preset,
                 deltaTime: wallDelta,
                 snap: snap
@@ -1157,6 +1312,7 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
             velocity: SIMD3<Float>,
             acceleration: SIMD3<Float>,
             noseForward: SIMD3<Float>,
+            orientation: simd_quatf,
             preset: ChaseCam3DPreset,
             deltaTime: Float,
             snap: Bool
@@ -1187,6 +1343,12 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
                     chaseClimb += (targetClimb - chaseClimb) * factor
                 }
             }
+
+            if preset.isFixedToAircraft {
+                updateFixedCamera(position: position, orientation: orientation, preset: preset)
+                return
+            }
+            if let camera = cameraNode.camera, camera.zNear != 2 { camera.zNear = 2 }
 
             var azimuth = preset.azimuth
             var distance = preset.distance
@@ -1249,6 +1411,40 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
                 up: SIMD3<Float>(0, 1, 0),
                 localFront: SIMD3<Float>(0, 0, -1)
             )
+        }
+
+        /// Caméra liée à l'avion : position et visée définies dans le repère de l'avion
+        /// (x = droite, y = haut, -z = nez), en unités du modèle avant mise à l'échelle.
+        private func updateFixedCamera(position: SIMD3<Float>, orientation: simd_quatf, preset: ChaseCam3DPreset) {
+            let mount: SIMD3<Float>
+            let target: SIMD3<Float>
+            let fieldOfView: CGFloat
+            switch preset {
+            case .tail:
+                // Sommet de la dérive, regard vers l'avant et légèrement vers le bas.
+                mount = SIMD3<Float>(0, 1.15, 3.2)
+                target = SIMD3<Float>(0, 0.1, -6)
+                fieldOfView = 80
+            default:
+                // Au large de l'aile gauche, regard à 90° de l'axe longitudinal (pile vers la droite),
+                // à la hauteur du fuselage : mêmes y et z pour la caméra et la cible.
+                mount = SIMD3<Float>(-4.6, 0.1, 0)
+                target = SIMD3<Float>(0, 0.1, 0)
+                fieldOfView = 70
+            }
+            let up = orientation.act(SIMD3<Float>(0, 1, 0))
+            cameraNode.simdPosition = position + orientation.act(mount * modelScale)
+            cameraNode.simdLook(
+                at: position + orientation.act(target * modelScale),
+                up: up,
+                localFront: SIMD3<Float>(0, 0, -1)
+            )
+            currentFieldOfView = Float(fieldOfView)
+            if let camera = cameraNode.camera {
+                if camera.fieldOfView != fieldOfView { camera.fieldOfView = fieldOfView }
+                // Caméra très proche de la structure : plan proche rapproché.
+                if camera.zNear != 0.3 { camera.zNear = 0.3 }
+            }
         }
 
         private func wrappedAngle(_ angle: Float) -> Float {
@@ -1590,6 +1786,8 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
             satelliteNode.simdEulerAngles = SIMD3<Float>(-.pi / 2, 0, 0)
             satelliteNode.isHidden = true
             scene.rootNode.addChildNode(satelliteNode)
+            detailNode.simdEulerAngles = SIMD3<Float>(-.pi / 2, 0, 0)
+            scene.rootNode.addChildNode(detailNode)
             configureGroundGrid()
             scene.rootNode.addChildNode(groundGrid)
 
@@ -1639,13 +1837,15 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
         }
 
         private func makeGround() -> SCNNode {
-            let floor = SCNFloor()
-            floor.reflectivity = 0
+            // Simple plan plutôt que SCNFloor : ce dernier ajoute une passe de réflexion
+            // (« FloorPass is not linked to the rendering graph ») au contrôle caméra souris.
+            let floor = SCNPlane(width: 20_000, height: 20_000)
             floor.firstMaterial?.lightingModel = .constant
             floor.firstMaterial?.diffuse.contents = PlatformColor(red: 0.16, green: 0.24, blue: 0.17, alpha: 1)
             let node = SCNNode(geometry: floor)
             // Sous le plan satellite (y = 0) pour éviter le z-fighting.
             node.position.y = -1
+            node.eulerAngles.x = -.pi / 2
             return node
         }
 

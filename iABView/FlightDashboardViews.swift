@@ -195,8 +195,7 @@ struct FlightVideoDataOverlay: View {
 
                 HStack(alignment: .bottom, spacing: 10) {
                     VStack(alignment: .leading, spacing: 4) {
-                        metric(icon: "location.north.line.fill", value: sample.heading, unit: "°")
-                            .accessibilityLabel("Cap")
+                        metric("Cap", value: sample.heading, unit: "°")
                         metric("△", value: aerobaticAxisDeviation, unit: "°")
                             .accessibilityLabel("Écart d’axe")
                         metric("IAS", value: sample.indicatedAirspeed, unit: "km/h")
@@ -672,6 +671,10 @@ struct ArtificialHorizonView: View {
             .drawingGroup()
         }
         .clipShape(RoundedRectangle(cornerRadius: 5))
+        // `.clipped()` / `.clipShape` ne limitent que le dessin, pas le hit-testing : la sphère
+        // surdimensionnée (4× la taille) débordait sur les vues voisines et volait leurs clics
+        // (orbite de la vue 3D STL, trajectoire GPS). L'horizon n'est pas interactif.
+        .allowsHitTesting(false)
         .accessibilityLabel("Horizon artificiel")
         .accessibilityValue("Tangage \(pitch, format: .number.precision(.fractionLength(0))) degrés, roulis \(roll, format: .number.precision(.fractionLength(0))) degrés")
     }
@@ -880,7 +883,6 @@ struct PlaybackControls: View {
     let onFineJumpBackward: () -> Void
     let onFineJumpForward: () -> Void
     let onToggleRecording: () -> Void
-    let onOpenChaseCam: () -> Void
     let onAddBookmark: () -> Void
     let onPreviousBookmark: () -> Void
     let onNextBookmark: () -> Void
@@ -917,11 +919,6 @@ struct PlaybackControls: View {
             .labelStyle(.titleAndIcon)
             .tint(.red)
             #endif
-
-            Button(action: onOpenChaseCam) {
-                Label("Cam", systemImage: "binoculars.fill")
-            }
-            .labelStyle(.titleAndIcon)
 
             Button(action: onPreviousBookmark) {
                 Label("Previous", systemImage: "backward.end.fill")

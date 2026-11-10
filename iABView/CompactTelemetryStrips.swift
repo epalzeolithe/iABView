@@ -17,13 +17,13 @@ struct BookmarkTimelineSlider: View {
                         guard bookmarkTime >= 0, bookmarkTime <= duration else { continue }
                         let x = bookmarkTime / max(0.01, duration) * size.width
                         context.fill(
-                            Path(CGRect(x: x - 1, y: 0, width: 2, height: size.height)),
-                            with: .color(.secondary)
+                            Path(CGRect(x: x - 1.5, y: 0, width: 3, height: size.height)),
+                            with: .color(.orange)
                         )
                     }
                 }
             }
-            .frame(height: 6)
+            .frame(height: 8)
         }
         .padding(.leading, 54)
         .accessibilityLabel("Position dans le vol")

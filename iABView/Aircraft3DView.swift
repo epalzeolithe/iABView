@@ -85,6 +85,7 @@ struct Aircraft3DView: PlatformViewRepresentable {
         // still smooth at this panel's on-screen size and roughly halves the
         // GPU fragment work of 4x for every one of those frames.
         view.antialiasingMode = .multisampling2X
+        // Bouton (ou doigt) maintenu : la caméra orbite autour de l'avion ; molette ou pincement : zoom.
         view.allowsCameraControl = true
         view.autoenablesDefaultLighting = false
         view.delegate = context.coordinator
@@ -102,7 +103,7 @@ struct Aircraft3DView: PlatformViewRepresentable {
         // frame, which is all the realtime attitude sync needs.
         view.rendersContinuously = false
         // Orbite autour du pivot de l'avion ; sans `automaticTarget = false`, SceneKit
-        // recalcule la cible à chaque clic d'après l'objet touché et décentre la vue.
+        // recalcule la cible à chaque clic ou toucher d'après l'objet touché et décentre la vue.
         view.defaultCameraController.automaticTarget = false
         view.defaultCameraController.target = SCNVector3(0, 0.8, 0)
         return view
@@ -1138,9 +1139,8 @@ struct Aircraft3DView: PlatformViewRepresentable {
         }
 
         private func makeGround() -> SCNNode {
-            let floor = SCNFloor()
-            floor.reflectivity = 0.06
-            floor.reflectionFalloffEnd = 7
+            // Simple plan plutôt que SCNFloor : évite la passe de réflexion (« FloorPass is not linked »).
+            let floor = SCNPlane(width: 400, height: 400)
             floor.firstMaterial?.lightingModel = .physicallyBased
             floor.firstMaterial?.diffuse.contents = PlatformColor(
                 red: 0.055,
@@ -1152,6 +1152,7 @@ struct Aircraft3DView: PlatformViewRepresentable {
 
             let node = SCNNode(geometry: floor)
             node.position.y = -2
+            node.eulerAngles.x = -.pi / 2
             node.castsShadow = false
             return node
         }

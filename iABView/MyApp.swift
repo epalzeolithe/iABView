@@ -8,6 +8,9 @@ import UIKit
 
 #if os(macOS)
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    // Fermer la dernière fenêtre quitte l'app (sinon la lecture et ses processus restent actifs).
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         ABVCreatorProcessRegistry.terminateAll()
         return .terminateNow
