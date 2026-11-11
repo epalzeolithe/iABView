@@ -817,7 +817,7 @@ private struct FlightPathGScale: View {
             GeometryReader { proxy in
                 ZStack(alignment: .leading) {
                     LinearGradient(
-                        colors: [.blue, .cyan, .green, .yellow, .red, .purple],
+                        colors: LoadFactorColorScale.colors,
                         startPoint: .leading,
                         endPoint: .trailing
                     )

@@ -130,6 +130,11 @@ struct MyApp: App {
             ABVCreatorView()
         }
         .defaultSize(width: 820, height: 650)
+
+        Window("Éditer un fichier ABV", id: "abv-editor") {
+            ABVEditorView()
+        }
+        .defaultSize(width: 900, height: 720)
         #else
         WindowGroup("ABView") {
             ContentView()
@@ -148,6 +153,10 @@ struct ABVCreatorCommands: Commands {
                 openWindow(id: "abv-creator")
             }
             .keyboardShortcut("n", modifiers: [.command, .shift])
+            Button("Éditer un fichier ABV…") {
+                openWindow(id: "abv-editor")
+            }
+            .keyboardShortcut("e", modifiers: [.command, .shift])
         }
     }
 }

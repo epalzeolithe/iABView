@@ -8,6 +8,22 @@ import Charts
 import MapKit
 import SwiftUI
 
+/// Code couleur du facteur de charge, partagé par la jauge de la trajectoire 3D et le cadre vidéo.
+/// Les couleurs sont réparties uniformément de −2 g à +4 g, comme dans le dégradé de la jauge.
+enum LoadFactorColorScale {
+    static let colors: [Color] = [.blue, .cyan, .green, .yellow, .red, .purple]
+    static let range: ClosedRange<Double> = -2...4
+
+    /// Couleur du dégradé à la position de `loadFactor` (interpolée entre les deux couleurs voisines).
+    static func color(for loadFactor: Double) -> Color {
+        let clamped = min(range.upperBound, max(range.lowerBound, loadFactor))
+        let position = (clamped - range.lowerBound) / (range.upperBound - range.lowerBound)
+            * Double(colors.count - 1)
+        let lower = min(colors.count - 2, Int(position))
+        return colors[lower].mix(with: colors[lower + 1], by: position - Double(lower))
+    }
+}
+
 enum VideoOverlayStyle {
     case standard
     case headingOnly
@@ -26,11 +42,42 @@ struct VideoPane: View {
     var mountingPitch = 15.0
     var isCameraInverted = false
     var overlayStyle: VideoOverlayStyle = .standard
+    /// Affiche `player` comme une vidéo équirectangulaire orientable (vue 360°).
+    var isVideo360 = false
+    /// Lacet initial de la vue 360° (180° : vers l'avant de l'avion).
+    var video360InitialYaw: CGFloat = 0
+    var video360Offset: Video360Offset = .zero
+    var video360YawPreset: Video360YawPreset?
+    /// Incrustation de petite taille (layout 2) : les données de vol sont réduites pour tenir dans le cadre.
+    var isCompact = false
+    @State private var video360FieldOfView = Video360View.Coordinator.defaultFieldOfView
 
     var body: some View {
         ZStack {
-            PlayerSurface(player: player)
+            if isVideo360 {
+                Video360View(
+                    player: player,
+                    initialYaw: video360InitialYaw,
+                    dynamicOffset: video360Offset,
+                    yawPreset: video360YawPreset,
+                    onFieldOfViewChange: { video360FieldOfView = $0 }
+                )
                 .background(.black)
+
+                Text("FOV \(Int(video360FieldOfView.rounded()))°")
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 4)
+                    .background(.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 5))
+                    // En bas à gauche se trouvent les mesures incrustées de la vidéo de gauche.
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: showsFlightData ? .topTrailing : .bottomLeading)
+                    .padding(8)
+                    .allowsHitTesting(false)
+            } else {
+                PlayerSurface(player: player)
+                    .background(.black)
+            }
 
             if overlayStyle == .headingOnly {
                 if let flightSample {
@@ -63,7 +110,8 @@ struct VideoPane: View {
                     FlightVideoDataOverlay(
                         sample: flightSample,
                         mountingPitch: mountingPitch,
-                        isCameraInverted: isCameraInverted
+                        isCameraInverted: isCameraInverted,
+                        scalesToFit: isCompact
                     )
                 }
             }
@@ -183,12 +231,36 @@ struct FlightVideoDataOverlay: View {
     let sample: FlightSample
     let mountingPitch: Double
     let isCameraInverted: Bool
+    /// Réduit toute l'incrustation (polices, cadrans) proportionnellement à la largeur disponible.
+    var scalesToFit = false
+
+    /// Largeur à laquelle l'incrustation est conçue (cadran de 270 pt et mesures de chaque côté).
+    private static let designWidth: CGFloat = 640
+
+    /// Échelle appliquée à l'incrustation pour une largeur de vidéo donnée.
+    static func fitScale(forWidth width: CGFloat) -> CGFloat {
+        min(1, max(0.3, width / designWidth))
+    }
 
     private var attitude: Attitude {
         sample.attitude(mountingPitch: mountingPitch, isInverted: isCameraInverted)
     }
 
     var body: some View {
+        if scalesToFit {
+            GeometryReader { proxy in
+                let scale = Self.fitScale(forWidth: proxy.size.width)
+                content
+                    .frame(width: proxy.size.width / scale, height: proxy.size.height / scale)
+                    .scaleEffect(scale, anchor: .topLeading)
+                    .frame(width: proxy.size.width, height: proxy.size.height, alignment: .topLeading)
+            }
+        } else {
+            content
+        }
+    }
+
+    private var content: some View {
         ZStack {
             VStack(spacing: 8) {
                 Spacer()
@@ -329,6 +401,52 @@ private struct VideoAttitudeReticle: View {
     }
 }
 
+/// Favori passé (petit) et favori à venir (grand), avec leur figure Aresti.
+struct BookmarkBanner: View {
+    let previousBookmark: String?
+    let upcomingBookmark: String?
+
+    var body: some View {
+        VStack(spacing: 6) {
+            // Pendant l'annonce, le favori qu'on vient de passer est déjà affiché en grand.
+            if let previousBookmark, previousBookmark != upcomingBookmark {
+                HStack(spacing: 6) {
+                    Label(previousBookmark, systemImage: "bookmark.fill")
+                        .lineLimit(1)
+                    if let figure = AerobaticFigure(bookmarkName: previousBookmark) {
+                        AerobaticFigureSymbol(figure: figure)
+                            .frame(width: 26, height: 26)
+                    }
+                }
+                .font(.caption)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 5)
+                .background(.black.opacity(0.65), in: Capsule())
+                .foregroundStyle(.white)
+            }
+
+            if let upcomingBookmark {
+                HStack(spacing: 14) {
+                    Text(upcomingBookmark)
+                        .font(.system(size: 34, weight: .heavy, design: .monospaced))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.5)
+                    if let figure = AerobaticFigure(bookmarkName: upcomingBookmark) {
+                        AerobaticFigureSymbol(figure: figure, color: .primary)
+                            .frame(width: 52, height: 52)
+                    }
+                }
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 10)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+                    .shadow(radius: 6)
+                    .transition(.scale.combined(with: .opacity))
+            }
+        }
+        .animation(.easeInOut(duration: 0.2), value: upcomingBookmark)
+    }
+}
+
 struct VideoInformationOverlay: View {
     let timestamp: Date?
     let elapsedTime: TimeInterval
@@ -347,27 +465,7 @@ struct VideoInformationOverlay: View {
                     .background(.regularMaterial, in: Rectangle())
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
 
-                VStack(spacing: 6) {
-                    if let previousBookmark {
-                        Label(previousBookmark, systemImage: "bookmark.fill")
-                            .lineLimit(1)
-                            .font(.caption)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 5)
-                            .background(.black.opacity(0.65), in: Capsule())
-                            .foregroundStyle(.white)
-                    }
-
-                    if let upcomingBookmark {
-                        Text(upcomingBookmark)
-                            .font(.title3.monospaced().bold())
-                            .lineLimit(1)
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 5)
-                            .background(.regularMaterial, in: Rectangle())
-                            .transition(.scale.combined(with: .opacity))
-                    }
-                }
+                BookmarkBanner(previousBookmark: previousBookmark, upcomingBookmark: upcomingBookmark)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             }
 
@@ -401,6 +499,10 @@ struct FlightMapView: View {
     let sample: FlightSample?
     let metar: String
     let routeProgress: Double
+    /// Encart optionnel affiché en bas à droite, juste au-dessus du METAR.
+    var bottomTrailingAccessory: AnyView? = nil
+    /// Texte du METAR en bas à gauche (masqué dans le layout 2).
+    var showsMETAR = true
     @State private var position: MapCameraPosition = .automatic
 
     var body: some View {
@@ -457,7 +559,12 @@ struct FlightMapView: View {
 
                 Spacer()
 
-                if !metar.isEmpty {
+                if let bottomTrailingAccessory {
+                    bottomTrailingAccessory
+                        .frame(maxWidth: .infinity, alignment: .trailing)
+                }
+
+                if showsMETAR, !metar.isEmpty {
                     Text(metar)
                         .font(.caption2.monospaced())
                         .lineLimit(4)
@@ -656,6 +763,11 @@ struct ArtificialHorizonView: View {
                     )
                     .shadow(color: .black.opacity(0.8), radius: 1, y: 1)
                 }
+                .overlay {
+                    if marker == .triangle {
+                        ArtificialHorizonRollScale(roll: roll)
+                    }
+                }
                 .frame(width: referenceSize, height: referenceSize)
                 .scaleEffect(contentScale)
             }
@@ -677,6 +789,48 @@ struct ArtificialHorizonView: View {
         .allowsHitTesting(false)
         .accessibilityLabel("Horizon artificiel")
         .accessibilityValue("Tangage \(pitch, format: .number.precision(.fractionLength(0))) degrés, roulis \(roll, format: .number.precision(.fractionLength(0))) degrés")
+    }
+}
+
+/// Échelle d'inclinaison fixe (repères à 10°, 20°, 30°, 45°, 60°, 90°) avec index mobile suivant le roulis.
+private struct ArtificialHorizonRollScale: View {
+    let roll: Double
+    private let referenceSize: CGFloat = 140
+    private let radius: CGFloat = 64
+    private let ticks: [Double] = [-90, -60, -45, -30, -20, -10, 0, 10, 20, 30, 45, 60, 90]
+
+    var body: some View {
+        let center = CGPoint(x: referenceSize / 2, y: referenceSize / 2)
+        ZStack {
+            Path { path in
+                for tick in ticks {
+                    let length: CGFloat = (tick == 0 || abs(tick) == 30 || abs(tick) == 60 || abs(tick) == 90) ? 9 : 5
+                    let angle = Angle.degrees(tick - 90).radians
+                    let cosine = CGFloat(Foundation.cos(angle))
+                    let sine = CGFloat(Foundation.sin(angle))
+                    path.move(to: CGPoint(x: center.x + cosine * radius, y: center.y + sine * radius))
+                    path.addLine(to: CGPoint(
+                        x: center.x + cosine * (radius - length),
+                        y: center.y + sine * (radius - length)
+                    ))
+                }
+            }
+            .stroke(.white.opacity(0.9), style: StrokeStyle(lineWidth: 1.4, lineCap: .round))
+            .shadow(color: .black.opacity(0.8), radius: 1)
+
+            // Index qui suit le roulis : triangle posé sur la sphère, pointe vers l'échelle.
+            Path { path in
+                path.move(to: CGPoint(x: center.x, y: center.y - radius + 11))
+                path.addLine(to: CGPoint(x: center.x - 5, y: center.y - radius + 20))
+                path.addLine(to: CGPoint(x: center.x + 5, y: center.y - radius + 20))
+                path.closeSubpath()
+            }
+            .fill(.yellow)
+            .shadow(color: .black.opacity(0.8), radius: 1)
+            .rotationEffect(.degrees(-roll), anchor: .center)
+        }
+        .frame(width: referenceSize, height: referenceSize)
+        .accessibilityHidden(true)
     }
 }
 
@@ -1025,9 +1179,11 @@ private struct PlaybackKeyboardMonitor: NSViewRepresentable {
                     parent.onFineJumpBackward()
                 case (124, [.shift]):
                     parent.onFineJumpForward()
-                case (123, [.control]):
+                // ⌃←/⌃→ sont pris par Mission Control (changement de Space) quand ce raccourci
+                // système est actif : ⌥←/⌥→ font la même chose et arrivent toujours jusqu'à l'app.
+                case (123, [.control]), (123, [.option]):
                     parent.onPreviousBookmark()
-                case (124, [.control]):
+                case (124, [.control]), (124, [.option]):
                     parent.onNextBookmark()
                 case (11, [.control]):
                     parent.onAddBookmark()

@@ -61,7 +61,7 @@ final class ScreenRecorder: NSObject {
             configuration.width = max(2, Int(captureWindow.frame.width) * 2)
             configuration.height = max(2, Int(captureWindow.frame.height) * 2)
             configuration.minimumFrameInterval = CMTime(value: 1, timescale: 60)
-            configuration.queueDepth = 5
+            configuration.queueDepth = 8
             configuration.capturesAudio = capturesAudio
             configuration.excludesCurrentProcessAudio = false
             configuration.showsCursor = true

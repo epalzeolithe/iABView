@@ -1293,7 +1293,7 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
                 deltaTime: wallDelta,
                 snap: snap
             )
-            if timeChanged, abs(seconds - lastTrailSeconds) >= (isInset ? 0.2 : 0.1) {
+            if timeChanged, abs(seconds - lastTrailSeconds) >= 0.1 {
                 lastTrailSeconds = seconds
                 updateTrail(
                     seconds: seconds,
@@ -1477,8 +1477,7 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
             isInverted: Bool
         ) {
             let firstTime = knotTimes[0]
-            // Incrustation : moins de points, et pas de barreaux (illisibles à cette taille).
-            let pointCount = isInset ? trailPointCount / 3 : trailPointCount
+            let pointCount = trailPointCount
             let step = trailDuration / Double(pointCount - 1)
             var centers: [SIMD3<Float>] = []
             var lefts: [SIMD3<Float>] = []
@@ -1532,10 +1531,6 @@ private struct ChaseCam3DScene: PlatformViewRepresentable {
             // Un barreau toutes les 0,25 s relie les saumons d'aile du même instant : il se vrille avec
             // le roulis. Calés sur des multiples de 0,25 s absolus, les barreaux défilent avec la traînée
             // au lieu de glisser dessus.
-            guard !isInset else {
-                trailRungs.geometry = nil
-                return
-            }
             let rungInterval = 0.25
             var rungVertices: [SIMD3<Float>] = []
             var rungColors: [SIMD4<Float>] = []

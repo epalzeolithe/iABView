@@ -43,10 +43,15 @@ final class FlightViewModel {
     private(set) var gpsOffset = 0.0
     private(set) var chartSamples: [FlightSample] = []
     private(set) var routeCoordinates: [CLLocationCoordinate2D] = []
-    private(set) var bookmarks: [FlightBookmark] = []
+    private(set) var bookmarks: [FlightBookmark] = [] {
+        didSet { refreshCurrentBookmark() }
+    }
     private(set) var metar: [METARReading] = []
     private(set) var currentIndex = 0 {
-        didSet { syncSlowIndex() }
+        didSet {
+            syncSlowIndex()
+            refreshCurrentBookmark()
+        }
     }
     /// Copie de `currentIndex` rafraîchie à 4 Hz au plus pendant la lecture, pour les vues qui n'ont
     /// pas besoin de suivre chaque tick à 15 Hz (carte, METAR, curseur, bandes de télémétrie).
@@ -87,15 +92,29 @@ final class FlightViewModel {
     private(set) var secondaryMaximumSpeed = 0.0
     private(set) var isAudioMuted = false
     private(set) var playbackCorrectionCount = 0
+    /// Vrai si le bundle contient un `video360.mp4` lisible et équirectangulaire (rapport 2:1).
+    private(set) var hasVideo360 = false
+    /// La vidéo 360° remplace les deux caméras (avant et arrière) par deux vues orientables.
+    private(set) var isVideo360Enabled = false
+    /// Suivi 360° dynamique : les accélérations décalent légèrement le tangage et l'inclinaison
+    /// du regard, comme une tête soumise au facteur de charge (chase cam vue de l'intérieur).
+    private(set) var isVideo360DynamicEnabled = false
 
     let frontPlayer = AVPlayer()
     let backPlayer = AVPlayer()
+    /// Lecteur de `video360.mp4`, sur la même timeline que `front.mp4` (même passe ffmpeg).
+    /// Il n'est lu que lorsque la vue 360° est active, pour ne pas décoder la 4K inutilement.
+    let player360 = AVPlayer()
     private var timeObserver: Any?
     private var securityScopedURL: URL?
     private var isCorrectingVideoDrift = false
+    private var isCorrecting360Drift = false
+    private var last360DriftSeekTime: TimeInterval = 0
     /// Seeks en cours sur le lecteur avant : tant qu'il y en a, l'observateur de lecture voit encore
     /// l'ancien temps et ne doit pas ramener `currentIndex` en arrière.
     private var pendingSeekCount = 0
+    /// Dernière position demandée par `seek(to:)`, valable tant que `pendingSeekCount > 0`.
+    private var lastSeekTarget: TimeInterval?
     private var loadTask: Task<FlightBundle, Error>?
     private var loadGeneration = 0
     private var lastDriftSeekTime: TimeInterval = 0
@@ -172,6 +191,8 @@ final class FlightViewModel {
     }
 
     private var currentVideoTime: TimeInterval {
+        // Tant qu'un seek est en cours, le lecteur renvoie encore l'ancienne position : on se fie à la cible.
+        if pendingSeekCount > 0, let lastSeekTarget { return lastSeekTarget }
         let time = frontPlayer.currentTime().seconds
         return time.isFinite ? max(0, time) : 0
     }
@@ -204,11 +225,64 @@ final class FlightViewModel {
         })?.name
     }
 
+    /// Une ligne du rapport des figures : favori, figure reconnue, fenêtre de temps et charges extrêmes.
+    struct FigureReportRow: Identifiable {
+        let id: UUID
+        let name: String
+        let displayTime: String
+        let figure: AerobaticFigure?
+        let window: TimeInterval
+        let minimumLoadFactor: Double
+        let maximumLoadFactor: Double
+    }
+
+    /// Rapport des favoris : chaque figure couvre la fenêtre jusqu'au favori suivant (20 s au plus).
+    func figureReport() -> [FigureReportRow] {
+        bookmarks.enumerated().map { index, bookmark in
+            let start = Double(bookmark.frame) / frontVideoFrameRate
+            let nextStart = bookmarks.indices.contains(index + 1)
+                ? Double(bookmarks[index + 1].frame) / frontVideoFrameRate : duration
+            let end = min(nextStart, start + 20)
+            let loads = samples.filter { $0.elapsed >= start && $0.elapsed < end }
+                .map { $0.signedLoadFactor(mountingPitch: mountingPitch) }
+            return FigureReportRow(
+                id: bookmark.id, name: bookmark.name, displayTime: bookmark.displayTime,
+                figure: AerobaticFigure(bookmarkName: bookmark.name),
+                window: max(0, end - start),
+                minimumLoadFactor: loads.min() ?? 0, maximumLoadFactor: loads.max() ?? 0
+            )
+        }
+    }
+
+    /// Favori passé depuis 8 s au plus : durée d'affichage du schéma Aresti en surimpression.
+    var recentBookmarkName: String? {
+        bookmarks.last(where: {
+            let elapsed = currentVideoTime - Double($0.frame) / frontVideoFrameRate
+            return elapsed >= 0
+        }).flatMap { bookmark in
+            currentVideoTime - Double(bookmark.frame) / frontVideoFrameRate <= 8 ? bookmark.name : nil
+        }
+    }
+
+    /// Favori en cours de lecture (le dernier passé), surligné dans le panneau de gauche.
+    /// Propriété stockée, n'écrite qu'au changement : une propriété calculée sur `currentIndex`
+    /// ferait réévaluer toute la vue racine (barre d'outils comprise) à chaque tick à 15 Hz.
+    private(set) var currentBookmarkID: UUID?
+
+    private func refreshCurrentBookmark() {
+        let time = samples.indices.contains(currentIndex) ? samples[currentIndex].elapsed : 0
+        // Tolérance : après un clic sur un favori, l'échantillon le plus proche peut précéder de quelques
+        // dizaines de ms l'instant exact du favori, qui resterait sinon sur le favori précédent à l'arrêt.
+        let id = bookmarks.last(where: { Double($0.frame) / frontVideoFrameRate <= time + 0.1 })?.id
+        if id != currentBookmarkID { currentBookmarkID = id }
+    }
+
+    /// Favori annoncé à l'écran : de 1,5 s avant son passage jusqu'à 3 s après.
     var upcomingBookmarkName: String? {
         bookmarks.first(where: {
             let bookmarkTime = Double($0.frame) / frontVideoFrameRate
             let delay = bookmarkTime - currentVideoTime
-            return delay >= 0 && delay <= 1.1
+            return delay >= -3 && delay <= 1.5
         })?.name
     }
 
@@ -544,7 +618,9 @@ final class FlightViewModel {
                     latitude: sample.latitude, longitude: sample.longitude, altitude: sample.altitude,
                     speed: sample.speed, heading: sample.heading, verticalSpeed: sample.verticalSpeed,
                     indicatedAirspeed: sample.indicatedAirspeed
-                )
+                ),
+                satellites: nil, // le compte de satellites décrit le GPS principal
+                hdop: nil
             )
         }
     }
@@ -572,7 +648,9 @@ final class FlightViewModel {
                 accelerationX: own.accelerationX, accelerationY: own.accelerationY, accelerationZ: own.accelerationZ,
                 quaternionW: own.quaternionW, quaternionX: own.quaternionX,
                 quaternionY: own.quaternionY, quaternionZ: own.quaternionZ,
-                gps2: gps.gps2
+                gps2: gps.gps2,
+                satellites: gps.satellites,
+                hdop: gps.hdop
             )
         }
         return result
@@ -582,6 +660,69 @@ final class FlightViewModel {
         isAudioMuted.toggle()
         frontPlayer.isMuted = isAudioMuted
         backPlayer.isMuted = true
+    }
+
+    func setVideo360Enabled(_ isEnabled: Bool) {
+        let target = isEnabled && hasVideo360
+        guard target != isVideo360Enabled else { return }
+        isVideo360Enabled = target
+        // Le suivi dynamique s'active avec la vue 360° ; on peut ensuite le couper seul.
+        isVideo360DynamicEnabled = target
+        if target {
+            sync360Player(playing: isPlaying)
+        } else {
+            player360.pause()
+        }
+    }
+
+    func setVideo360DynamicEnabled(_ isEnabled: Bool) {
+        isVideo360DynamicEnabled = isEnabled
+    }
+
+    /// Presets ponctuels de la croix de boutons, un par vidéo 360° : `revision` change à chaque appui.
+    private(set) var video360FrontPreset = Video360YawPreset(yaw: 0, revision: 0)
+    private(set) var video360BackPreset = Video360YawPreset(yaw: 180, revision: 0)
+
+    func applyVideo360Preset(_ direction: Video360Direction, onBackPane: Bool) {
+        if onBackPane {
+            video360BackPreset = Video360YawPreset(
+                yaw: direction.yaw, revision: video360BackPreset.revision + 1, recenters: direction == .center
+            )
+        } else {
+            video360FrontPreset = Video360YawPreset(
+                yaw: direction.yaw, revision: video360FrontPreset.revision + 1, recenters: direction == .center
+            )
+        }
+    }
+
+    /// Décalage du regard 360° en mode suivi dynamique, dérivé des accélérations de l'échantillon courant.
+    /// Repère capteur identique à `signedLoadFactor` : après correction du calage caméra, la composante
+    /// verticale donne le facteur de charge et `accelerationX` l'accélération latérale.
+    var video360DynamicOffset: Video360Offset {
+        guard isVideo360DynamicEnabled, let sample = currentSample else { return .zero }
+        let gravity = 9.80665
+        let angle = mountingPitch * .pi / 180
+        let vertical = sin(angle) * sample.accelerationZ + cos(angle) * -sample.accelerationY
+        // Négatif en vol normal (cf. `signedLoadFactor`) : +1 en palier, +4 en ressource à 4 G.
+        let loadFactor = -vertical / gravity
+        let lateral = sample.accelerationX / gravity
+        // Sous facteur de charge positif la tête « s'enfonce » : le regard plonge (~6°/G),
+        // l'accélération latérale (glissade, dérapage) penche le regard (~30°/G).
+        let pitch = min(20, max(-20, -(loadFactor - 1) * 6))
+        let roll = min(15, max(-15, lateral * 30))
+        return Video360Offset(pitch: pitch, roll: roll)
+    }
+
+    /// Recale le lecteur 360° sur le lecteur avant, puis le lance ou l'arrête comme lui.
+    private func sync360Player(playing: Bool) {
+        guard player360.currentItem != nil else { return }
+        let target = CMTime(seconds: currentVideoTime, preferredTimescale: 600)
+        player360.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero)
+        if playing {
+            player360.playImmediately(atRate: 1)
+        } else {
+            player360.pause()
+        }
     }
 
     func toggleTimelineZoom() {
@@ -696,6 +837,7 @@ final class FlightViewModel {
     func pausePlayback() {
         frontPlayer.pause()
         backPlayer.pause()
+        player360.pause()
         guard isPlaying else { return }
         isPlaying = false
         slowIndex = currentIndex
@@ -706,6 +848,7 @@ final class FlightViewModel {
         if isPlaying {
             frontPlayer.pause()
             backPlayer.pause()
+            player360.pause()
             isPlaying = false
             slowIndex = currentIndex
         } else {
@@ -721,6 +864,9 @@ final class FlightViewModel {
             if backPlayer.currentItem != nil {
                 backPlayer.playImmediately(atRate: 1)
             }
+            if isVideo360Enabled, player360.currentItem != nil {
+                player360.playImmediately(atRate: 1)
+            }
             isPlaying = true
         }
     }
@@ -733,6 +879,7 @@ final class FlightViewModel {
         let backTime = max(0, frontTime + backVideoOffset)
         let backTarget = CMTime(seconds: backTime, preferredTimescale: 600)
         pendingSeekCount += 1
+        lastSeekTarget = clamped
         let model = WeakFlightViewModel(self)
         // Un seek remplacé par un plus récent est aussi terminé (finished == false) : le compte reste juste.
         frontPlayer.seek(to: frontTarget, toleranceBefore: .zero, toleranceAfter: .zero) { _ in
@@ -741,6 +888,9 @@ final class FlightViewModel {
             }
         }
         backPlayer.seek(to: backTarget, toleranceBefore: .zero, toleranceAfter: .zero)
+        if isVideo360Enabled {
+            player360.seek(to: frontTarget, toleranceBefore: .zero, toleranceAfter: .zero)
+        }
         currentIndex = sampleIndex(at: clamped)
     }
 
@@ -780,6 +930,12 @@ final class FlightViewModel {
         saveBookmarks()
     }
 
+    func removeBookmark(_ bookmark: FlightBookmark) {
+        bookmarks.removeAll { $0.id == bookmark.id }
+        refreshCurrentBookmark()
+        saveBookmarks()
+    }
+
     private func apply(_ bundle: FlightBundle) {
         bundleURL = bundle.url
         rawSamples = bundle.samples
@@ -794,9 +950,16 @@ final class FlightViewModel {
 
         configure(player: frontPlayer, file: "front.mp4")
         configure(player: backPlayer, file: "back.mp4")
+        player360.pause()
+        isVideo360Enabled = false
+        isVideo360DynamicEnabled = false
+        hasVideo360 = false
+        configure(player: player360, file: "video360.mp4")
         frontPlayer.isMuted = isAudioMuted
         backPlayer.isMuted = true
+        player360.isMuted = true
         loadVideoSynchronization()
+        validateVideo360()
         loadCalibration()
         updateLoadFactorExtrema()
         installTimeObserver()
@@ -861,6 +1024,35 @@ final class FlightViewModel {
                 frontVideoOffset = 0
                 backVideoOffset = 0
                 frontVideoFrameRate = 30
+            }
+        }
+    }
+
+    /// Vérifie que `video360.mp4` existe et contient bien une piste vidéo équirectangulaire (2:1).
+    /// Tant que ce n'est pas confirmé, le switch « Vidéo 360° » reste inactif.
+    private func validateVideo360() {
+        guard let bundleURL else { return }
+        let url = bundleURL.appendingPathComponent("video360.mp4")
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            player360.replaceCurrentItem(with: nil)
+            return
+        }
+        let asset = AVURLAsset(url: url)
+        let generation = loadGeneration
+        Task {
+            var isValid = false
+            if let track = try? await asset.loadTracks(withMediaType: .video).first,
+               let size = try? await track.load(.naturalSize),
+               let transform = try? await track.load(.preferredTransform) {
+                let oriented = size.applying(transform)
+                let width = abs(oriented.width)
+                let height = abs(oriented.height)
+                isValid = height > 0 && abs(width / height - 2) < 0.05
+            }
+            guard generation == loadGeneration else { return }
+            hasVideo360 = isValid
+            if !isValid {
+                player360.replaceCurrentItem(with: nil)
             }
         }
     }
@@ -981,6 +1173,7 @@ final class FlightViewModel {
                 guard let value = model.value, !value.samples.isEmpty, value.pendingSeekCount == 0 else { return }
                 value.currentIndex = value.sampleIndex(at: seconds)
                 value.correctVideoDrift(frontTime: seconds)
+                value.correct360Drift(frontTime: seconds)
             }
         }
     }
@@ -1019,6 +1212,27 @@ final class FlightViewModel {
         ) { _ in
             Task { @MainActor in
                 model.value?.isCorrectingVideoDrift = false
+            }
+        }
+    }
+
+    /// Même correction par seek que pour la caméra arrière, appliquée au lecteur 360° quand il est affiché.
+    private func correct360Drift(frontTime: TimeInterval) {
+        guard isPlaying, isVideo360Enabled, player360.currentItem != nil, !isCorrecting360Drift else { return }
+        let actualTime = player360.currentTime().seconds
+        guard actualTime.isFinite, abs(actualTime - frontTime) > videoDriftSeekThreshold else { return }
+
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - last360DriftSeekTime > videoDriftSeekCooldown else { return }
+        last360DriftSeekTime = now
+
+        let target = CMTime(seconds: frontTime, preferredTimescale: 600)
+        let tolerance = CMTime(seconds: 0.1, preferredTimescale: 600)
+        isCorrecting360Drift = true
+        let model = WeakFlightViewModel(self)
+        player360.seek(to: target, toleranceBefore: tolerance, toleranceAfter: tolerance) { _ in
+            Task { @MainActor in
+                model.value?.isCorrecting360Drift = false
             }
         }
     }

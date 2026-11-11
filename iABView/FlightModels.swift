@@ -39,6 +39,10 @@ struct FlightSample: Identifiable, Sendable {
     let quaternionZ: Double
     /// Présent seulement si l'ABV contient des colonnes `gps2_*`.
     var gps2: SecondaryGPS? = nil
+    /// Satellites du GPS principal (colonne `gps_sats`), si l'ABV la contient.
+    var satellites: Int? = nil
+    /// HDOP du GPS principal (colonne `gps_hdop`), si l'ABV la contient.
+    var hdop: Double? = nil
 
     var coordinate: CLLocationCoordinate2D {
         CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
@@ -319,6 +323,8 @@ enum FlightBundleLoader {
         var previousElapsed = -Double.infinity
         var isChronological = true
         var hasGPS2 = false
+        var hasSatellites = false
+        var hasHDOP = false
         var offset = 0
 
         var isCancelled = false
@@ -347,6 +353,8 @@ enum FlightBundleLoader {
                     uniqueKeysWithValues: headers.enumerated().map { ($1, $0) }
                 )
                 hasGPS2 = columns["gps2_lat"] != nil && columns["gps2_lon"] != nil
+                hasSatellites = columns["gps_sats"] != nil
+                hasHDOP = columns["gps_hdop"] != nil
                 return
             }
 
@@ -416,7 +424,9 @@ enum FlightBundleLoader {
                     heading: number("gps2_heading"),
                     verticalSpeed: number("gps2_fpm"),
                     indicatedAirspeed: number("gps2_ias")
-                ) : nil
+                ) : nil,
+                satellites: hasSatellites ? Int(value("gps_sats")) : nil,
+                hdop: hasHDOP ? Double(value("gps_hdop")) : nil
             ))
             offset += 1
         }

@@ -14,6 +14,7 @@ struct ABVCreatorView: View {
     @AppStorage(ABVAccelerationSource.storageKey) private var accelerationSource = ABVAccelerationSource.gyroflow
     @AppStorage(ABVHighResolution.storageKey) private var highResolution = false
     @AppStorage(ABVExport360.storageKey) private var export360 = false
+    @AppStorage(ABVGPSSatellites.storageKey) private var gpsSatellites = true
     @State private var gyroflowTestResult: (succeeded: Bool, message: String)?
     @AppStorage(ABVGyroflowBinary.storageKey) private var gyroflowCustomPath = ""
 
@@ -296,6 +297,10 @@ struct ABVCreatorView: View {
                 .help("Génère en plus video360.mp4 (équirectangulaire 3840×1920, sans son) dans le fichier ABV, pour l'incruster plus tard dans l'app et y orienter la caméra. Allonge la conversion.")
                 .disabled(model.state == .running)
 
+            Toggle("Nombre de satellites GPS", isOn: $gpsSatellites)
+                .help("Importe le nombre de satellites quand le journal GPS le renseigne et l'ajoute (colonne gps_sats) à merged_data.csv, pour l'afficher dans l'encart de statistiques.")
+                .disabled(model.state == .running)
+
             HStack(spacing: 12) {
                 Text("Accélérations")
                 Picker("Accélérations", selection: $accelerationSource) {
@@ -492,6 +497,8 @@ struct ABVCreatorView: View {
             model.create(at: url)
             return
         }
+        // Un fichier de favoris existant peut être conservé (sauf en aperçu, qui ne produit pas de favoris).
+        let hasBookmarks = !model.isPreview && model.hasBookmarks(at: finalURL)
 
         let alert = NSAlert()
         alert.alertStyle = .warning
@@ -501,11 +508,12 @@ struct ABVCreatorView: View {
             alert.addButton(withTitle: "Garder la vidéo")
             alert.addButton(withTitle: "Tout écraser")
             alert.addButton(withTitle: "Annuler")
-            switch alert.runModal() {
-            case .alertFirstButtonReturn: model.create(at: url, overwrite: true, keepVideo: true)
-            case .alertSecondButtonReturn: model.create(at: url, overwrite: true)
-            default: break
-            }
+            let choice = alert.runModal()
+            guard choice == .alertFirstButtonReturn || choice == .alertSecondButtonReturn else { return }
+            guard let keepBookmarks = askKeepBookmarks(hasBookmarks, name: finalURL.lastPathComponent) else { return }
+            model.create(
+                at: url, overwrite: true, keepVideo: choice == .alertFirstButtonReturn, keepBookmarks: keepBookmarks
+            )
             return
         }
         alert.messageText = "Le fichier « \(finalURL.lastPathComponent) » existe déjà."
@@ -513,7 +521,25 @@ struct ABVCreatorView: View {
         alert.addButton(withTitle: "Remplacer")
         alert.addButton(withTitle: "Annuler")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        model.create(at: url, overwrite: true)
+        guard let keepBookmarks = askKeepBookmarks(hasBookmarks, name: finalURL.lastPathComponent) else { return }
+        model.create(at: url, overwrite: true, keepBookmarks: keepBookmarks)
+    }
+
+    /// Propose de conserver les favoris existants. Renvoie nil si l'utilisateur annule.
+    private func askKeepBookmarks(_ hasBookmarks: Bool, name: String) -> Bool? {
+        guard hasBookmarks else { return false }
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "Le fichier « \(name) » contient des favoris."
+        alert.informativeText = "Voulez-vous conserver les favoris existants (bookmark.csv) ?"
+        alert.addButton(withTitle: "Garder les favoris")
+        alert.addButton(withTitle: "Ne pas les garder")
+        alert.addButton(withTitle: "Annuler")
+        switch alert.runModal() {
+        case .alertFirstButtonReturn: return true
+        case .alertSecondButtonReturn: return false
+        default: return nil
+        }
     }
 
     private func icon(for kind: ABVSourceFile.Kind) -> String {

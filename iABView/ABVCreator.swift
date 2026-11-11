@@ -287,9 +287,8 @@ enum ABVIntegrationMethod: String, CaseIterable, Identifiable, Sendable {
 enum ABVHighResolution {
     static let storageKey = "ABVCreator.highResolution"
 
-    static var stored: Bool {
-        UserDefaults.standard.bool(forKey: storageKey)
-    }
+    /// L'option n'est plus proposée dans l'interface : l'export reste désactivé.
+    static var stored: Bool { false }
 }
 
 /// Option « Export vidéo 360° » : produit en plus `video360.mp4` (équirectangulaire), pour une future
@@ -299,6 +298,71 @@ enum ABVExport360 {
 
     static var stored: Bool {
         UserDefaults.standard.bool(forKey: storageKey)
+    }
+}
+
+/// Option « Nombre de satellites » : ajoute la colonne `gps_sats` à merged_data.csv quand le journal GPS
+/// la renseigne (activée par défaut).
+enum ABVGPSSatellites {
+    static let storageKey = "ABVCreator.gpsSatellites"
+
+    static var stored: Bool {
+        UserDefaults.standard.object(forKey: storageKey) as? Bool ?? true
+    }
+}
+
+/// Option « Gyroscopes bruts » : écrit en plus `gyro_raw.csv` dans l'ABV (gyroscope et accéléromètre à la
+/// cadence native de l'IMU, tels qu'exportés par Gyroflow), pour une future fusion GPS/inertielle.
+enum ABVRawGyro {
+    static let storageKey = "ABVCreator.rawGyro"
+    static let fileName = "gyro_raw.csv"
+
+    static var stored: Bool {
+        UserDefaults.standard.bool(forKey: storageKey)
+    }
+}
+
+/// Un échantillon IMU brut, dans le repère du fichier merged_data.csv (même repère que `x4_acc_*`).
+struct RawGyroSample: Sendable {
+    var date: Date
+    var milliseconds: Double
+    var gyroX: Double
+    var gyroY: Double
+    var gyroZ: Double
+    var accelerationX: Double
+    var accelerationY: Double
+    var accelerationZ: Double
+}
+
+/// Reçoit les échantillons bruts d'un fichier caméra pendant l'extraction de sa télémétrie.
+final class ABVRawGyroCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private nonisolated(unsafe) var rows: [RawGyroSample] = []
+    private nonisolated(unsafe) var failure: String?
+
+    nonisolated init() {}
+
+    nonisolated func set(_ samples: [RawGyroSample]) {
+        lock.lock(); defer { lock.unlock() }
+        rows = samples
+    }
+
+    nonisolated func fail(_ message: String) {
+        lock.lock(); defer { lock.unlock() }
+        failure = message
+    }
+
+    /// Échantillons du dernier fichier caméra traité (la collecte est vidée).
+    nonisolated func take() -> [RawGyroSample] {
+        lock.lock(); defer { lock.unlock() }
+        let result = rows
+        rows = []
+        return result
+    }
+
+    nonisolated var failureMessage: String? {
+        lock.lock(); defer { lock.unlock() }
+        return failure
     }
 }
 
@@ -597,7 +661,12 @@ final class ABVCreatorModel {
         UserDefaults.standard.set(bookmarks, forKey: Self.lastSessionBookmarksKey)
     }
 
-    func create(at destination: URL, overwrite: Bool = false, keepVideo: Bool = false) {
+    /// Vrai si le paquet de destination contient déjà un fichier de favoris (bookmark.csv).
+    func hasBookmarks(at url: URL) -> Bool {
+        FileManager.default.fileExists(atPath: url.appendingPathComponent(ABVCreatorPipeline.bookmarkFileName).path)
+    }
+
+    func create(at destination: URL, overwrite: Bool = false, keepVideo: Bool = false, keepBookmarks: Bool = false) {
         guard canCreate else { return }
         state = .running
         isPaused = false
@@ -619,6 +688,8 @@ final class ABVCreatorModel {
         let integrationMethod = ABVIntegrationMethod.gyroflowDefault
         let highResolution = ABVHighResolution.stored && hasX6Camera
         let export360 = ABVExport360.stored
+        let includeSatellites = ABVGPSSatellites.stored
+        let rawGyro = ABVRawGyro.stored
         let previewOffset: TimeInterval? = isPreview ? Double(max(0, previewOffsetMinutes)) * 60 : nil
         saveLastSession()
         let token = ABVCreatorCancellationToken()
@@ -645,9 +716,10 @@ final class ABVCreatorModel {
                 let result = try await Task.detached(priority: .userInitiated) {
                     try ABVCreatorPipeline.create(
                         sources: selectedSources, destination: destination,
-                        overwrite: overwrite, keepVideo: keepVideo, previewOffset: previewOffset,
+                        overwrite: overwrite, keepVideo: keepVideo, keepBookmarks: keepBookmarks, previewOffset: previewOffset,
                         accelerationSource: accelerationSource, integrationMethod: integrationMethod,
-                        highResolution: highResolution, export360: export360, cancellation: token
+                        highResolution: highResolution, export360: export360,
+                        includeSatellites: includeSatellites, rawGyro: rawGyro, cancellation: token
                     ) { update in
                         continuation.yield(update)
                     }
@@ -728,6 +800,10 @@ private enum ABVCreatorPipeline {
         var speed: Double
         var heading: Double
         var verticalSpeed: Double
+        /// Nombre de satellites, quand le journal le renseigne.
+        var satellites: Int? = nil
+        /// HDOP (dilution horizontale de précision, champ 8 de GGA), quand le journal le renseigne.
+        var hdop: Double? = nil
     }
 
     struct IPhoneSample: Sendable {
@@ -748,11 +824,14 @@ private enum ABVCreatorPipeline {
         destination: URL,
         overwrite: Bool,
         keepVideo: Bool = false,
+        keepBookmarks: Bool = false,
         previewOffset: TimeInterval? = nil,
         accelerationSource: ABVAccelerationSource = .gyroflow,
         integrationMethod: ABVIntegrationMethod = .gyroflowDefault,
         highResolution: Bool = false,
         export360: Bool = false,
+        includeSatellites: Bool = true,
+        rawGyro: Bool = false,
         cancellation: ABVCreatorCancellationToken,
         progress: @escaping @Sendable (ABVCreatorProgress) -> Void
     ) throws -> CreationResult {
@@ -787,7 +866,14 @@ private enum ABVCreatorPipeline {
                 throw ABVCreatorError.invalidSources("Le fichier \(output.lastPathComponent) existe déjà.")
             }
             if keepVideo {
-                removeAllExceptVideos(in: output)
+                removeAllExceptVideos(in: output, keepBookmarks: keepBookmarks)
+            } else if keepBookmarks {
+                // Seuls les favoris sont conservés : on les met de côté le temps de recréer le paquet.
+                let bookmarkURL = output.appendingPathComponent(bookmarkFileName)
+                let saved = try? Data(contentsOf: bookmarkURL)
+                try fileManager.removeItem(at: output)
+                try fileManager.createDirectory(at: output, withIntermediateDirectories: true)
+                if let saved { try saved.write(to: bookmarkURL) }
             } else {
                 try fileManager.removeItem(at: output)
             }
@@ -821,6 +907,8 @@ private enum ABVCreatorPipeline {
             var segmentStart: Date?
             var segmentDurations: [TimeInterval] = []
             var usesX6 = false
+            let rawGyroCollector = rawGyro ? ABVRawGyroCollector() : nil
+            var rawGyroSamples: [RawGyroSample] = []
             for camera in stagedCameras {
                 try cancellation.checkCancelled()
                 announce("Extraction de la télémétrie caméra : \(camera.lastPathComponent) (accélérations : \(accelerationSource.displayName), intégration : \(integrationMethod.displayName))…")
@@ -830,12 +918,12 @@ private enum ABVCreatorPipeline {
                     usesX6 = true
                     segment = try cameraDataX6(
                         from: camera, work: work, accelerationSource: accelerationSource,
-                        integrationMethod: integrationMethod, cancellation: cancellation
+                        integrationMethod: integrationMethod, rawGyro: rawGyroCollector, cancellation: cancellation
                     )
                 case .x4:
                     segment = try cameraData(
                         from: camera, work: work, accelerationSource: accelerationSource,
-                        integrationMethod: integrationMethod, cancellation: cancellation
+                        integrationMethod: integrationMethod, rawGyro: rawGyroCollector, cancellation: cancellation
                     )
                 }
                 if let first = segment.first?.date, let last = segment.last?.date {
@@ -843,14 +931,19 @@ private enum ABVCreatorPipeline {
                 } else {
                     segmentDurations.append(0)
                 }
+                var segmentGyro = rawGyroCollector?.take() ?? []
                 if let previousEnd = cameraSamples.last?.date, let first = segment.first?.date {
                     let offset = previousEnd.timeIntervalSince(first)
                     for index in segment.indices {
                         segment[index].date = segment[index].date.addingTimeInterval(offset)
                     }
+                    for index in segmentGyro.indices {
+                        segmentGyro[index].date = segmentGyro[index].date.addingTimeInterval(offset)
+                    }
                 } else {
                     segmentStart = segment.first?.date
                 }
+                rawGyroSamples.append(contentsOf: segmentGyro)
                 cameraSamples.append(contentsOf: segment)
                 advance(cameraWeight / Double(stagedCameras.count), message: "Télémétrie extraite : \(camera.lastPathComponent).")
             }
@@ -883,6 +976,10 @@ private enum ABVCreatorPipeline {
                 let windowStart = cameraSamples[0].date.addingTimeInterval(previewOffset)
                 let windowEnd = windowStart.addingTimeInterval(previewDuration)
                 cameraSamples = cameraSamples.filter { $0.date >= windowStart && $0.date <= windowEnd }
+                rawGyroSamples = rawGyroSamples.filter { $0.date >= windowStart && $0.date <= windowEnd }
+                for index in rawGyroSamples.indices {
+                    rawGyroSamples[index].milliseconds = rawGyroSamples[index].date.timeIntervalSince(windowStart) * 1_000
+                }
                 for index in cameraSamples.indices {
                     cameraSamples[index].milliseconds = cameraSamples[index].date.timeIntervalSince(windowStart) * 1_000
                 }
@@ -972,7 +1069,19 @@ private enum ABVCreatorPipeline {
             let phone = try phoneSource.map { try loadIPhone(from: $0.url) } ?? []
             advance(phoneWeight)
             announce("Fusion des données…")
-            try writeMergedCSV(camera: cameraSamples, gps: gps, gps2: gps2, phone: phone, to: output)
+            try writeMergedCSV(camera: cameraSamples, gps: gps, gps2: gps2, phone: phone,
+                                    includeSatellites: includeSatellites, to: output)
+            if rawGyro {
+                if let failure = rawGyroCollector?.failureMessage {
+                    advance(0, message: failure)
+                } else if rawGyroSamples.isEmpty {
+                    advance(0, message: "Gyroscopes bruts : aucun échantillon exporté.")
+                } else {
+                    announce("Écriture des gyroscopes bruts…")
+                    try writeRawGyroCSV(rawGyroSamples, to: output)
+                    advance(0, message: "Gyroscopes bruts écrits (\(rawGyroSamples.count) échantillons).")
+                }
+            }
             try "1.11-native".write(to: output.appendingPathComponent("version.txt"), atomically: true, encoding: .utf8)
             if usesX6 {
                 // Angle de montage par défaut : 0° pour l'X6 (15° pour l'X4, valeur du viewer).
@@ -983,7 +1092,9 @@ private enum ABVCreatorPipeline {
             return CreationResult(url: output, flightDate: cameraSamples[0].date)
         } catch {
             if keepVideo {
-                removeAllExceptVideos(in: output)
+                removeAllExceptVideos(in: output, keepBookmarks: keepBookmarks)
+            } else if keepBookmarks {
+                removeAllExceptVideos(in: output, keepVideos: false, keepBookmarks: true)
             } else {
                 try? fileManager.removeItem(at: output)
             }
@@ -991,9 +1102,12 @@ private enum ABVCreatorPipeline {
         }
     }
 
-    /// Supprime tout le contenu du paquet sauf les vidéos déjà converties.
-    nonisolated static func removeAllExceptVideos(in package: URL) {
-        let keep: Set<String> = ["front.mp4", "back.mp4", "video360.mp4"]
+    nonisolated static let bookmarkFileName = "bookmark.csv"
+
+    /// Supprime tout le contenu du paquet sauf les vidéos déjà converties (et, si demandé, les favoris).
+    nonisolated static func removeAllExceptVideos(in package: URL, keepVideos: Bool = true, keepBookmarks: Bool = false) {
+        var keep: Set<String> = keepVideos ? ["front.mp4", "back.mp4", "video360.mp4"] : []
+        if keepBookmarks { keep.insert(bookmarkFileName) }
         let items = (try? FileManager.default.contentsOfDirectory(atPath: package.path)) ?? []
         for name in items where !keep.contains(name) {
             try? FileManager.default.removeItem(at: package.appendingPathComponent(name))
@@ -1241,6 +1355,7 @@ private enum ABVCreatorPipeline {
     nonisolated static func cameraData(
         from camera: URL, work: URL, accelerationSource: ABVAccelerationSource = .gyroflow,
         integrationMethod: ABVIntegrationMethod = .gyroflowDefault,
+        rawGyro: ABVRawGyroCollector? = nil,
         cancellation: ABVCreatorCancellationToken
     ) throws -> [CameraSample] {
         let gyroflow = try executable("Gyroflow", candidates: ABVTool.gyroflow.candidates)
@@ -1250,7 +1365,8 @@ private enum ABVCreatorPipeline {
             try run(
                 gyroflow,
                 gyroflowExportArguments(
-                    camera: camera, output: quaternionURL, source: accelerationSource, integrationMethod: integrationMethod
+                    camera: camera, output: quaternionURL, source: accelerationSource, integrationMethod: integrationMethod,
+                    allSamples: rawGyro != nil
                 ),
                 work: work, cancellation: cancellation
             )
@@ -1259,6 +1375,9 @@ private enum ABVCreatorPipeline {
             // après avoir écrit l'export : on accepte alors le fichier produit.
             let size = (try? FileManager.default.attributesOfItem(atPath: quaternionURL.path)[.size] as? NSNumber)?.intValue ?? 0
             guard size > 0 else { throw ABVCreatorError.commandFailed(name, output) }
+        }
+        if let rawGyro {
+            collectRawGyro(into: rawGyro, from: quaternionURL, camera: camera, flipXY: false)
         }
         if accelerationSource == .gyroflow {
             // Quaternion et accélération (m/s²) viennent du même export Gyroflow, un échantillon IMU sur 10.
@@ -1349,6 +1468,7 @@ private enum ABVCreatorPipeline {
     nonisolated static func cameraDataX6(
         from camera: URL, work: URL, accelerationSource: ABVAccelerationSource = .gyroflow,
         integrationMethod: ABVIntegrationMethod = .gyroflowDefault,
+        rawGyro: ABVRawGyroCollector? = nil,
         cancellation: ABVCreatorCancellationToken
     ) throws -> [CameraSample] {
         let gyroflow = try executable("Gyroflow", candidates: ABVTool.gyroflow.candidates)
@@ -1358,7 +1478,8 @@ private enum ABVCreatorPipeline {
             try run(
                 gyroflow,
                 gyroflowExportArguments(
-                    camera: camera, output: quaternionURL, source: accelerationSource, integrationMethod: integrationMethod
+                    camera: camera, output: quaternionURL, source: accelerationSource, integrationMethod: integrationMethod,
+                    allSamples: rawGyro != nil
                 ),
                 work: work, cancellation: cancellation
             )
@@ -1367,6 +1488,9 @@ private enum ABVCreatorPipeline {
             // après avoir écrit l'export : on accepte alors le fichier produit.
             let size = (try? FileManager.default.attributesOfItem(atPath: quaternionURL.path)[.size] as? NSNumber)?.intValue ?? 0
             guard size > 0 else { throw ABVCreatorError.commandFailed(name, output) }
+        }
+        if let rawGyro {
+            collectRawGyro(into: rawGyro, from: quaternionURL, camera: camera, flipXY: true)
         }
         if accelerationSource == .gyroflow {
             // Mêmes corrections de repère que ci-dessous : q · x6SensorCorrection, accélération (−x, −y, z).
@@ -1456,6 +1580,47 @@ private enum ABVCreatorPipeline {
         return samples
     }
 
+    /// Lit le gyroscope brut de l'export Gyroflow et le range dans le repère de `merged_data.csv`
+    /// (X6 : rotation de 180° autour de l'axe Z, comme pour l'accélération). Un échec n'interrompt pas la création.
+    nonisolated static func collectRawGyro(
+        into collector: ABVRawGyroCollector, from url: URL, camera: URL, flipXY: Bool
+    ) {
+        guard let firstDate = dateFromCameraName(camera.lastPathComponent) else {
+            collector.fail("Gyroscopes bruts : date absente du nom \(camera.lastPathComponent).")
+            return
+        }
+        do {
+            var samples = try gyroflowRawSamples(at: url, firstDate: firstDate)
+            if flipXY {
+                for index in samples.indices {
+                    samples[index].gyroX = -samples[index].gyroX
+                    samples[index].gyroY = -samples[index].gyroY
+                    samples[index].accelerationX = -samples[index].accelerationX
+                    samples[index].accelerationY = -samples[index].accelerationY
+                }
+            }
+            collector.set(samples)
+        } catch {
+            collector.fail(error.localizedDescription)
+        }
+    }
+
+    /// Écrit `gyro_raw.csv` : gyroscope (unité de l'export Gyroflow) et accéléromètre bruts (m/s²).
+    nonisolated static func writeRawGyroCSV(_ samples: [RawGyroSample], to output: URL) throws {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        var text = "timestamp,timestamp_ms,gyro_x,gyro_y,gyro_z,acc_x,acc_y,acc_z\n"
+        text.reserveCapacity(samples.count * 90)
+        for sample in samples {
+            text += [
+                formatter.string(from: sample.date), number(sample.milliseconds),
+                number(sample.gyroX), number(sample.gyroY), number(sample.gyroZ),
+                number(sample.accelerationX), number(sample.accelerationY), number(sample.accelerationZ)
+            ].joined(separator: ",") + "\n"
+        }
+        try text.write(to: output.appendingPathComponent(ABVRawGyro.fileName), atomically: true, encoding: .utf8)
+    }
+
     /// Champs exportés par Gyroflow avec `export_all_samples` : un échantillon par mesure IMU, quaternion
     /// et accéléromètre (m/s²) inclus. Toutes les clés sont requises : Gyroflow plante si l'une manque.
     private nonisolated static let gyroflowAllSamplesFields = """
@@ -1466,13 +1631,14 @@ private enum ABVCreatorPipeline {
 
     nonisolated static func gyroflowExportArguments(
         camera: URL, output: URL, source: ABVAccelerationSource,
-        integrationMethod: ABVIntegrationMethod = .gyroflowDefault
+        integrationMethod: ABVIntegrationMethod = .gyroflowDefault,
+        allSamples: Bool = false
     ) -> [String] {
         var arguments = [camera.path, "--export-metadata", "3:\(output.path)"]
         if let index = integrationMethod.presetIndex {
             arguments += ["--preset", "{ 'version': 2, 'gyro_source': { 'integration_method': \(index) } }"]
         }
-        if source == .gyroflow {
+        if source == .gyroflow || allSamples {
             arguments += ["--export-metadata-fields", gyroflowAllSamplesFields]
         }
         return arguments
@@ -1492,11 +1658,52 @@ private enum ABVCreatorPipeline {
     /// Lit l'export Gyroflow « tous les échantillons » (~1,8 million de lignes, ~400 Mo pour 30 min)
     /// sans le charger en mémoire sous forme de dictionnaires : seule une ligne sur `step` est analysée.
     nonisolated static func gyroflowSamples(at url: URL, step: Int = 10) throws -> [GyroflowSample] {
-        let data = try Data(contentsOf: url, options: .alwaysMapped)
-        let wanted = ["timestamp_ms", "org_acc_x", "org_acc_y", "org_acc_z",
-                      "org_quat_w", "org_quat_x", "org_quat_y", "org_quat_z"]
-        var columns: [Int] = []
         var samples: [GyroflowSample] = []
+        try scanGyroflowCSV(
+            at: url,
+            wanted: ["timestamp_ms", "org_acc_x", "org_acc_y", "org_acc_z",
+                     "org_quat_w", "org_quat_x", "org_quat_y", "org_quat_z"],
+            step: step,
+            missingMessage: "Export Gyroflow : colonnes quaternion/accélération absentes."
+        ) { values in
+            samples.append(GyroflowSample(
+                milliseconds: values[0],
+                accelerationX: values[1], accelerationY: values[2], accelerationZ: values[3],
+                quaternionW: values[4], quaternionX: values[5], quaternionY: values[6], quaternionZ: values[7]
+            ))
+        }
+        guard !samples.isEmpty else { throw ABVCreatorError.invalidData("Export Gyroflow vide.") }
+        return samples
+    }
+
+    /// Gyroscope et accéléromètre bruts (tous les échantillons IMU, sans lissage) de l'export Gyroflow,
+    /// dans le repère capteur d'origine. Lève une erreur si les colonnes `org_gyro_*` sont absentes.
+    nonisolated static func gyroflowRawSamples(at url: URL, firstDate: Date) throws -> [RawGyroSample] {
+        var samples: [RawGyroSample] = []
+        try scanGyroflowCSV(
+            at: url,
+            wanted: ["timestamp_ms", "org_gyro_x", "org_gyro_y", "org_gyro_z",
+                     "org_acc_x", "org_acc_y", "org_acc_z"],
+            step: 1,
+            missingMessage: "Export Gyroflow : colonnes gyroscope (org_gyro_*) absentes."
+        ) { values in
+            samples.append(RawGyroSample(
+                date: firstDate.addingTimeInterval(values[0] / 1_000), milliseconds: values[0],
+                gyroX: values[1], gyroY: values[2], gyroZ: values[3],
+                accelerationX: values[4], accelerationY: values[5], accelerationZ: values[6]
+            ))
+        }
+        return samples
+    }
+
+    /// Parcourt l'export Gyroflow (une ligne sur `step`) et fournit, pour chaque ligne valide,
+    /// les valeurs des colonnes `wanted` dans cet ordre.
+    private nonisolated static func scanGyroflowCSV(
+        at url: URL, wanted: [String], step: Int, missingMessage: String,
+        row: ([Double]) -> Void
+    ) throws {
+        let data = try Data(contentsOf: url, options: .alwaysMapped)
+        var columns: [Int] = []
         try data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             guard let base = raw.baseAddress else { return }
             let count = raw.count
@@ -1516,21 +1723,15 @@ private enum ABVCreatorPipeline {
                     let names = fields.map(String.init)
                     columns = wanted.compactMap { names.firstIndex(of: $0) }
                     guard columns.count == wanted.count else {
-                        throw ABVCreatorError.invalidData("Export Gyroflow : colonnes quaternion/accélération absentes.")
+                        throw ABVCreatorError.invalidData(missingMessage)
                     }
                     continue
                 }
                 let values = columns.compactMap { fields.indices.contains($0) ? Double(fields[$0]) : nil }
                 guard values.count == wanted.count, values[0] >= 0 else { continue }
-                samples.append(GyroflowSample(
-                    milliseconds: values[0],
-                    accelerationX: values[1], accelerationY: values[2], accelerationZ: values[3],
-                    quaternionW: values[4], quaternionX: values[5], quaternionY: values[6], quaternionZ: values[7]
-                ))
+                row(values)
             }
         }
-        guard !samples.isEmpty else { throw ABVCreatorError.invalidData("Export Gyroflow vide.") }
-        return samples
     }
 
     nonisolated static func numericCSV(at url: URL, headerLine: Int = 0) throws -> [[String: Double]] {
@@ -1564,20 +1765,26 @@ private enum ABVCreatorPipeline {
             return enrichGPS(unique)
         }
         let text = try String(contentsOf: url, encoding: .utf8)
-        var pending: (time: String, lat: Double, lon: Double, alt: Double)?
+        var pending: (time: String, lat: Double, lon: Double, alt: Double, sats: Int?, hdop: Double?)?
         var points: [GPSSample] = []
+        // Satellites en vue (GSV, un total par constellation) ; à défaut, ceux utilisés (GGA).
+        var inView: [String: Int] = [:]
         for line in text.split(whereSeparator: \.isNewline).map(String.init) {
             let parts = line.split(separator: ",", omittingEmptySubsequences: false).map(String.init)
-            if line.hasPrefix("$GNGGA"), parts.count > 9,
+            if line.hasPrefix("$"), line.dropFirst(3).hasPrefix("GSV"), parts.count > 3, let count = Int(parts[3]) {
+                inView[String(line.dropFirst().prefix(2))] = count
+            } else if line.hasPrefix("$GNGGA"), parts.count > 9,
                let lat = nmeaCoordinate(parts[2], direction: parts[3]),
                let lon = nmeaCoordinate(parts[4], direction: parts[5]),
                let altitude = Double(parts[9]) {
-                pending = (parts[1], lat, lon, altitude * 3.28084)
+                pending = (parts[1], lat, lon, altitude * 3.28084, Int(parts[7]), Double(parts[8]))
             } else if line.hasPrefix("$GNRMC"), parts.count > 8, let pending,
                       let date = nmeaDate(parts[1], dateField: parts.count > 9 ? parts[9] : nil, fallbackDay: flightDate) {
                 points.append(GPSSample(
                     date: date, latitude: pending.lat, longitude: pending.lon, altitude: pending.alt,
-                    speed: (Double(parts[7]) ?? 0) * 1.852, heading: Double(parts[8]) ?? 0, verticalSpeed: 0
+                    speed: (Double(parts[7]) ?? 0) * 1.852, heading: Double(parts[8]) ?? 0, verticalSpeed: 0,
+                    satellites: inView.isEmpty ? pending.sats : inView.values.reduce(0, +),
+                    hdop: pending.hdop
                 ))
             }
         }
@@ -1635,7 +1842,8 @@ private enum ABVCreatorPipeline {
     }
 
     nonisolated static func writeMergedCSV(
-        camera: [CameraSample], gps: [GPSSample], gps2: [GPSSample] = [], phone: [IPhoneSample], to output: URL
+        camera: [CameraSample], gps: [GPSSample], gps2: [GPSSample] = [], phone: [IPhoneSample],
+        includeSatellites: Bool = true, to output: URL
     ) throws {
         let phoneColumns = ["iphone_lat", "iphone_lon", "iphone_alt", "iphone_speed", "iphone_heading",
                             "iphone_acc_x", "iphone_acc_y", "iphone_acc_z",
@@ -1646,6 +1854,11 @@ private enum ABVCreatorPipeline {
         headers += ["gps_lat", "gps_lon", "gps_alt", "gps_speed", "gps_heading", "gps_fpm",
                     "era5_wind_speed", "era5_wind_direction", "gps_ias"]
         let hasGPS2 = !gps2.isEmpty
+        // Colonne ajoutée seulement si le journal renseigne les satellites.
+        let hasSatellites = includeSatellites && gps.contains { $0.satellites != nil }
+        if hasSatellites { headers.append("gps_sats") }
+        let hasHDOP = gps.contains { $0.hdop != nil }
+        if hasHDOP { headers.append("gps_hdop") }
         if hasGPS2 {
             headers += ["gps2_lat", "gps2_lon", "gps2_alt", "gps2_speed", "gps2_heading", "gps2_fpm", "gps2_ias"]
         }
@@ -1667,6 +1880,8 @@ private enum ABVCreatorPipeline {
                 number(g.latitude), number(g.longitude), number(g.altitude), number(g.speed),
                 number(g.heading), number(g.verticalSpeed), "0", "0", number(g.speed)
             ]
+            if hasSatellites { values.append(g.satellites.map(String.init) ?? "") }
+            if hasHDOP { values.append(g.hdop.map(number) ?? "") }
             if hasGPS2 {
                 let g2 = gps2[nearestIndex(in: gps2Dates, to: sample.date)]
                 values += [
@@ -1785,6 +2000,7 @@ private final class GPXPointParser: NSObject, XMLParserDelegate {
     private var latitude: Double?
     private var longitude: Double?
     private var elevation: Double?
+    private var satellites: Int?
     private var date: Date?
     private var currentElement = ""
     private var text = ""
@@ -1807,6 +2023,7 @@ private final class GPXPointParser: NSObject, XMLParserDelegate {
             latitude = attributeDict["lat"].flatMap(Double.init)
             longitude = attributeDict["lon"].flatMap(Double.init)
             elevation = nil
+            satellites = nil
             date = nil
         }
     }
@@ -1821,11 +2038,13 @@ private final class GPXPointParser: NSObject, XMLParserDelegate {
     ) {
         let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if elementName == "ele" { elevation = Double(value) }
+        if elementName == "sat" { satellites = Int(value) }
         if elementName == "time" { date = isoFractional.date(from: value) ?? iso.date(from: value) }
         if elementName == "trkpt", let latitude, let longitude, let date {
             points.append(.init(
                 date: date, latitude: latitude, longitude: longitude,
-                altitude: (elevation ?? 0) * 3.28084, speed: 0, heading: 0, verticalSpeed: 0
+                altitude: (elevation ?? 0) * 3.28084, speed: 0, heading: 0, verticalSpeed: 0,
+                satellites: satellites
             ))
         }
         currentElement = ""

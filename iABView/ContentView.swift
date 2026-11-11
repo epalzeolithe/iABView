@@ -44,10 +44,10 @@ struct ContentView: View {
     @State private var recorder = ScreenRecorder()
     @State private var detachedWindows = DetachedWindowManager()
     @State private var isChaseCam3DPresented = false
+    @AppStorage("workspaceLayout") private var layout = WorkspaceLayout.standard
     @State private var isKeyboardHelpPresented = false
     @State private var columnVisibility: NavigationSplitViewVisibility = .detailOnly
     @State private var preferredCompactColumn: NavigationSplitViewColumn = .detail
-    @State private var bookmarkName = ""
     @State private var isBookmarkDialogPresented = false
     @State private var bookmarkTimeText = ""
     @State private var isLastBundleDialogPresented = false
@@ -80,6 +80,7 @@ struct ContentView: View {
                 bundleName: model.bundleURL?.lastPathComponent,
                 recentBundles: model.recentBundles,
                 bookmarks: model.bookmarks,
+                currentBookmarkID: model.currentBookmarkID,
                 onOpen: openBundlePanel,
                 onSelectRecent: { recent in
                     model.openBundle(recent.url)
@@ -88,6 +89,8 @@ struct ContentView: View {
                 onShowFlight: { preferredCompactColumn = .detail },
                 onOpenBookmarksFile: model.openBookmarksFile,
                 onReloadBookmarks: model.reloadBookmarks,
+                onRemoveBookmark: model.removeBookmark,
+                figureReport: model.figureReport,
                 onSelectBookmark: { bookmark in
                     model.goToBookmark(bookmark)
                     preferredCompactColumn = .detail
@@ -113,7 +116,8 @@ struct ContentView: View {
                     #else
                     isChaseCam3DPresented = true
                     #endif
-                }
+                },
+                layout: layout
             )
         }
         #if os(macOS)
@@ -193,16 +197,17 @@ struct ContentView: View {
         } message: {
             Text(model.lastBundleName ?? "Dernier bundle ABView")
         }
-        .alert("Ajouter un bookmark", isPresented: $isBookmarkDialogPresented) {
-            TextField("Nom", text: $bookmarkName)
-            Button("Ajouter") {
-                let name = bookmarkName.trimmingCharacters(in: .whitespacesAndNewlines)
-                model.addBookmark(named: name.isEmpty ? "Bookmark" : name)
-                bookmarkName = ""
-            }
-            Button("Annuler", role: .cancel) {}
-        } message: {
-            Text("Le bookmark sera créé à \(bookmarkTimeText).")
+        .sheet(isPresented: $isBookmarkDialogPresented) {
+            BookmarkCreationSheet(
+                timeText: bookmarkTimeText,
+                onAdd: { name, code in
+                    // Le code choisi est mémorisé : les prochains favoris de même texte afficheront la figure.
+                    if let code { AerobaticFigureLibrary.learn(name: name, code: code) }
+                    model.addBookmark(named: name)
+                    isBookmarkDialogPresented = false
+                },
+                onCancel: { isBookmarkDialogPresented = false }
+            )
         }
         // Heure figée à l'ouverture du dialogue : lire `currentTime` dans le message ferait
         // réévaluer tout `ContentView` (et donc l'espace de travail) à chaque tick de lecture.
@@ -232,6 +237,13 @@ struct ContentView: View {
         }
         .modifier(FlightErrorAlerts(model: model, recorder: recorder))
         .toolbar {
+            // Groupe isolé des autres icônes : vue 360° et suivi dynamique.
+            ToolbarItem {
+                Video360Toggles(model: model)
+            }
+
+            ToolbarSpacer(.fixed)
+
             ToolbarItemGroup {
                 Button {
                     openBundlePanel()
@@ -240,6 +252,12 @@ struct ContentView: View {
                 }
 
                 if !isRunningOnIPhone {
+                    Picker("Layout", selection: $layout) {
+                        ForEach(WorkspaceLayout.allCases) { Text($0.title).tag($0) }
+                    }
+                    .pickerStyle(.menu)
+                    .help("Disposition de l'espace de travail")
+
                     Button {
                         #if os(macOS)
                         detachedWindows.showChaseCam3D(model: model)
@@ -247,7 +265,7 @@ struct ContentView: View {
                         isChaseCam3DPresented = true
                         #endif
                     } label: {
-                        Label("Cam 3D", systemImage: "cube.transparent")
+                        Label("Cam 3D", systemImage: "airplane.path.dotted")
                     }
                     .disabled(model.samples.isEmpty)
 
@@ -258,6 +276,13 @@ struct ContentView: View {
                     Label("Créer un fichier ABV…", systemImage: "shippingbox.and.arrow.backward")
                 }
                 .help("Assembler les sources d’un vol (caméra, GPS, iPhone) en un fichier ABV")
+
+                Button {
+                    openWindow(id: "abv-editor")
+                } label: {
+                    Label("Éditer un fichier ABV…", systemImage: "scissors")
+                }
+                .help("Couper le début et la fin d’un fichier ABV sans écraser l’original")
 
                 Button(action: updateHistoricalMETAR) {
                     if model.isUpdatingMETAR {
@@ -538,12 +563,20 @@ struct FlightSidebar: View {
     let bundleName: String?
     let recentBundles: [RecentBundle]
     let bookmarks: [FlightBookmark]
+    let currentBookmarkID: UUID?
     let onOpen: () -> Void
     let onSelectRecent: (RecentBundle) -> Void
     let onShowFlight: () -> Void
     let onOpenBookmarksFile: () -> Void
     let onReloadBookmarks: () -> Void
+    let onRemoveBookmark: (FlightBookmark) -> Void
+    let figureReport: () -> [FlightViewModel.FigureReportRow]
     let onSelectBookmark: (FlightBookmark) -> Void
+    @State private var isReportPresented = false
+    @State private var figureTarget: FlightBookmark?
+    @State private var isAssociationsManagerPresented = false
+    /// Incrémenté après chaque changement d'association pour réévaluer les symboles de la liste.
+    @State private var associationsRevision = 0
 
     var body: some View {
         List {
@@ -591,6 +624,12 @@ struct FlightSidebar: View {
                     Label("Recharger bookmark.csv", systemImage: "arrow.clockwise")
                 }
                 .disabled(bundleName == nil)
+                Button {
+                    isReportPresented = true
+                } label: {
+                    Label("Rapport des figures…", systemImage: "list.number")
+                }
+                .disabled(bookmarks.isEmpty)
                 if bookmarks.isEmpty {
                     Text("Aucun favori")
                         .foregroundStyle(.secondary)
@@ -599,17 +638,68 @@ struct FlightSidebar: View {
                         Button {
                             onSelectBookmark(bookmark)
                         } label: {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(bookmark.name)
-                                Text(bookmark.displayTime)
-                                    .font(.caption.monospacedDigit())
-                                    .foregroundStyle(.secondary)
+                            // Le code Aresti est placé près du symbole, sur la même ligne que l'heure.
+                            let figure = AerobaticFigure(bookmarkName: bookmark.name)
+                            HStack(alignment: .bottom, spacing: 6) {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    // Libellé long : passe à la ligne plutôt que d'être tronqué.
+                                    Text(bookmark.name)
+                                        .lineLimit(nil)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                    Text(bookmark.displayTime)
+                                        .font(.caption.monospacedDigit())
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                if let code = figure?.catalogCode {
+                                    Text(code)
+                                        .font(.caption.monospacedDigit())
+                                        .foregroundStyle(.secondary)
+                                        .id(associationsRevision)
+                                }
+                                if let figure {
+                                    AerobaticFigureSymbol(figure: figure, color: .primary)
+                                        .frame(width: 30, height: 30)
+                                        .id(associationsRevision)
+                                }
                             }
                         }
                         .buttonStyle(.plain)
+                        .contextMenu {
+                            Button("Associer une figure Aresti…", systemImage: "scribble.variable") {
+                                figureTarget = bookmark
+                            }
+                            Button("Gérer les associations…", systemImage: "list.bullet") {
+                                isAssociationsManagerPresented = true
+                            }
+                            Divider()
+                            Button("Supprimer le favori", systemImage: "trash", role: .destructive) {
+                                onRemoveBookmark(bookmark)
+                            }
+                        }
+                        .swipeActions(edge: .trailing) {
+                            Button("Supprimer", systemImage: "trash", role: .destructive) {
+                                onRemoveBookmark(bookmark)
+                            }
+                        }
+                        .listRowBackground(
+                            bookmark.id == currentBookmarkID ? Color.accentColor.opacity(0.3) : nil
+                        )
                     }
                 }
             }
+        }
+        .sheet(isPresented: $isReportPresented) {
+            AerobaticFlightReportView(rows: figureReport()) { isReportPresented = false }
+        }
+        .sheet(item: $figureTarget) { bookmark in
+            AerobaticAssociationSheet(name: bookmark.name) {
+                figureTarget = nil
+                associationsRevision += 1
+            }
+        }
+        .sheet(isPresented: $isAssociationsManagerPresented, onDismiss: { associationsRevision += 1 }) {
+            AerobaticAssociationsManager { isAssociationsManagerPresented = false }
         }
         .navigationTitle("ABView")
         #if os(iOS)
@@ -626,6 +716,21 @@ struct FlightSidebar: View {
     }
 }
 
+/// Dispositions de l'espace de travail : 1 = standard, 2 = chase cam plein cadre avec incrustations.
+enum WorkspaceLayout: String, CaseIterable, Identifiable {
+    case standard
+    case chaseCam
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .standard: "Layout 1 — Standard"
+        case .chaseCam: "Layout 2 — Chase cam"
+        }
+    }
+}
+
 struct FlightWorkspace: View {
     let model: FlightViewModel
     let isRecording: Bool
@@ -637,6 +742,9 @@ struct FlightWorkspace: View {
     let onDetachAircraft: () -> Void
     let onDetachFlightPath: () -> Void
     let onOpenChaseCam3D: () -> Void
+    var layout: WorkspaceLayout = .standard
+    @AppStorage(AerobaticOverlay.cornerKey) private var arestiCorner = AerobaticOverlay.Corner.topTrailing
+    @AppStorage(AerobaticOverlay.sizeKey) private var arestiSize = AerobaticOverlay.Size.medium
     @State private var fullScreenVideo: FlightVideoSelection?
     @State private var fullScreenInstrument: FlightInstrumentSelection?
 
@@ -736,12 +844,19 @@ struct FlightWorkspace: View {
         // est enveloppé dans un `ObservationScope` pour que seul le bloc concerné soit
         // réévalué à chaque tick de `currentIndex`, et non tout l'espace de travail.
         VStack(spacing: 6) {
-            ObservationScope { videoRow }
-                .frame(height: max(320, size.height * 0.48))
+            switch layout {
+            case .standard:
+                ObservationScope { videoRow }
+                    .frame(height: max(320, size.height * 0.48))
 
-            instrumentRow
-                .frame(maxHeight: .infinity)
-                .layoutPriority(1)
+                instrumentRow
+                    .frame(maxHeight: .infinity)
+                    .layoutPriority(1)
+            case .chaseCam:
+                chaseCamLayout
+                    .frame(maxHeight: .infinity)
+                    .layoutPriority(1)
+            }
 
             ObservationScope {
                 CompactTelemetryStrips(
@@ -782,23 +897,140 @@ struct FlightWorkspace: View {
         .padding(6)
     }
 
+    /// Layout 2 : chase cam plein cadre, vidéos en haut, trajectoire et carte en bas, un horizon sur chaque côté.
+    private var chaseCamLayout: some View {
+        GeometryReader { proxy in
+            let insetWidth = max(160, proxy.size.width * 0.26)
+            let insetHeight = max(120, proxy.size.height * 0.30)
+            // Les vidéos sont plus grandes que la trajectoire et la carte.
+            let videoWidth = max(200, proxy.size.width * 0.33)
+            let videoHeight = max(150, proxy.size.height * 0.38)
+            let horizonSize = max(60, min(proxy.size.height * 0.22, 170))
+            ZStack {
+                ChaseCamPane(model: model, onOpen: onOpenChaseCam3D, menuTrailingInset: videoWidth + 6)
+
+                ObservationScope { frontVideoPane(isCompact: true) }
+                    .frame(width: videoWidth, height: videoHeight)
+                    .clipShape(RoundedRectangle(cornerRadius: 7))
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                    .padding(6)
+
+                ObservationScope { backVideoPane(isCompact: true) }
+                    .frame(width: videoWidth, height: videoHeight)
+                    .clipShape(RoundedRectangle(cornerRadius: 7))
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                    .padding(6)
+
+                flightPathPane
+                    .frame(width: insetWidth, height: insetHeight)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+                    .padding(6)
+
+                ObservationScope {
+                    FlightMapView(
+                        coordinates: model.routeCoordinates,
+                        sample: model.slowSample,
+                        metar: model.slowMETAR,
+                        routeProgress: model.slowRouteProgress,
+                        showsMETAR: false
+                    )
+                }
+                .clipShape(RoundedRectangle(cornerRadius: 7))
+                .frame(width: insetWidth, height: insetHeight)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
+                .padding(6)
+
+                // Favoris / titres en haut au centre, schéma Aresti en bas au centre.
+                ObservationScope {
+                    BookmarkBanner(
+                        previousBookmark: model.previousBookmarkName,
+                        upcomingBookmark: model.upcomingBookmarkName
+                    )
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                .padding(6)
+                .allowsHitTesting(false)
+
+                ObservationScope { arestiBadge(alignment: .bottom) }
+
+                ObservationScope { horizon(.wings, size: horizonSize) }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+                    .padding(6)
+                    .allowsHitTesting(false)
+
+                ObservationScope { horizon(.triangle, size: horizonSize) }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .trailing)
+                    .padding(6)
+                    .allowsHitTesting(false)
+            }
+        }
+    }
+
+    private func horizon(_ marker: ArtificialHorizonMarker, size: CGFloat) -> some View {
+        let sample = model.currentSample
+        let attitude = marker == .wings
+            ? sample?.attitude(mountingPitch: model.mountingPitch, isInverted: model.isCameraInverted)
+            : sample?.wingtipAttitude(mountingPitch: model.mountingPitch, isInverted: model.isCameraInverted)
+        return ArtificialHorizonView(
+            pitch: attitude?.pitch ?? 0,
+            roll: attitude?.roll ?? 0,
+            marker: marker,
+            displaySize: size
+        )
+        .aspectRatio(1, contentMode: .fit)
+        .frame(width: size, height: size)
+    }
+
     private var videoRow: some View {
         HStack(spacing: 6) {
+            frontVideoPane
+            backVideoPane
+        }
+    }
+
+    private var frontVideoPane: some View { frontVideoPane(isCompact: false) }
+
+    /// `isCompact` : incrustation du layout 2, sans favoris ni schéma Aresti (affichés par le layout lui-même).
+    private func frontVideoPane(isCompact: Bool) -> some View {
             ZStack(alignment: .topTrailing) {
                 VideoPane(
-                    title: "Caméra avant",
-                    player: model.displayedFrontPlayer,
+                    title: model.isVideo360Enabled ? "Vidéo 360° avant" : "Caméra avant",
+                    player: model.isVideo360Enabled ? model.player360 : model.displayedFrontPlayer,
                     timestamp: nil,
                     elapsedTime: model.currentTime,
-                    previousBookmark: model.previousBookmarkName,
-                    upcomingBookmark: model.upcomingBookmarkName,
+                    previousBookmark: isCompact ? nil : model.previousBookmarkName,
+                    upcomingBookmark: isCompact ? nil : model.upcomingBookmarkName,
                     flightSample: model.currentSample,
                     showsFlightData: true,
                     timestampAlignment: .topTrailing,
                     mountingPitch: model.mountingPitch,
                     isCameraInverted: model.isCameraInverted,
-                    overlayStyle: isRunningOnIPhone ? .headingOnly : .standard
+                    overlayStyle: isRunningOnIPhone ? .headingOnly : .standard,
+                    isVideo360: model.isVideo360Enabled,
+                    video360Offset: model.video360DynamicOffset,
+                    video360YawPreset: model.video360FrontPreset,
+                    isCompact: isCompact
                 )
+                .id(model.isVideo360Enabled)
+                if !isCompact {
+                    arestiBadge(alignment: arestiCorner.alignment)
+                }
+                if model.isVideo360Enabled {
+                    // Remonté au-dessus des instruments incrustés (cadran 86 pt de haut).
+                    if isCompact {
+                        // Layout 2 : juste au-dessus du cadran, dont la taille suit la largeur de la vidéo.
+                        GeometryReader { proxy in
+                            let scale = FlightVideoDataOverlay.fitScale(forWidth: proxy.size.width)
+                            Video360DirectionPad(showsDirections: false) { model.applyVideo360Preset($0, onBackPane: false) }
+                                .padding(.bottom, 94 * scale + 6)
+                                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                        }
+                    } else {
+                        Video360DirectionPad { model.applyVideo360Preset($0, onBackPane: false) }
+                            .padding(.bottom, 110)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                    }
+                }
             }
             #if !os(macOS)
             .contentShape(Rectangle())
@@ -806,27 +1038,70 @@ struct FlightWorkspace: View {
                 fullScreenVideo = .front
             }
             #endif
+    }
+
+    @ViewBuilder
+    private func arestiBadge(alignment: Alignment) -> some View {
+        if let name = model.recentBookmarkName,
+           let figure = AerobaticFigure(bookmarkName: name) {
+            AerobaticFigureSymbol(figure: figure)
+                .padding(8)
+                .overlay(alignment: .bottomTrailing) {
+                    if let k = figure.k {
+                        Text("K \(k)")
+                            .font(.caption2.monospacedDigit().bold())
+                            .foregroundStyle(.white)
+                            .padding(4)
+                    }
+                }
+                .frame(width: arestiSize.side, height: arestiSize.side)
+                .background(.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 8))
+                .padding(8)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: alignment)
+                .allowsHitTesting(false)
+        }
+    }
+
+    private var backVideoPane: some View { backVideoPane(isCompact: false) }
+
+    private func backVideoPane(isCompact: Bool) -> some View {
             ZStack(alignment: .topTrailing) {
                 VideoPane(
-                    title: "Caméra arrière",
-                    player: model.displayedBackPlayer,
+                    title: model.isVideo360Enabled ? "Vidéo 360°" : "Caméra arrière",
+                    player: model.isVideo360Enabled ? model.player360 : model.displayedBackPlayer,
                     timestamp: model.currentSample?.timestamp,
                     elapsedTime: model.currentTime,
                     previousBookmark: model.previousBookmarkName,
                     upcomingBookmark: model.upcomingBookmarkName,
                     flightSample: model.currentSample,
                     timestampAlignment: .bottomTrailing,
-                    overlayStyle: isRunningOnIPhone ? .headingOnly : .standard
+                    overlayStyle: isRunningOnIPhone ? .headingOnly : .standard,
+                    isVideo360: model.isVideo360Enabled,
+                    video360InitialYaw: 180,
+                    video360Offset: model.video360DynamicOffset,
+                    video360YawPreset: model.video360BackPreset
                 )
-                VStack(alignment: .trailing, spacing: 4) {
-                    PlaybackDiagnosticsOverlay(
-                        currentFrame: model.currentVideoFrame,
-                        playbackCorrectionCount: model.playbackCorrectionCount,
-                        videoFrameRate: model.frontVideoFrameRate,
-                        synchronizationError: model.videoSynchronizationError
-                    )
+                // Une vue SceneKit par mode : on repart de zéro en basculant.
+                .id(model.isVideo360Enabled)
+                // Cadre coloré selon le facteur de charge, même code couleur que la jauge de la trajectoire 3D.
+                .overlay {
+                    // Pas de cadre en vol « normal » (entre 0,8 et 1,2 G).
+                    if !(0.8...1.2).contains(model.currentSignedLoadFactor) {
+                        RoundedRectangle(cornerRadius: 3)
+                            .strokeBorder(
+                                LoadFactorColorScale.color(for: model.currentSignedLoadFactor),
+                                lineWidth: 7
+                            )
+                            .allowsHitTesting(false)
+                    }
                 }
-                .padding(8)
+                // Presets ponctuels, pas des états : la vue pivote vers la direction choisie.
+                // Visibles uniquement en mode 360.
+                if model.isVideo360Enabled {
+                    Video360DirectionPad(showsDirections: !isCompact) { model.applyVideo360Preset($0, onBackPane: true) }
+                        .padding(.bottom, 10)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                }
             }
             #if !os(macOS)
             .contentShape(Rectangle())
@@ -834,7 +1109,6 @@ struct FlightWorkspace: View {
                 fullScreenVideo = .back
             }
             #endif
-        }
     }
 
     private var instrumentRow: some View {
@@ -845,13 +1119,23 @@ struct FlightWorkspace: View {
 
     private func instrumentRowContent(in workspaceSize: CGSize) -> some View {
         HStack(spacing: 6) {
-            ChaseCamPane(model: model, onOpen: onOpenChaseCam3D)
-                .layoutPriority(1)
+            // Chase cam et vue STL occupent exactement la largeur de la vidéo de gauche (rangée du
+            // dessus, deux vidéos égales séparées de 6 pt) : les horizons artificiels qui suivent
+            // démarrent ainsi pile au bord gauche de la vidéo de droite. Les deux vues gardent la
+            // même largeur l'une que l'autre.
+            let leftColumnWidth = max(0, (workspaceSize.width - 6) / 2)
+            let paneWidth = max(0, (leftColumnWidth - 6) / 2)
+            HStack(spacing: 6) {
+                ChaseCamPane(model: model, onOpen: onOpenChaseCam3D)
+                    .frame(width: paneWidth)
+                    .frame(maxHeight: .infinity)
 
-            aircraftPane
-                .frame(minWidth: 220, maxWidth: .infinity, maxHeight: .infinity)
-                .clipped()
-                .layoutPriority(1)
+                aircraftPane
+                    .frame(width: paneWidth)
+                    .frame(maxHeight: .infinity)
+                    .clipped()
+            }
+            .frame(width: leftColumnWidth)
 
             // The two horizon gauges stack vertically with 8pt between them;
             // sizing from that so their combined height matches the STL pane
@@ -881,7 +1165,20 @@ struct FlightWorkspace: View {
                     coordinates: model.routeCoordinates,
                     sample: model.slowSample,
                     metar: model.slowMETAR,
-                    routeProgress: model.slowRouteProgress
+                    routeProgress: model.slowRouteProgress,
+                    bottomTrailingAccessory: AnyView(
+                        // Lu dans sa propre portée d'observation : le compteur de frames change à chaque tick.
+                        ObservationScope {
+                            PlaybackDiagnosticsOverlay(
+                                currentFrame: model.currentVideoFrame,
+                                playbackCorrectionCount: model.playbackCorrectionCount,
+                                videoFrameRate: model.frontVideoFrameRate,
+                                synchronizationError: model.videoSynchronizationError,
+                                satellites: model.currentSample?.satellites,
+                                hdop: model.currentSample?.hdop
+                            )
+                        }
+                    )
                 )
             }
             .frame(minWidth: 260)
@@ -979,9 +1276,57 @@ struct FlightWorkspace: View {
 /// Évalue son contenu dans son propre corps : les valeurs observées lues par `content`
 /// n'invalident que cette vue, et non la vue parente qui la construit.
 /// Chase cam 3D intégrée à la seconde ligne de l'espace de travail, avec ses options dans un menu en coin.
+/// Switchs « 360 » et « Suivi » de la barre d'outils.
+private struct Video360Toggles: View {
+    let model: FlightViewModel
+
+    var body: some View {
+        HStack(spacing: 10) {
+            labeledSwitch(
+                "360",
+                isOn: Binding(
+                    get: { model.isVideo360Enabled },
+                    set: { model.setVideo360Enabled($0) }
+                )
+            )
+            .disabled(!model.hasVideo360)
+            .help(
+                model.hasVideo360
+                    ? "Remplacer les caméras par la vidéo 360° (glisser pour orienter, molette pour le champ de vision, double-clic pour réinitialiser)"
+                    : "Ce fichier ABV ne contient pas de vidéo 360° (video360.mp4)"
+            )
+
+            labeledSwitch(
+                "Suivi",
+                isOn: Binding(
+                    get: { model.isVideo360DynamicEnabled },
+                    set: { model.setVideo360DynamicEnabled($0) }
+                )
+            )
+            .disabled(!model.isVideo360Enabled)
+            .help("Suivi 360° dynamique : les accélérations font varier le tangage et l’inclinaison du regard")
+        }
+        .padding(.horizontal, 6)
+    }
+
+    /// Switch précédé de son libellé : dans une barre d'outils, le style `.switch` masque le titre.
+    private func labeledSwitch(_ title: LocalizedStringKey, isOn: Binding<Bool>) -> some View {
+        HStack(spacing: 4) {
+            Text(title)
+                .font(.callout.weight(.semibold))
+            Toggle(title, isOn: isOn)
+                .toggleStyle(.switch)
+                .labelsHidden()
+                .controlSize(.small)
+        }
+    }
+}
+
 private struct ChaseCamPane: View {
     let model: FlightViewModel
     let onOpen: () -> Void
+    /// Décalage du menu depuis le bord droit (layout 2 : évite l'incrustation vidéo de droite).
+    var menuTrailingInset: CGFloat = 0
     @State private var options = ChaseCam3DOptions()
 
     var body: some View {
@@ -990,7 +1335,6 @@ private struct ChaseCamPane: View {
             loadsDetailTiles: true, isInteractive: true
         )
         .clipShape(RoundedRectangle(cornerRadius: 7))
-        .frame(minWidth: 340, maxWidth: 520)
         // Pas de calque par-dessus la vue SceneKit : elle doit recevoir la souris (orbite, zoom).
         // Les options et l'ouverture de la fenêtre passent par un petit menu en coin.
         .overlay(alignment: .topTrailing) {
@@ -1022,6 +1366,7 @@ private struct ChaseCamPane: View {
             .menuIndicator(.hidden)
             .fixedSize()
             .padding(6)
+            .padding(.trailing, menuTrailingInset)
             .accessibilityLabel("Options de la chase cam")
         }
         .accessibilityLabel("Chase cam 3D")
@@ -1041,10 +1386,18 @@ private struct PlaybackDiagnosticsOverlay: View {
     let playbackCorrectionCount: Int
     let videoFrameRate: Double
     let synchronizationError: TimeInterval
+    var satellites: Int? = nil
+    var hdop: Double? = nil
 
     var body: some View {
         VStack(alignment: .trailing, spacing: 1) {
             Text("Frame : \(currentFrame)")
+            if let satellites {
+                Text("Satellites : \(satellites)")
+            }
+            if let hdop {
+                Text("HDOP : \(hdop, format: .number.precision(.fractionLength(1)))")
+            }
             Text("Corrections : \(playbackCorrectionCount)")
             Text("FPS : \(videoFrameRate, format: .number.precision(.fractionLength(2)))")
             Text("Dérive : \(synchronizationError * 1_000, format: .number.precision(.fractionLength(0))) ms")
@@ -1074,14 +1427,27 @@ private struct FullScreenFlightVideo: View {
         selection == .front
     }
 
+    private var shows360: Bool {
+        model.isVideo360Enabled
+    }
+
+    private var title: LocalizedStringKey {
+        switch (isFrontVideo, shows360) {
+        case (true, true): "Vidéo 360° avant"
+        case (true, false): "Caméra avant"
+        case (false, true): "Vidéo 360°"
+        case (false, false): "Caméra arrière"
+        }
+    }
+
     var body: some View {
         ZStack(alignment: .topTrailing) {
             Color.black
                 .ignoresSafeArea()
 
             VideoPane(
-                title: isFrontVideo ? "Caméra avant" : "Caméra arrière",
-                player: isFrontVideo ? model.displayedFrontPlayer : model.displayedBackPlayer,
+                title: title,
+                player: shows360 ? model.player360 : (isFrontVideo ? model.displayedFrontPlayer : model.displayedBackPlayer),
                 timestamp: isFrontVideo ? nil : model.currentSample?.timestamp,
                 elapsedTime: model.currentTime,
                 previousBookmark: model.previousBookmarkName,
@@ -1091,7 +1457,10 @@ private struct FullScreenFlightVideo: View {
                 timestampAlignment: isFrontVideo ? .topTrailing : .topLeading,
                 mountingPitch: model.mountingPitch,
                 isCameraInverted: model.isCameraInverted,
-                overlayStyle: isRunningOnIPhone ? .headingOnly : .standard
+                overlayStyle: isRunningOnIPhone ? .headingOnly : .standard,
+                isVideo360: shows360,
+                video360InitialYaw: isFrontVideo ? 0 : 180,
+                video360Offset: model.video360DynamicOffset
             )
             .ignoresSafeArea()
 

@@ -5,7 +5,7 @@ struct KeyboardShortcutsView: View {
         KeyboardShortcutEntry(keys: "Espace", action: "Lecture / Pause"),
         KeyboardShortcutEntry(keys: "← / →", action: "Reculer / avancer de 10 secondes"),
         KeyboardShortcutEntry(keys: "⇧← / ⇧→", action: "Reculer / avancer de 2 secondes"),
-        KeyboardShortcutEntry(keys: "⌃← / ⌃→", action: "Favori précédent / suivant"),
+        KeyboardShortcutEntry(keys: "⌥← / ⌥→ (ou ⌃← / ⌃→)", action: "Favori précédent / suivant"),
         KeyboardShortcutEntry(keys: "⌃B", action: "Ajouter un favori"),
         KeyboardShortcutEntry(keys: "⌃R", action: "Recharger bookmark.csv"),
         KeyboardShortcutEntry(keys: "Z", action: "Activer ou désactiver le zoom timeline"),
