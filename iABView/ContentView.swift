@@ -24,12 +24,35 @@ private struct WindowTitleSetter: NSViewRepresentable {
 
     func makeNSView(context: Context) -> NSView {
         let view = NSView()
-        DispatchQueue.main.async { view.window?.title = title }
+        DispatchQueue.main.async { configure(view.window) }
         return view
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {
-        nsView.window?.title = title
+        configure(nsView.window)
+    }
+
+    private func configure(_ window: NSWindow?) {
+        window?.title = title
+    }
+}
+
+/// Numéro et date de build, en petite police. Le numéro (CFBundleVersion) est incrémenté par
+/// Scripts/build-number.sh ; la date est celle de modification de l'exécutable (édition de liens).
+private struct BuildNumberLabel: View {
+    private static let text: String = {
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
+        guard let url = Bundle.main.executableURL,
+              let date = try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+        else { return "build \(build)" }
+        return "build \(build) · " + date.formatted(date: .numeric, time: .shortened)
+    }()
+
+    var body: some View {
+        Text(Self.text)
+            .font(.system(size: 9))
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
     }
 }
 #endif
@@ -119,12 +142,19 @@ struct ContentView: View {
                 },
                 layout: layout
             )
+            #if os(iOS)
+            .toolbar { mainToolbar }
+            #endif
         }
         #if os(macOS)
         .frame(minWidth: 1_100, minHeight: 720)
         .background(
             WindowTitleSetter(title: windowTitle)
         )
+        .task {
+            cpuMonitor.start()
+        }
+        #endif
         // Le raccourci Z vit hors du Menu de la toolbar : les raccourcis d'un Menu ne sont pas
         // fiables tant que le menu n'a pas été ouvert.
         .background(
@@ -150,10 +180,6 @@ struct ContentView: View {
             .allowsHitTesting(false)
             .accessibilityHidden(true)
         )
-        .task {
-            cpuMonitor.start()
-        }
-        #endif
         .onAppear {
             guard !didAskToRestoreLastBundle else { return }
             didAskToRestoreLastBundle = true
@@ -236,10 +262,41 @@ struct ContentView: View {
             preferredCompactColumn = .detail
         }
         .modifier(FlightErrorAlerts(model: model, recorder: recorder))
-        .toolbar {
+        #if os(macOS)
+        .toolbar { mainToolbar }
+        #endif
+    }
+
+    /// Barre d'outils principale. Sur iPad elle doit être attachée à la colonne de détail : posée sur
+    /// le `NavigationSplitView`, elle n'affiche que le bouton du volet latéral.
+    @ToolbarContentBuilder
+    private var mainToolbar: some ToolbarContent {
+            #if os(macOS)
+            ToolbarItem {
+                BuildNumberLabel()
+            }
+            .sharedBackgroundVisibility(.hidden)
+
+            ToolbarSpacer(.fixed)
+            #endif
+
             // Groupe isolé des autres icônes : vue 360° et suivi dynamique.
             ToolbarItem {
                 Video360Toggles(model: model)
+            }
+
+            if !isRunningOnIPhone {
+                // Élément à part : dans le groupe principal, l'iPad le repliait dans le menu « … ».
+                ToolbarItem {
+                    Menu {
+                        Picker("Layout", selection: $layout) {
+                            ForEach(WorkspaceLayout.allCases) { Text($0.title).tag($0) }
+                        }
+                    } label: {
+                        Label(layout.title, systemImage: "rectangle.3.group")
+                    }
+                    .help("Disposition de l'espace de travail")
+                }
             }
 
             ToolbarSpacer(.fixed)
@@ -252,12 +309,6 @@ struct ContentView: View {
                 }
 
                 if !isRunningOnIPhone {
-                    Picker("Layout", selection: $layout) {
-                        ForEach(WorkspaceLayout.allCases) { Text($0.title).tag($0) }
-                    }
-                    .pickerStyle(.menu)
-                    .help("Disposition de l'espace de travail")
-
                     Button {
                         #if os(macOS)
                         detachedWindows.showChaseCam3D(model: model)
@@ -467,7 +518,6 @@ struct ContentView: View {
                     }
                 }
             }
-        }
     }
 
     #if os(macOS)

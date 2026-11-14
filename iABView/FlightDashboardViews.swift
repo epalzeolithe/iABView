@@ -1207,7 +1207,7 @@ private struct PlaybackKeyboardMonitor: NSViewRepresentable {
     }
 }
 #else
-private struct PlaybackKeyboardMonitor: UIViewRepresentable {
+private struct PlaybackKeyboardMonitor: View {
     let onJumpBackward: () -> Void
     let onJumpForward: () -> Void
     let onFineJumpBackward: () -> Void
@@ -1216,10 +1216,46 @@ private struct PlaybackKeyboardMonitor: UIViewRepresentable {
     let onNextBookmark: () -> Void
     let onAddBookmark: () -> Void
 
-    func makeUIView(context: Context) -> UIView {
-        UIView(frame: .zero)
+    var body: some View {
+        PlaybackHardwareKeyboardShortcuts(
+            onJumpBackward: onJumpBackward,
+            onJumpForward: onJumpForward,
+            onFineJumpBackward: onFineJumpBackward,
+            onFineJumpForward: onFineJumpForward,
+            onPreviousBookmark: onPreviousBookmark,
+            onNextBookmark: onNextBookmark
+        )
     }
+}
 
-    func updateUIView(_ uiView: UIView, context: Context) {}
+/// Clavier matériel (iPad) : mêmes raccourcis que le moniteur d'événements macOS, via des boutons
+/// invisibles dont les `keyboardShortcut` sont relayés par UIKit.
+private struct PlaybackHardwareKeyboardShortcuts: View {
+    let onJumpBackward: () -> Void
+    let onJumpForward: () -> Void
+    let onFineJumpBackward: () -> Void
+    let onFineJumpForward: () -> Void
+    let onPreviousBookmark: () -> Void
+    let onNextBookmark: () -> Void
+
+    var body: some View {
+        Group {
+            Button("−10 s", action: onJumpBackward)
+                .keyboardShortcut(.leftArrow, modifiers: [])
+            Button("+10 s", action: onJumpForward)
+                .keyboardShortcut(.rightArrow, modifiers: [])
+            Button("−2 s", action: onFineJumpBackward)
+                .keyboardShortcut(.leftArrow, modifiers: .shift)
+            Button("+2 s", action: onFineJumpForward)
+                .keyboardShortcut(.rightArrow, modifiers: .shift)
+            Button("Favori précédent", action: onPreviousBookmark)
+                .keyboardShortcut(.leftArrow, modifiers: .option)
+            Button("Favori suivant", action: onNextBookmark)
+                .keyboardShortcut(.rightArrow, modifiers: .option)
+        }
+        .opacity(0)
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
 }
 #endif
